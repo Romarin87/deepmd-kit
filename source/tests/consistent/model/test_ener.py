@@ -1177,3 +1177,540 @@ class TestEnerModelAPIs(unittest.TestCase):
             np.testing.assert_allclose(
                 dp_bias_loaded, dp_bias_after, rtol=1e-10, atol=1e-10
             )
+
+    def test_get_observed_type_list(self) -> None:
+        """get_observed_type_list should be consistent across dp, pt, pt_expt.
+
+        Uses mock data containing only type 0 ("O") so that type 1 ("H") is
+        unobserved and should be absent from the returned list.
+        """
+        nframes = 2
+        natoms = 6
+        # All atoms are type 0 — type 1 is unobserved
+        atype_2f = np.zeros((nframes, natoms), dtype=np.int32)
+        coords_2f = np.tile(self.coords, (nframes, 1, 1))
+        box_2f = np.tile(self.box.reshape(1, 3, 3), (nframes, 1, 1))
+        natoms_data = np.array([[natoms, natoms, natoms, 0]] * nframes, dtype=np.int32)
+        energy_data = np.array([10.0, 20.0]).reshape(nframes, 1)
+
+        dp_merged = [
+            {
+                "coord": coords_2f,
+                "atype": atype_2f,
+                "atype_ext": atype_2f,
+                "box": box_2f,
+                "natoms": natoms_data,
+                "energy": energy_data,
+                "find_energy": np.float32(1.0),
+            }
+        ]
+        pt_merged = [
+            {
+                "coord": numpy_to_torch(coords_2f),
+                "atype": numpy_to_torch(atype_2f),
+                "atype_ext": numpy_to_torch(atype_2f),
+                "box": numpy_to_torch(box_2f),
+                "natoms": numpy_to_torch(natoms_data),
+                "energy": numpy_to_torch(energy_data),
+                "find_energy": np.float32(1.0),
+            }
+        ]
+
+        self.dp_model.atomic_model.compute_or_load_out_stat(dp_merged)
+        self.pt_model.atomic_model.compute_or_load_out_stat(pt_merged)
+        self.pt_expt_model.atomic_model.compute_or_load_out_stat(dp_merged)
+
+        dp_observed = self.dp_model.get_observed_type_list()
+        pt_observed = self.pt_model.get_observed_type_list()
+        pe_observed = self.pt_expt_model.get_observed_type_list()
+
+        self.assertEqual(dp_observed, pt_observed)
+        self.assertEqual(dp_observed, pe_observed)
+        # Only type 0 ("O") should be observed
+        self.assertEqual(dp_observed, ["O"])
+
+
+@parameterized(
+    (([], []), ([[0, 1]], [1])),  # (pair_exclude_types, atom_exclude_types)
+    (False, True),  # fparam_in_data
+)
+@unittest.skipUnless(INSTALLED_PT and INSTALLED_PT_EXPT, "PT and PT_EXPT are required")
+class TestEnerComputeOrLoadStat(unittest.TestCase):
+    """Test that compute_or_load_stat produces identical statistics on dp, pt, and pt_expt.
+
+    Covers descriptor stats (dstd), fitting stats (fparam, aparam), and output bias.
+    Parameterized over exclusion types and whether fparam is explicitly provided or
+    injected via default_fparam.
+    """
+
+    def setUp(self) -> None:
+        (pair_exclude_types, atom_exclude_types), self.fparam_in_data = self.param
+        data = model_args().normalize_value(
+            {
+                "type_map": ["O", "H"],
+                "pair_exclude_types": pair_exclude_types,
+                "atom_exclude_types": atom_exclude_types,
+                "descriptor": {
+                    "type": "dpa3",
+                    "repflow": {
+                        "n_dim": 20,
+                        "e_dim": 10,
+                        "a_dim": 8,
+                        "nlayers": 3,
+                        "e_rcut": 6.0,
+                        "e_rcut_smth": 5.0,
+                        "e_sel": 10,
+                        "a_rcut": 4.0,
+                        "a_rcut_smth": 3.5,
+                        "a_sel": 8,
+                        "axis_neuron": 4,
+                        "update_angle": True,
+                        "update_style": "res_residual",
+                        "update_residual": 0.1,
+                        "update_residual_init": "const",
+                    },
+                    "precision": "float64",
+                    "seed": 1,
+                },
+                "fitting_net": {
+                    "neuron": [10, 10],
+                    "precision": "float64",
+                    "seed": 1,
+                    "numb_fparam": 2,
+                    "default_fparam": [0.5, -0.3],
+                    "numb_aparam": 3,
+                },
+            },
+            trim_pattern="_*",
+        )
+
+        # Save data for reuse in load-from-file test
+        self._model_data = data
+
+        # Build dp model, then deserialize into pt and pt_expt to share weights
+        self.dp_model = get_model_dp(data)
+        serialized = self.dp_model.serialize()
+        self.pt_model = EnergyModelPT.deserialize(serialized)
+        self.pt_expt_model = EnergyModelPTExpt.deserialize(serialized)
+
+        # Test coords / atype / box for forward evaluation
+        self.coords = np.array(
+            [
+                12.83,
+                2.56,
+                2.18,
+                12.09,
+                2.87,
+                2.74,
+                0.25,
+                3.32,
+                1.68,
+                3.36,
+                3.00,
+                1.81,
+                3.51,
+                2.51,
+                2.60,
+                4.27,
+                3.22,
+                1.56,
+            ],
+            dtype=GLOBAL_NP_FLOAT_PRECISION,
+        ).reshape(1, -1, 3)
+        self.atype = np.array([0, 1, 1, 0, 1, 1], dtype=np.int32).reshape(1, -1)
+        self.box = np.array(
+            [13.0, 0.0, 0.0, 0.0, 13.0, 0.0, 0.0, 0.0, 13.0],
+            dtype=GLOBAL_NP_FLOAT_PRECISION,
+        ).reshape(1, 9)
+
+        # Mock training data for compute_or_load_stat
+        natoms = 6
+        nframes = 3
+        rng = np.random.default_rng(42)
+        coords_stat = rng.normal(size=(nframes, natoms, 3)).astype(
+            GLOBAL_NP_FLOAT_PRECISION
+        )
+        atype_stat = np.array([[0, 0, 1, 1, 1, 1]] * nframes, dtype=np.int32)
+        box_stat = np.tile(
+            np.eye(3, dtype=GLOBAL_NP_FLOAT_PRECISION).reshape(1, 3, 3) * 13.0,
+            (nframes, 1, 1),
+        )
+        natoms_stat = np.array([[natoms, natoms, 2, 4]] * nframes, dtype=np.int32)
+        energy_stat = rng.normal(size=(nframes, 1)).astype(GLOBAL_NP_FLOAT_PRECISION)
+        aparam_stat = rng.normal(size=(nframes, natoms, 3)).astype(
+            GLOBAL_NP_FLOAT_PRECISION
+        )
+
+        # dp / pt_expt sample (numpy)
+        np_sample = {
+            "coord": coords_stat,
+            "atype": atype_stat,
+            "atype_ext": atype_stat,
+            "box": box_stat,
+            "natoms": natoms_stat,
+            "energy": energy_stat,
+            "find_energy": np.float32(1.0),
+            "aparam": aparam_stat,
+            "find_aparam": np.float32(1.0),
+        }
+        # pt sample (torch tensors)
+        pt_sample = {
+            "coord": numpy_to_torch(coords_stat),
+            "atype": numpy_to_torch(atype_stat),
+            "atype_ext": numpy_to_torch(atype_stat),
+            "box": numpy_to_torch(box_stat),
+            "natoms": numpy_to_torch(natoms_stat),
+            "energy": numpy_to_torch(energy_stat),
+            "find_energy": np.float32(1.0),
+            "aparam": numpy_to_torch(aparam_stat),
+            "find_aparam": np.float32(1.0),
+        }
+
+        if self.fparam_in_data:
+            fparam_stat = rng.normal(size=(nframes, 2)).astype(
+                GLOBAL_NP_FLOAT_PRECISION
+            )
+            np_sample["fparam"] = fparam_stat
+            pt_sample["fparam"] = numpy_to_torch(fparam_stat)
+            np_sample["find_fparam"] = np.float32(1.0)
+            pt_sample["find_fparam"] = np.float32(1.0)
+            self.expected_fparam_avg = np.mean(fparam_stat, axis=0)
+        else:
+            # No fparam in data.  dpmodel keeps zero-padded fparam with
+            # find_fparam=0; _make_wrapped_sampler injects default_fparam.
+            np_sample["fparam"] = np.zeros(
+                (nframes, 2), dtype=GLOBAL_NP_FLOAT_PRECISION
+            )
+            np_sample["find_fparam"] = np.float32(0.0)
+            # pt pipeline pops fparam/find_fparam (stat.py), then
+            # wrapped_sampler injects default_fparam when keys are absent.
+            # pt_sample has no fparam/find_fparam keys.
+            self.expected_fparam_avg = np.array([0.5, -0.3])
+
+        self.np_sampled = [np_sample]
+        self.pt_sampled = [pt_sample]
+
+        # aparam for forward evaluation (1 frame, 6 atoms, 3 aparam)
+        self.eval_aparam = rng.normal(size=(1, natoms, 3)).astype(
+            GLOBAL_NP_FLOAT_PRECISION
+        )
+
+    def _eval_dp(self) -> dict:
+        return self.dp_model(
+            self.coords, self.atype, box=self.box, aparam=self.eval_aparam
+        )
+
+    def _eval_pt(self) -> dict:
+        return {
+            kk: torch_to_numpy(vv)
+            for kk, vv in self.pt_model(
+                numpy_to_torch(self.coords),
+                numpy_to_torch(self.atype),
+                box=numpy_to_torch(self.box),
+                aparam=numpy_to_torch(self.eval_aparam),
+                do_atomic_virial=True,
+            ).items()
+        }
+
+    def _eval_pt_expt(self) -> dict:
+        coord_t = pt_expt_numpy_to_torch(self.coords)
+        coord_t.requires_grad_(True)
+        return {
+            k: v.detach().cpu().numpy()
+            for k, v in self.pt_expt_model(
+                coord_t,
+                pt_expt_numpy_to_torch(self.atype),
+                box=pt_expt_numpy_to_torch(self.box),
+                aparam=pt_expt_numpy_to_torch(self.eval_aparam),
+                do_atomic_virial=True,
+            ).items()
+        }
+
+    def test_compute_stat(self) -> None:
+        # 1. Pre-stat forward consistency
+        dp_ret0 = self._eval_dp()
+        pt_ret0 = self._eval_pt()
+        pe_ret0 = self._eval_pt_expt()
+        for key in ("energy", "atom_energy"):
+            np.testing.assert_allclose(
+                dp_ret0[key],
+                pt_ret0[key],
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"Pre-stat dp vs pt mismatch in {key}",
+            )
+            np.testing.assert_allclose(
+                dp_ret0[key],
+                pe_ret0[key],
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"Pre-stat dp vs pt_expt mismatch in {key}",
+            )
+
+        # 2. Run compute_or_load_stat on all three backends
+        # deepcopy because stat.py mutates natoms in-place when atom_exclude_types
+        # is non-empty (natoms[:, 2:] *= type_mask).
+        from copy import (
+            deepcopy,
+        )
+
+        self.dp_model.compute_or_load_stat(lambda: deepcopy(self.np_sampled))
+        self.pt_model.compute_or_load_stat(lambda: deepcopy(self.pt_sampled))
+        self.pt_expt_model.compute_or_load_stat(lambda: deepcopy(self.np_sampled))
+
+        # 3. Serialize all three and compare @variables
+        dp_ser = self.dp_model.serialize()
+        pt_ser = self.pt_model.serialize()
+        pe_ser = self.pt_expt_model.serialize()
+        compare_variables_recursive(dp_ser, pt_ser)
+        compare_variables_recursive(dp_ser, pe_ser)
+
+        # 4. Post-stat forward consistency
+        dp_ret1 = self._eval_dp()
+        pt_ret1 = self._eval_pt()
+        pe_ret1 = self._eval_pt_expt()
+        for key in ("energy", "atom_energy"):
+            np.testing.assert_allclose(
+                dp_ret1[key],
+                pt_ret1[key],
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"Post-stat dp vs pt mismatch in {key}",
+            )
+            np.testing.assert_allclose(
+                dp_ret1[key],
+                pe_ret1[key],
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"Post-stat dp vs pt_expt mismatch in {key}",
+            )
+
+        # 5. Non-triviality checks
+        fit_vars = dp_ser["fitting"]["@variables"]
+        # fparam stats were computed
+        fparam_avg = np.asarray(fit_vars["fparam_avg"])
+        self.assertFalse(
+            np.allclose(fparam_avg, 0.0),
+            "fparam_avg is still zero — fparam stats were not computed",
+        )
+        np.testing.assert_allclose(
+            fparam_avg,
+            self.expected_fparam_avg,
+            rtol=1e-10,
+            atol=1e-10,
+            err_msg="fparam_avg does not match expected values",
+        )
+        # aparam stats were computed
+        aparam_avg = np.asarray(fit_vars["aparam_avg"])
+        self.assertFalse(
+            np.allclose(aparam_avg, 0.0),
+            "aparam_avg is still zero — aparam stats were not computed",
+        )
+
+    def test_load_stat_from_file(self) -> None:
+        import tempfile
+        from pathlib import (
+            Path,
+        )
+
+        import h5py
+
+        from deepmd.utils.path import (
+            DPPath,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create separate stat files for each backend
+            dp_h5 = str((Path(tmpdir) / "dp_stat.h5").resolve())
+            pt_h5 = str((Path(tmpdir) / "pt_stat.h5").resolve())
+            pe_h5 = str((Path(tmpdir) / "pe_stat.h5").resolve())
+            for p in (dp_h5, pt_h5, pe_h5):
+                with h5py.File(p, "w"):
+                    pass
+
+            # 1. Compute stats and save to file
+            self.dp_model.compute_or_load_stat(
+                lambda: self.np_sampled, stat_file_path=DPPath(dp_h5, "a")
+            )
+            self.pt_model.compute_or_load_stat(
+                lambda: self.pt_sampled, stat_file_path=DPPath(pt_h5, "a")
+            )
+            self.pt_expt_model.compute_or_load_stat(
+                lambda: self.np_sampled, stat_file_path=DPPath(pe_h5, "a")
+            )
+
+            # Save the computed serializations as reference
+            dp_ser_computed = self.dp_model.serialize()
+            pt_ser_computed = self.pt_model.serialize()
+            pe_ser_computed = self.pt_expt_model.serialize()
+
+            # 2. Build fresh models from the same initial weights
+            dp_model2 = get_model_dp(self._model_data)
+            pt_model2 = EnergyModelPT.deserialize(dp_model2.serialize())
+            pe_model2 = EnergyModelPTExpt.deserialize(dp_model2.serialize())
+
+            # 3. Load stats from file (should NOT call the sampled func)
+            def raise_error():
+                raise RuntimeError("Should load from file, not recompute")
+
+            dp_model2.compute_or_load_stat(
+                raise_error, stat_file_path=DPPath(dp_h5, "a")
+            )
+            pt_model2.compute_or_load_stat(
+                raise_error, stat_file_path=DPPath(pt_h5, "a")
+            )
+            pe_model2.compute_or_load_stat(
+                raise_error, stat_file_path=DPPath(pe_h5, "a")
+            )
+
+            # 4. Loaded models should match the computed ones
+            dp_ser_loaded = dp_model2.serialize()
+            pt_ser_loaded = pt_model2.serialize()
+            pe_ser_loaded = pe_model2.serialize()
+            compare_variables_recursive(dp_ser_computed, dp_ser_loaded)
+            compare_variables_recursive(pt_ser_computed, pt_ser_loaded)
+            compare_variables_recursive(pe_ser_computed, pe_ser_loaded)
+
+            # 5. Cross-backend consistency after loading
+            compare_variables_recursive(dp_ser_loaded, pt_ser_loaded)
+            compare_variables_recursive(dp_ser_loaded, pe_ser_loaded)
+
+
+@parameterized(
+    ("no_fparam", "explicit_fparam", "default_fparam"),  # fparam_mode
+)
+@unittest.skipUnless(INSTALLED_PT and INSTALLED_PT_EXPT, "PT and PT_EXPT are required")
+class TestEnerChgSpinEbdFparam(unittest.TestCase):
+    """Test dp/pt/pt_expt model forward consistency for add_chg_spin_ebd with three fparam modes.
+
+    - no_fparam: numb_fparam=0, add_chg_spin_ebd=False (baseline)
+    - explicit_fparam: numb_fparam=2, add_chg_spin_ebd=True, fparam provided
+    - default_fparam: numb_fparam=2, default_fparam set, add_chg_spin_ebd=True, fparam=None
+    """
+
+    def setUp(self) -> None:
+        (self.fparam_mode,) = self.param
+
+        add_chg_spin_ebd = self.fparam_mode != "no_fparam"
+        fitting_cfg: dict[str, Any] = {
+            "neuron": [10, 10],
+            "precision": "float64",
+            "seed": 1,
+        }
+        if self.fparam_mode != "no_fparam":
+            fitting_cfg["numb_fparam"] = 2
+        if self.fparam_mode == "default_fparam":
+            fitting_cfg["default_fparam"] = [5, 1]
+
+        data = model_args().normalize_value(
+            {
+                "type_map": ["O", "H"],
+                "descriptor": {
+                    "type": "dpa3",
+                    "repflow": {
+                        "n_dim": 20,
+                        "e_dim": 10,
+                        "a_dim": 8,
+                        "nlayers": 3,
+                        "e_rcut": 6.0,
+                        "e_rcut_smth": 5.0,
+                        "e_sel": 10,
+                        "a_rcut": 4.0,
+                        "a_rcut_smth": 3.5,
+                        "a_sel": 8,
+                        "axis_neuron": 4,
+                        "update_angle": True,
+                        "update_style": "res_residual",
+                        "update_residual": 0.1,
+                        "update_residual_init": "const",
+                    },
+                    "precision": "float64",
+                    "seed": 1,
+                    "add_chg_spin_ebd": add_chg_spin_ebd,
+                },
+                "fitting_net": fitting_cfg,
+            },
+            trim_pattern="_*",
+        )
+
+        self.dp_model = get_model_dp(data)
+        serialized = self.dp_model.serialize()
+        self.pt_model = EnergyModelPT.deserialize(serialized)
+        self.pt_expt_model = EnergyModelPTExpt.deserialize(serialized)
+
+        self.coords = np.array(
+            [
+                12.83,
+                2.56,
+                2.18,
+                12.09,
+                2.87,
+                2.74,
+                0.25,
+                3.32,
+                1.68,
+                3.36,
+                3.00,
+                1.81,
+                3.51,
+                2.51,
+                2.60,
+                4.27,
+                3.22,
+                1.56,
+            ],
+            dtype=GLOBAL_NP_FLOAT_PRECISION,
+        ).reshape(1, -1, 3)
+        self.atype = np.array([0, 1, 1, 0, 1, 1], dtype=np.int32).reshape(1, -1)
+        self.box = np.array(
+            [13.0, 0.0, 0.0, 0.0, 13.0, 0.0, 0.0, 0.0, 13.0],
+            dtype=GLOBAL_NP_FLOAT_PRECISION,
+        ).reshape(1, 9)
+
+        # fparam: charge=5, spin=1
+        if self.fparam_mode == "explicit_fparam":
+            self.fparam_np = np.array([[5, 1]], dtype=GLOBAL_NP_FLOAT_PRECISION)
+        else:
+            self.fparam_np = None
+
+    def test_forward_consistency(self) -> None:
+        dp_ret = self.dp_model(
+            self.coords, self.atype, box=self.box, fparam=self.fparam_np
+        )
+        pt_ret = {
+            kk: torch_to_numpy(vv)
+            for kk, vv in self.pt_model(
+                numpy_to_torch(self.coords),
+                numpy_to_torch(self.atype),
+                box=numpy_to_torch(self.box),
+                fparam=numpy_to_torch(self.fparam_np),
+                do_atomic_virial=True,
+            ).items()
+        }
+        coord_t = pt_expt_numpy_to_torch(self.coords)
+        coord_t.requires_grad_(True)
+        pe_ret = {
+            k: v.detach().cpu().numpy()
+            for k, v in self.pt_expt_model(
+                coord_t,
+                pt_expt_numpy_to_torch(self.atype),
+                box=pt_expt_numpy_to_torch(self.box),
+                fparam=pt_expt_numpy_to_torch(self.fparam_np),
+                do_atomic_virial=True,
+            ).items()
+        }
+        for key in ("energy", "atom_energy"):
+            np.testing.assert_allclose(
+                dp_ret[key],
+                pt_ret[key],
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"dp vs pt mismatch in {key} (mode={self.fparam_mode})",
+            )
+            np.testing.assert_allclose(
+                dp_ret[key],
+                pe_ret[key],
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"dp vs pt_expt mismatch in {key} (mode={self.fparam_mode})",
+            )

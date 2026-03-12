@@ -348,6 +348,7 @@ class DescrptSeR(NativeOP, BaseDescriptor):
         atype_ext: Array,
         nlist: Array,
         mapping: Array | None = None,
+        fparam: Array | None = None,
     ) -> Array:
         """Compute the descriptor.
 
