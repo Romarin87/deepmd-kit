@@ -1254,6 +1254,25 @@ class DPTrainer:
             if int(os.environ.get("DP_JAX_MULTI_NPROC", "0")) > 1
             else None
         )
+        def debug_first_step(message: str) -> None:
+            print(
+                "[DP_JAX_DEBUG_FIRST_STEP] "
+                f"pid={os.getpid()} "
+                f"process={jax.process_index()}/{jax.process_count()} "
+                f"local_devices={jax.local_device_count()} "
+                f"global_devices={len(jax.devices())} "
+                f"{message}",
+                flush=True,
+            )
+
+        def debug_batch_summary(prefix: str, data: dict[str, Any]) -> None:
+            summary = {
+                key: getattr(value, "shape", None)
+                for key, value in data.items()
+                if key in {"coord", "type", "box", "energy", "force", "hessian"}
+            }
+            debug_first_step(f"{prefix} batch_shapes={summary}")
+
         model = ModelWrapper.deserialize(
             model.serialize(),
             shared_links=self.shared_links,
@@ -1388,13 +1407,21 @@ class DPTrainer:
             )
             task_key = self.model_keys[model_index]
             model.set_case_embd(task_key)
+            if step == self.start_step:
+                debug_first_step(f"before_train_get_batch step={step + 1} task={task_key}")
             batch_data = train_data[task_key].get_batch()
+            if step == self.start_step:
+                debug_batch_summary("after_train_get_batch", batch_data)
             jax_data = convert_numpy_data_to_jax_data(
                 batch_data,
                 sharding,
                 natoms_axis_size=auto_mesh.shape.get("natoms", 1),
             )
+            if step == self.start_step:
+                debug_batch_summary("after_train_convert_to_jax", jax_data)
             branch_model = model[task_key]
+            if step == self.start_step:
+                debug_first_step(f"before_train_prepare_input step={step + 1} task={task_key}")
             extended_coord, extended_atype, nlist, mapping, fp, ap = prepare_input(
                 rcut=branch_model.get_rcut(),
                 sel=branch_model.get_sel(),
@@ -1404,6 +1431,9 @@ class DPTrainer:
                 fparam=jax_data.get("fparam", None),
                 aparam=jax_data.get("aparam", None),
             )
+            if step == self.start_step:
+                debug_first_step(f"after_train_prepare_input step={step + 1} task={task_key}")
+                debug_first_step(f"before_train_step step={step + 1} task={task_key}")
             train_step_fns[task_key](
                 model,
                 optimizer,
@@ -1416,10 +1446,14 @@ class DPTrainer:
                 fp,
                 ap,
             )
+            if step == self.start_step:
+                debug_first_step(f"after_train_step_dispatch step={step + 1} task={task_key}")
             if self.display_in_training and (step == 0 or (step + 1) % self.disp_freq == 0):
                 train_results = {_key: {} for _key in self.model_keys}
                 valid_results = {_key: {} for _key in self.model_keys}
                 model.set_case_embd(task_key)
+                if step == self.start_step:
+                    debug_first_step(f"before_display_train_loss step={step + 1} task={task_key}")
                 train_results[task_key] = more_loss_fns[task_key](
                     model,
                     self.lr.value(step),
@@ -1431,15 +1465,25 @@ class DPTrainer:
                     fp,
                     ap,
                 )
+                if step == self.start_step:
+                    debug_first_step(f"after_display_train_loss step={step + 1} task={task_key}")
                 for _key in self.model_keys:
                     if _key != task_key:
+                        if step == self.start_step:
+                            debug_first_step(f"before_aux_train_get_batch step={step + 1} task={_key}")
                         train_batch_data = train_data[_key].get_batch()
+                        if step == self.start_step:
+                            debug_batch_summary("after_aux_train_get_batch", train_batch_data)
                         jax_train_data = convert_numpy_data_to_jax_data(
                             train_batch_data,
                             sharding,
                             natoms_axis_size=auto_mesh.shape.get("natoms", 1),
                         )
+                        if step == self.start_step:
+                            debug_batch_summary("after_aux_train_convert_to_jax", jax_train_data)
                         branch_model = model[_key]
+                        if step == self.start_step:
+                            debug_first_step(f"before_aux_train_prepare_input step={step + 1} task={_key}")
                         (
                             train_extended_coord,
                             train_extended_atype,
@@ -1458,7 +1502,11 @@ class DPTrainer:
                             fparam=jax_train_data.get("fparam", None),
                             aparam=jax_train_data.get("aparam", None),
                         )
+                        if step == self.start_step:
+                            debug_first_step(f"after_aux_train_prepare_input step={step + 1} task={_key}")
                         model.set_case_embd(_key)
+                        if step == self.start_step:
+                            debug_first_step(f"before_aux_train_loss step={step + 1} task={_key}")
                         train_results[_key] = more_loss_fns[_key](
                             model,
                             self.lr.value(step),
@@ -1470,14 +1518,24 @@ class DPTrainer:
                             train_fp,
                             train_ap,
                         )
+                        if step == self.start_step:
+                            debug_first_step(f"after_aux_train_loss step={step + 1} task={_key}")
                     if valid_data.get(_key) is not None:
+                        if step == self.start_step:
+                            debug_first_step(f"before_valid_get_batch step={step + 1} task={_key}")
                         valid_batch_data = valid_data[_key].get_batch()
+                        if step == self.start_step:
+                            debug_batch_summary("after_valid_get_batch", valid_batch_data)
                         jax_valid_data = convert_numpy_data_to_jax_data(
                             valid_batch_data,
                             sharding,
                             natoms_axis_size=auto_mesh.shape.get("natoms", 1),
                         )
+                        if step == self.start_step:
+                            debug_batch_summary("after_valid_convert_to_jax", jax_valid_data)
                         branch_model = model[_key]
+                        if step == self.start_step:
+                            debug_first_step(f"before_valid_prepare_input step={step + 1} task={_key}")
                         (
                             valid_extended_coord,
                             valid_extended_atype,
@@ -1494,7 +1552,11 @@ class DPTrainer:
                             fparam=jax_valid_data.get("fparam", None),
                             aparam=jax_valid_data.get("aparam", None),
                         )
+                        if step == self.start_step:
+                            debug_first_step(f"after_valid_prepare_input step={step + 1} task={_key}")
                         model.set_case_embd(_key)
+                        if step == self.start_step:
+                            debug_first_step(f"before_valid_loss step={step + 1} task={_key}")
                         valid_results[_key] = more_loss_fns[_key](
                             model,
                             self.lr.value(step),
@@ -1506,8 +1568,16 @@ class DPTrainer:
                             valid_fp,
                             valid_ap,
                         )
+                        if step == self.start_step:
+                            debug_first_step(f"after_valid_loss step={step + 1} task={_key}")
                 if step == 0:
+                    if step == self.start_step:
+                        debug_first_step(f"before_print_header step={step + 1}")
                     self.print_header_multitask(disp_file_fp, train_results, valid_results)
+                    if step == self.start_step:
+                        debug_first_step(f"after_print_header step={step + 1}")
+                if step == self.start_step:
+                    debug_first_step(f"before_print_training step={step + 1}")
                 self.print_on_training_multitask(
                     disp_file_fp,
                     train_results,
@@ -1515,6 +1585,8 @@ class DPTrainer:
                     cur_batch=step + 1,
                     cur_lr=self.lr.value(step),
                 )
+                if step == self.start_step:
+                    debug_first_step(f"after_print_training step={step + 1}")
                 wall_time = time.time() - start_time
                 log.info(format_training_message(batch=step + 1, wall_time=wall_time))
                 start_time = time.time()
