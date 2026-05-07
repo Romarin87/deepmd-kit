@@ -1140,8 +1140,6 @@ class DPTrainer:
                 ap,
             )
             if self.display_in_training and (step == 0 or (step + 1) % self.disp_freq == 0):
-                wall_time = time.time() - start_time
-                log.info(format_training_message(batch=step + 1, wall_time=wall_time))
                 more_loss = loss_fn_more_loss(
                     model,
                     self.lr.value(step),
@@ -1191,6 +1189,8 @@ class DPTrainer:
                     cur_batch=step + 1,
                     cur_lr=self.lr.value(step),
                 )
+                wall_time = time.time() - start_time
+                log.info(format_training_message(batch=step + 1, wall_time=wall_time))
                 start_time = time.time()
             if (step + 1) % self.save_freq == 0:
                 self._save_checkpoint(model, step + 1)
@@ -1417,8 +1417,6 @@ class DPTrainer:
                 ap,
             )
             if self.display_in_training and (step == 0 or (step + 1) % self.disp_freq == 0):
-                wall_time = time.time() - start_time
-                log.info(format_training_message(batch=step + 1, wall_time=wall_time))
                 train_results = {_key: {} for _key in self.model_keys}
                 valid_results = {_key: {} for _key in self.model_keys}
                 model.set_case_embd(task_key)
@@ -1517,6 +1515,8 @@ class DPTrainer:
                     cur_batch=step + 1,
                     cur_lr=self.lr.value(step),
                 )
+                wall_time = time.time() - start_time
+                log.info(format_training_message(batch=step + 1, wall_time=wall_time))
                 start_time = time.time()
             if (step + 1) % self.save_freq == 0:
                 self._save_checkpoint(model, step + 1)
