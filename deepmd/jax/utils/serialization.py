@@ -42,6 +42,7 @@ def _is_topology_mismatch_error(exc: Exception) -> bool:
         "Topology mismatch detected" in message
         or "available devices are different from the devices used to save the checkpoint"
         in message
+        or "was not found in jax.local_devices()" in message
     )
 
 
