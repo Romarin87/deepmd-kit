@@ -223,6 +223,85 @@ def _set_jax_mesh(mesh: Mesh) -> None:
     _ACTIVE_JAX_MESH_CONTEXT.append(mesh)
 
 
+def _shared_seed(seed: int | list[int] | None, *, purpose: str) -> int | None:
+    if seed is not None:
+        return int(np.random.SeedSequence(seed).generate_state(1)[0])
+    if jax.process_count() <= 1:
+        return None
+
+    local_seed = np.random.SeedSequence().generate_state(1)
+    if jax.process_index() != 0:
+        local_seed = np.zeros_like(local_seed)
+    try:
+        from jax.experimental import multihost_utils
+
+        shared_seed = multihost_utils.broadcast_one_to_all(
+            local_seed,
+            is_source=(jax.process_index() == 0),
+        )
+        return int(np.asarray(shared_seed).reshape(-1)[0])
+    except Exception as exc:
+        log.warning(
+            "Failed to broadcast %s seed across JAX processes; falling back to "
+            "deterministic seed 0. Original error: %s",
+            purpose,
+            exc,
+        )
+        return 0
+
+
+def _make_multitask_task_rng(seed: int | list[int] | None) -> np.random.RandomState:
+    seed_value = _shared_seed(seed, purpose="multitask sampling")
+    if seed_value is None:
+        return np.random.RandomState(None)
+    return np.random.RandomState(seed_value)
+
+
+def _broadcast_array_leaves_from_process0(data: Any) -> Any:
+    if jax.process_count() <= 1:
+        return data
+    if isinstance(data, dict):
+        return {
+            key: _broadcast_array_leaves_from_process0(value)
+            for key, value in data.items()
+        }
+    if isinstance(data, list):
+        return [_broadcast_array_leaves_from_process0(value) for value in data]
+    if isinstance(data, tuple):
+        return tuple(_broadcast_array_leaves_from_process0(value) for value in data)
+    if isinstance(data, np.ndarray):
+        from jax.experimental import multihost_utils
+
+        shared = multihost_utils.broadcast_one_to_all(
+            data,
+            is_source=(jax.process_index() == 0),
+        )
+        return np.asarray(shared)
+    return data
+
+
+def _sync_model_from_process0(
+    model: DefModel,
+    *,
+    shared_links: dict[str, Any] | None = None,
+    case_embd_index: dict[str, int] | None = None,
+) -> DefModel:
+    if jax.process_count() <= 1:
+        return model
+    model_data = _broadcast_array_leaves_from_process0(model.serialize())
+    if isinstance(model, ModelWrapper):
+        synced_model = ModelWrapper.deserialize(
+            model_data,
+            shared_links=shared_links,
+            case_embd_index=case_embd_index,
+        )
+    else:
+        synced_model = BaseModel.deserialize(model_data)
+    if jax.process_index() == 0:
+        log.info("Synchronized JAX model parameters from process 0.")
+    return synced_model
+
+
 def _merge_batches_for_bias(batch_list: list[np.ndarray], key: str) -> np.ndarray | float:
     arrays = [np.asarray(item) for item in batch_list]
     if key.startswith("find_"):
@@ -998,6 +1077,8 @@ class DPTrainer:
             if isinstance(model, ModelWrapper):
                 raise TypeError("single-task JAX finetune produced a multitask model unexpectedly.")
 
+        model = _sync_model_from_process0(model)
+        self._apply_hessian_flags(model)
         auto_mesh = jax.make_mesh(
             (jax.process_count(), jax.local_device_count()),
             ("data", "natoms"),
@@ -1235,6 +1316,13 @@ class DPTrainer:
             self._finetune_multi(train_data)
             model = self.model
             assert isinstance(model, ModelWrapper)
+        model = _sync_model_from_process0(
+            model,
+            shared_links=self.shared_links,
+            case_embd_index=self.case_embd_index,
+        )
+        assert isinstance(model, ModelWrapper)
+        self._apply_hessian_flags(model)
         self.lr = LearningRateExp(
             **self.learning_rate_param,
             num_steps=self.num_steps,
@@ -1400,8 +1488,9 @@ class DPTrainer:
 
         start_time = time.time()
         disp_file_fp = open(self.disp_file, "w")
+        task_rng = _make_multitask_task_rng(self.training_param.get("seed", None))
         for step in range(self.start_step, self.num_steps):
-            model_index = np.random.choice(
+            model_index = task_rng.choice(
                 np.arange(len(self.model_keys), dtype=np.int_),
                 p=self.model_prob,
             )
