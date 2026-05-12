@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import logging
 import os
+import pickle
 import shutil
 import socket
 import time
@@ -152,6 +153,14 @@ def _debug_block_until_ready(value: Any, label: str) -> None:
 
 def _is_process0_or_single_process() -> bool:
     return jax.process_count() <= 1 or jax.process_index() == 0
+
+
+def _sync_global_devices(name: str) -> None:
+    if jax.process_count() <= 1:
+        return
+    from jax.experimental import multihost_utils
+
+    multihost_utils.sync_global_devices(name)
 
 
 def _merge_init_frz_model_data(
@@ -310,6 +319,73 @@ def _make_multitask_task_rng(seed: int | list[int] | None) -> np.random.RandomSt
     return np.random.RandomState(seed_value)
 
 
+def _broadcast_object_from_process0(data: Any, *, purpose: str) -> Any:
+    if jax.process_count() <= 1:
+        return data
+    from jax.experimental import multihost_utils
+
+    payload = (
+        np.array(
+            np.frombuffer(
+                pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL),
+                dtype=np.uint8,
+            ),
+            copy=True,
+        )
+        if jax.process_index() == 0
+        else np.zeros(0, dtype=np.uint8)
+    )
+    payload_size = np.array([payload.size], dtype=np.int64)
+    shared_size = multihost_utils.broadcast_one_to_all(
+        payload_size,
+        is_source=(jax.process_index() == 0),
+    )
+    shared_size = int(np.asarray(shared_size)[0])
+    if jax.process_index() != 0:
+        payload = np.zeros(shared_size, dtype=np.uint8)
+    elif payload.size != shared_size:
+        raise ValueError(
+            f"Unexpected {purpose} payload size mismatch: "
+            f"{payload.size} != {shared_size}"
+        )
+    shared_payload = multihost_utils.broadcast_one_to_all(
+        payload,
+        is_source=(jax.process_index() == 0),
+    )
+    return pickle.loads(np.asarray(shared_payload, dtype=np.uint8).tobytes())
+
+
+def _strip_array_leaves(data: Any) -> Any:
+    if isinstance(data, dict):
+        return {key: _strip_array_leaves(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [_strip_array_leaves(value) for value in data]
+    if isinstance(data, tuple):
+        return tuple(_strip_array_leaves(value) for value in data)
+    if isinstance(data, np.ndarray):
+        return {
+            "__deepmd_jax_array_placeholder__": True,
+            "shape": data.shape,
+            "dtype": str(data.dtype),
+        }
+    return data
+
+
+def _restore_array_placeholders(data: Any) -> Any:
+    if (
+        isinstance(data, dict)
+        and data.get("__deepmd_jax_array_placeholder__") is True
+    ):
+        return np.zeros(tuple(data["shape"]), dtype=np.dtype(data["dtype"]))
+    if isinstance(data, dict):
+        return {key: _restore_array_placeholders(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [_restore_array_placeholders(value) for value in data]
+    if isinstance(data, tuple):
+        return tuple(_restore_array_placeholders(value) for value in data)
+    return data
+
+
 def _broadcast_array_leaves_from_process0(
     data: Any,
     path: tuple[Any, ...] = (),
@@ -364,7 +440,17 @@ def _sync_model_from_process0(
     if jax.process_count() <= 1:
         return model
     _debug_hang_trace("model_sync_start", model_type=type(model).__name__)
-    model_data = _broadcast_array_leaves_from_process0(model.serialize())
+    local_model_data = model.serialize()
+    model_structure = _broadcast_object_from_process0(
+        _strip_array_leaves(local_model_data) if jax.process_index() == 0 else None,
+        purpose="model structure",
+    )
+    broadcast_input = (
+        local_model_data
+        if jax.process_index() == 0
+        else _restore_array_placeholders(model_structure)
+    )
+    model_data = _broadcast_array_leaves_from_process0(broadcast_input)
     if isinstance(model, ModelWrapper):
         synced_model = ModelWrapper.deserialize(
             model_data,
@@ -1172,7 +1258,7 @@ class DPTrainer:
         _set_jax_mesh(auto_mesh)
         sharding = (
             NamedSharding(auto_mesh, P("data"))
-            if int(os.environ.get("DP_JAX_MULTI_NPROC", "0")) > 1
+            if jax.process_count() > 1
             else None
         )
         model = BaseModel.deserialize(model.serialize())
@@ -1276,7 +1362,10 @@ class DPTrainer:
                 optimizer.update(grads)
 
         start_time = time.time()
-        disp_file_fp = open(self.disp_file, "w")
+        disp_file_fp = open(
+            self.disp_file if _is_process0_or_single_process() else os.devnull,
+            "w",
+        )
         for step in range(self.start_step, self.num_steps):
             trace_step = _debug_should_trace_step(step, self.start_step)
             batch_data = train_data.get_batch()
@@ -1393,7 +1482,11 @@ class DPTrainer:
                 start_time = time.time()
             if (step + 1) % self.save_freq == 0:
                 self._save_checkpoint(model, step + 1)
-                log.info(f"Trained model has been saved to: {Path(f'{self.save_ckpt}-{step + 1}.jax')!s}")
+                if _is_process0_or_single_process():
+                    log.info(
+                        "Trained model has been saved to: "
+                        f"{Path(f'{self.save_ckpt}-{step + 1}.jax')!s}"
+                    )
         disp_file_fp.close()
         self.model = model
 
@@ -1493,7 +1586,7 @@ class DPTrainer:
         _debug_hang_trace("train_multi_set_mesh_end")
         sharding = (
             NamedSharding(auto_mesh, P("data"))
-            if int(os.environ.get("DP_JAX_MULTI_NPROC", "0")) > 1
+            if jax.process_count() > 1
             else None
         )
         _debug_hang_trace("train_multi_sharding_ready", sharding=repr(sharding))
@@ -1649,7 +1742,10 @@ class DPTrainer:
 
         start_time = time.time()
         _debug_hang_trace("train_multi_open_lcurve_start", disp_file=self.disp_file)
-        disp_file_fp = open(self.disp_file, "w")
+        disp_file_fp = open(
+            self.disp_file if _is_process0_or_single_process() else os.devnull,
+            "w",
+        )
         _debug_hang_trace("train_multi_open_lcurve_end", disp_file=self.disp_file)
         task_rng = _make_multitask_task_rng(self.training_param.get("seed", None))
         for step in range(self.start_step, self.num_steps):
@@ -1883,15 +1979,21 @@ class DPTrainer:
                 start_time = time.time()
             if (step + 1) % self.save_freq == 0:
                 self._save_checkpoint(model, step + 1)
-                log.info(f"Trained model has been saved to: {Path(f'{self.save_ckpt}-{step + 1}.jax')!s}")
+                if _is_process0_or_single_process():
+                    log.info(
+                        "Trained model has been saved to: "
+                        f"{Path(f'{self.save_ckpt}-{step + 1}.jax')!s}"
+                    )
         disp_file_fp.close()
         self.model = model
 
     def _save_checkpoint(self, model: DefModel, step: int) -> None:
         _, state = nnx.split(model)
         ckpt_path = Path(f"{self.save_ckpt}-{step}.jax")
-        if ckpt_path.is_dir():
+        _sync_global_devices(f"checkpoint_{step}_before_remove")
+        if _is_process0_or_single_process() and ckpt_path.is_dir():
             shutil.rmtree(ckpt_path)
+        _sync_global_devices(f"checkpoint_{step}_after_remove")
         model_def_script_cpy = deepcopy(self.model_def_script)
         model_def_script_cpy["current_step"] = step
         with ocp.Checkpointer(
@@ -1904,9 +2006,12 @@ class DPTrainer:
                     model_def_script=ocp.args.JsonSave(model_def_script_cpy),
                 ),
             )
-        symlink_prefix_files(f"{self.save_ckpt}-{step}", self.save_ckpt)
-        with open("checkpoint", "w") as fp:
-            fp.write(f"{self.save_ckpt}.jax")
+        _sync_global_devices(f"checkpoint_{step}_after_save")
+        if _is_process0_or_single_process():
+            symlink_prefix_files(f"{self.save_ckpt}-{step}", self.save_ckpt)
+            with open("checkpoint", "w") as fp:
+                fp.write(f"{self.save_ckpt}.jax")
+        _sync_global_devices(f"checkpoint_{step}_after_pointer")
 
     @staticmethod
     def print_on_training(
