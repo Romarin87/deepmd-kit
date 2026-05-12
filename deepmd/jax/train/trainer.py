@@ -3,6 +3,7 @@
 import logging
 import os
 import shutil
+import socket
 import time
 from copy import (
     deepcopy,
@@ -99,6 +100,54 @@ _ACTIVE_JAX_MESH_CONTEXT: list[Any] = []
 
 DefModel = BaseModel | ModelWrapper
 DefLoss = EnergyLoss | EnergyHessianLoss
+
+
+def _debug_hang_enabled() -> bool:
+    return os.environ.get("DP_JAX_DEBUG_HANG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_trace_steps() -> int:
+    try:
+        return int(os.environ.get("DP_JAX_DEBUG_TRACE_STEPS", "1"))
+    except ValueError:
+        return 1
+
+
+def _debug_should_trace_step(step: int, start_step: int) -> bool:
+    return _debug_hang_enabled() and step < start_step + _debug_trace_steps()
+
+
+def _debug_hang_trace(message: str, **values: Any) -> None:
+    if not _debug_hang_enabled():
+        return
+    suffix = ""
+    if values:
+        suffix = " " + " ".join(f"{key}={value!r}" for key, value in values.items())
+    print(
+        "[DP_JAX_DEBUG_HANG] "
+        f"time={time.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"host={socket.gethostname()} "
+        f"pid={os.getpid()} "
+        f"process={jax.process_index()}/{jax.process_count()} "
+        f"{message}{suffix}",
+        flush=True,
+    )
+
+
+def _debug_shape(value: Any) -> Any:
+    return getattr(value, "shape", None)
+
+
+def _debug_block_until_ready(value: Any, label: str) -> None:
+    if not _debug_hang_enabled():
+        return
+    _debug_hang_trace(f"{label}.block_start")
+    try:
+        jax.block_until_ready(value)
+    except Exception as exc:
+        _debug_hang_trace(f"{label}.block_error", error=repr(exc))
+        raise
+    _debug_hang_trace(f"{label}.block_end")
 
 
 def _merge_init_frz_model_data(
@@ -257,26 +306,48 @@ def _make_multitask_task_rng(seed: int | list[int] | None) -> np.random.RandomSt
     return np.random.RandomState(seed_value)
 
 
-def _broadcast_array_leaves_from_process0(data: Any) -> Any:
+def _broadcast_array_leaves_from_process0(
+    data: Any,
+    path: tuple[Any, ...] = (),
+) -> Any:
     if jax.process_count() <= 1:
         return data
     if isinstance(data, dict):
         return {
-            key: _broadcast_array_leaves_from_process0(value)
+            key: _broadcast_array_leaves_from_process0(value, path + (key,))
             for key, value in data.items()
         }
     if isinstance(data, list):
-        return [_broadcast_array_leaves_from_process0(value) for value in data]
+        return [
+            _broadcast_array_leaves_from_process0(value, path + (idx,))
+            for idx, value in enumerate(data)
+        ]
     if isinstance(data, tuple):
-        return tuple(_broadcast_array_leaves_from_process0(value) for value in data)
+        return tuple(
+            _broadcast_array_leaves_from_process0(value, path + (idx,))
+            for idx, value in enumerate(data)
+        )
     if isinstance(data, np.ndarray):
         from jax.experimental import multihost_utils
 
+        _debug_hang_trace(
+            "model_sync_array_start",
+            path="/".join(map(str, path)),
+            shape=data.shape,
+            dtype=data.dtype,
+        )
         shared = multihost_utils.broadcast_one_to_all(
             data,
             is_source=(jax.process_index() == 0),
         )
-        return np.asarray(shared)
+        shared = np.asarray(shared)
+        _debug_hang_trace(
+            "model_sync_array_end",
+            path="/".join(map(str, path)),
+            shape=shared.shape,
+            dtype=shared.dtype,
+        )
+        return shared
     return data
 
 
@@ -288,6 +359,7 @@ def _sync_model_from_process0(
 ) -> DefModel:
     if jax.process_count() <= 1:
         return model
+    _debug_hang_trace("model_sync_start", model_type=type(model).__name__)
     model_data = _broadcast_array_leaves_from_process0(model.serialize())
     if isinstance(model, ModelWrapper):
         synced_model = ModelWrapper.deserialize(
@@ -299,6 +371,7 @@ def _sync_model_from_process0(
         synced_model = BaseModel.deserialize(model_data)
     if jax.process_index() == 0:
         log.info("Synchronized JAX model parameters from process 0.")
+    _debug_hang_trace("model_sync_end", model_type=type(synced_model).__name__)
     return synced_model
 
 
@@ -1193,11 +1266,15 @@ class DPTrainer:
         start_time = time.time()
         disp_file_fp = open(self.disp_file, "w")
         for step in range(self.start_step, self.num_steps):
+            trace_step = _debug_should_trace_step(step, self.start_step)
             batch_data = train_data.get_batch()
             jax_data = convert_numpy_data_to_jax_data(
                 batch_data,
                 sharding,
                 natoms_axis_size=auto_mesh.shape.get("natoms", 1),
+                trace_label=f"single.step{step + 1}.train_convert"
+                if trace_step
+                else None,
             )
             extended_coord, extended_atype, nlist, mapping, fp, ap = prepare_input(
                 rcut=model.get_rcut(),
@@ -1207,7 +1284,12 @@ class DPTrainer:
                 box=jax_data["box"] if jax_data["default_mesh"].size > 1 else None,
                 fparam=jax_data.get("fparam", None),
                 aparam=jax_data.get("aparam", None),
+                trace_label=f"single.step{step + 1}.train_prepare"
+                if trace_step
+                else None,
             )
+            if trace_step:
+                _debug_hang_trace(f"single.step{step + 1}.train_step_start")
             train_step(
                 model,
                 optimizer,
@@ -1220,7 +1302,15 @@ class DPTrainer:
                 fp,
                 ap,
             )
+            if trace_step:
+                _debug_block_until_ready(
+                    nnx.state(model).to_pure_dict(),
+                    f"single.step{step + 1}.train_step_state",
+                )
+                _debug_hang_trace(f"single.step{step + 1}.train_step_end")
             if self.display_in_training and (step == 0 or (step + 1) % self.disp_freq == 0):
+                if trace_step:
+                    _debug_hang_trace(f"single.step{step + 1}.train_loss_start")
                 more_loss = loss_fn_more_loss(
                     model,
                     self.lr.value(step),
@@ -1232,12 +1322,20 @@ class DPTrainer:
                     fp,
                     ap,
                 )
+                if trace_step:
+                    _debug_block_until_ready(
+                        more_loss,
+                        f"single.step{step + 1}.train_loss",
+                    )
                 if valid_data is not None:
                     valid_batch_data = valid_data.get_batch()
                     jax_valid_data = convert_numpy_data_to_jax_data(
                         valid_batch_data,
                         sharding,
                         natoms_axis_size=auto_mesh.shape.get("natoms", 1),
+                        trace_label=f"single.step{step + 1}.valid_convert"
+                        if trace_step
+                        else None,
                     )
                     extended_coord, extended_atype, nlist, mapping, fp, ap = prepare_input(
                         rcut=model.get_rcut(),
@@ -1247,6 +1345,9 @@ class DPTrainer:
                         box=jax_valid_data["box"] if jax_valid_data["find_box"] else None,
                             fparam=jax_valid_data.get("fparam", None),
                             aparam=jax_valid_data.get("aparam", None),
+                            trace_label=f"single.step{step + 1}.valid_prepare"
+                            if trace_step
+                            else None,
                         )
                     valid_more_loss = loss_fn_more_loss(
                         model,
@@ -1259,6 +1360,11 @@ class DPTrainer:
                         fp,
                         ap,
                     )
+                    if trace_step:
+                        _debug_block_until_ready(
+                            valid_more_loss,
+                            f"single.step{step + 1}.valid_loss",
+                        )
                 else:
                     valid_more_loss = None
                 if step == 0:
@@ -1286,11 +1392,23 @@ class DPTrainer:
     ) -> None:
         model = self.model
         assert isinstance(model, ModelWrapper)
+        _debug_hang_trace(
+            "train_multi_start",
+            model_keys=self.model_keys,
+            start_step=self.start_step,
+        )
         _clear_jax_mesh_for_host_ops()
+        _debug_hang_trace("train_multi_after_clear_mesh")
+        _debug_hang_trace("train_multi_resolve_model_prob_start")
         self.model_prob, self.num_steps = _resolve_model_prob_multi(
             self.model_keys,
             self.training_param,
             train_data,
+        )
+        _debug_hang_trace(
+            "train_multi_resolve_model_prob_end",
+            model_prob=self.model_prob,
+            num_steps=self.num_steps,
         )
         finetune_has_new_type = (
             self.finetune_model is not None
@@ -1298,6 +1416,7 @@ class DPTrainer:
         )
         if self.init_model is None and self.restart is None:
             if self.finetune_model is None or finetune_has_new_type:
+                _debug_hang_trace("train_multi_data_stat_start")
                 data_stat_protect_map = {
                     model_key: float(
                         self.model_def_script["model_dict"][model_key].get(
@@ -1312,36 +1431,54 @@ class DPTrainer:
                     dict(zip(self.model_keys, self.model_prob, strict=True)),
                     data_stat_protect_map,
                 )
+                _debug_hang_trace("train_multi_data_stat_end")
         if self.finetune_model is not None:
+            _debug_hang_trace("train_multi_finetune_start")
             self._finetune_multi(train_data)
+            _debug_hang_trace("train_multi_finetune_end")
             model = self.model
             assert isinstance(model, ModelWrapper)
+        _debug_hang_trace("train_multi_model_sync_start")
         model = _sync_model_from_process0(
             model,
             shared_links=self.shared_links,
             case_embd_index=self.case_embd_index,
         )
+        _debug_hang_trace("train_multi_model_sync_end")
         assert isinstance(model, ModelWrapper)
         self._apply_hessian_flags(model)
+        _debug_hang_trace("train_multi_lr_start")
         self.lr = LearningRateExp(
             **self.learning_rate_param,
             num_steps=self.num_steps,
         )
+        _debug_hang_trace("train_multi_lr_end")
+        _debug_hang_trace("train_multi_optax_adam_start")
         tx = optax.adam(
             learning_rate=lambda step: self.lr.value(self.start_step + step),
         )
+        _debug_hang_trace("train_multi_optax_adam_end")
 
+        _debug_hang_trace(
+            "train_multi_make_mesh_start",
+            process_count=jax.process_count(),
+            local_device_count=jax.local_device_count(),
+        )
         auto_mesh = jax.make_mesh(
             (jax.process_count(), jax.local_device_count()),
             ("data", "natoms"),
         )
+        _debug_hang_trace("train_multi_make_mesh_end", mesh=repr(auto_mesh))
+        _debug_hang_trace("train_multi_set_mesh_start")
         _set_nnx_eager_sharding(True)
         _set_jax_mesh(auto_mesh)
+        _debug_hang_trace("train_multi_set_mesh_end")
         sharding = (
             NamedSharding(auto_mesh, P("data"))
             if int(os.environ.get("DP_JAX_MULTI_NPROC", "0")) > 1
             else None
         )
+        _debug_hang_trace("train_multi_sharding_ready", sharding=repr(sharding))
         def debug_first_step(message: str) -> None:
             print(
                 "[DP_JAX_DEBUG_FIRST_STEP] "
@@ -1361,17 +1498,22 @@ class DPTrainer:
             }
             debug_first_step(f"{prefix} batch_shapes={summary}")
 
+        _debug_hang_trace("train_multi_deserialize_for_training_start")
         model = ModelWrapper.deserialize(
             model.serialize(),
             shared_links=self.shared_links,
             case_embd_index=self.case_embd_index,
         )
         self._apply_hessian_flags(model)
+        _debug_hang_trace("train_multi_deserialize_for_training_end")
+        _debug_hang_trace("train_multi_optimizer_start")
         optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+        _debug_hang_trace("train_multi_optimizer_end")
 
         loss_fns = {}
         more_loss_fns = {}
         train_step_fns = {}
+        _debug_hang_trace("train_multi_build_step_fns_start")
         for model_key in self.model_keys:
             branch_loss = self.loss[model_key]
 
@@ -1485,11 +1627,15 @@ class DPTrainer:
             loss_fns[model_key] = make_loss_fn(model_key, branch_loss)
             more_loss_fns[model_key] = make_more_loss_fn(model_key, branch_loss)
             train_step_fns[model_key] = make_train_step(loss_fns[model_key])
+        _debug_hang_trace("train_multi_build_step_fns_end")
 
         start_time = time.time()
+        _debug_hang_trace("train_multi_open_lcurve_start", disp_file=self.disp_file)
         disp_file_fp = open(self.disp_file, "w")
+        _debug_hang_trace("train_multi_open_lcurve_end", disp_file=self.disp_file)
         task_rng = _make_multitask_task_rng(self.training_param.get("seed", None))
         for step in range(self.start_step, self.num_steps):
+            trace_step = _debug_should_trace_step(step, self.start_step)
             model_index = task_rng.choice(
                 np.arange(len(self.model_keys), dtype=np.int_),
                 p=self.model_prob,
@@ -1505,6 +1651,9 @@ class DPTrainer:
                 batch_data,
                 sharding,
                 natoms_axis_size=auto_mesh.shape.get("natoms", 1),
+                trace_label=f"multi.step{step + 1}.{task_key}.train_convert"
+                if trace_step
+                else None,
             )
             if step == self.start_step:
                 debug_batch_summary("after_train_convert_to_jax", jax_data)
@@ -1519,6 +1668,9 @@ class DPTrainer:
                 box=jax_data["box"] if jax_data["default_mesh"].size > 1 else None,
                 fparam=jax_data.get("fparam", None),
                 aparam=jax_data.get("aparam", None),
+                trace_label=f"multi.step{step + 1}.{task_key}.train_prepare"
+                if trace_step
+                else None,
             )
             if step == self.start_step:
                 debug_first_step(f"after_train_prepare_input step={step + 1} task={task_key}")
@@ -1535,6 +1687,11 @@ class DPTrainer:
                 fp,
                 ap,
             )
+            if trace_step:
+                _debug_block_until_ready(
+                    nnx.state(model).to_pure_dict(),
+                    f"multi.step{step + 1}.{task_key}.train_step_state",
+                )
             if step == self.start_step:
                 debug_first_step(f"after_train_step_dispatch step={step + 1} task={task_key}")
             if self.display_in_training and (step == 0 or (step + 1) % self.disp_freq == 0):
@@ -1554,6 +1711,11 @@ class DPTrainer:
                     fp,
                     ap,
                 )
+                if trace_step:
+                    _debug_block_until_ready(
+                        train_results[task_key],
+                        f"multi.step{step + 1}.{task_key}.display_train_loss",
+                    )
                 if step == self.start_step:
                     debug_first_step(f"after_display_train_loss step={step + 1} task={task_key}")
                 for _key in self.model_keys:
@@ -1567,6 +1729,9 @@ class DPTrainer:
                             train_batch_data,
                             sharding,
                             natoms_axis_size=auto_mesh.shape.get("natoms", 1),
+                            trace_label=f"multi.step{step + 1}.{_key}.aux_train_convert"
+                            if trace_step
+                            else None,
                         )
                         if step == self.start_step:
                             debug_batch_summary("after_aux_train_convert_to_jax", jax_train_data)
@@ -1590,6 +1755,9 @@ class DPTrainer:
                             else None,
                             fparam=jax_train_data.get("fparam", None),
                             aparam=jax_train_data.get("aparam", None),
+                            trace_label=f"multi.step{step + 1}.{_key}.aux_train_prepare"
+                            if trace_step
+                            else None,
                         )
                         if step == self.start_step:
                             debug_first_step(f"after_aux_train_prepare_input step={step + 1} task={_key}")
@@ -1607,6 +1775,11 @@ class DPTrainer:
                             train_fp,
                             train_ap,
                         )
+                        if trace_step:
+                            _debug_block_until_ready(
+                                train_results[_key],
+                                f"multi.step{step + 1}.{_key}.aux_train_loss",
+                            )
                         if step == self.start_step:
                             debug_first_step(f"after_aux_train_loss step={step + 1} task={_key}")
                     if valid_data.get(_key) is not None:
@@ -1619,6 +1792,9 @@ class DPTrainer:
                             valid_batch_data,
                             sharding,
                             natoms_axis_size=auto_mesh.shape.get("natoms", 1),
+                            trace_label=f"multi.step{step + 1}.{_key}.valid_convert"
+                            if trace_step
+                            else None,
                         )
                         if step == self.start_step:
                             debug_batch_summary("after_valid_convert_to_jax", jax_valid_data)
@@ -1640,6 +1816,9 @@ class DPTrainer:
                             box=jax_valid_data["box"] if jax_valid_data["find_box"] else None,
                             fparam=jax_valid_data.get("fparam", None),
                             aparam=jax_valid_data.get("aparam", None),
+                            trace_label=f"multi.step{step + 1}.{_key}.valid_prepare"
+                            if trace_step
+                            else None,
                         )
                         if step == self.start_step:
                             debug_first_step(f"after_valid_prepare_input step={step + 1} task={_key}")
@@ -1657,6 +1836,11 @@ class DPTrainer:
                             valid_fp,
                             valid_ap,
                         )
+                        if trace_step:
+                            _debug_block_until_ready(
+                                valid_results[_key],
+                                f"multi.step{step + 1}.{_key}.valid_loss",
+                            )
                         if step == self.start_step:
                             debug_first_step(f"after_valid_loss step={step + 1} task={_key}")
                 if step == 0:
@@ -1841,6 +2025,7 @@ def prepare_input(
     box: Optional[np.ndarray] = None,
     fparam: Optional[np.ndarray] = None,
     aparam: Optional[np.ndarray] = None,
+    trace_label: str | None = None,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -1852,16 +2037,47 @@ def prepare_input(
     nframes, nloc = atype.shape[:2]
     cc, bb, fp, ap = coord, box, fparam, aparam
     del coord, box, fparam, aparam
+    if trace_label is not None:
+        _debug_hang_trace(
+            f"{trace_label}.prepare_start",
+            rcut=rcut,
+            sel=sel,
+            coord_shape=_debug_shape(cc),
+            atype_shape=_debug_shape(atype),
+            box_shape=_debug_shape(bb),
+            fparam_shape=_debug_shape(fp),
+            aparam_shape=_debug_shape(ap),
+        )
     if bb is not None:
+        if trace_label is not None:
+            _debug_hang_trace(f"{trace_label}.normalize_coord_start")
         coord_normalized = normalize_coord(
             cc.reshape(nframes, nloc, 3),
             bb.reshape(nframes, 3, 3),
         )
+        if trace_label is not None:
+            _debug_block_until_ready(coord_normalized, f"{trace_label}.normalize_coord")
     else:
+        if trace_label is not None:
+            _debug_hang_trace(f"{trace_label}.coord_copy_start")
         coord_normalized = cc.copy()
+        if trace_label is not None:
+            _debug_block_until_ready(coord_normalized, f"{trace_label}.coord_copy")
+    if trace_label is not None:
+        _debug_hang_trace(f"{trace_label}.extend_coord_start")
     extended_coord, extended_atype, mapping = extend_coord_with_ghosts(
         coord_normalized, atype, bb, rcut
     )
+    if trace_label is not None:
+        _debug_block_until_ready(
+            (extended_coord, extended_atype, mapping),
+            f"{trace_label}.extend_coord",
+        )
+        _debug_hang_trace(
+            f"{trace_label}.build_neighbor_list_start",
+            extended_coord_shape=_debug_shape(extended_coord),
+            extended_atype_shape=_debug_shape(extended_atype),
+        )
     nlist = build_neighbor_list(
         extended_coord,
         extended_atype,
@@ -1870,7 +2086,19 @@ def prepare_input(
         sel,
         distinguish_types=False,
     )
+    if trace_label is not None:
+        _debug_block_until_ready(nlist, f"{trace_label}.build_neighbor_list")
+        _debug_hang_trace(f"{trace_label}.reshape_extended_coord_start")
     extended_coord = extended_coord.reshape(nframes, -1, 3)
+    if trace_label is not None:
+        _debug_block_until_ready(extended_coord, f"{trace_label}.reshape_extended_coord")
+        _debug_hang_trace(
+            f"{trace_label}.prepare_end",
+            extended_coord_shape=_debug_shape(extended_coord),
+            extended_atype_shape=_debug_shape(extended_atype),
+            nlist_shape=_debug_shape(nlist),
+            mapping_shape=_debug_shape(mapping),
+        )
     return extended_coord, extended_atype, nlist, mapping, fp, ap
 
 
@@ -1878,20 +2106,50 @@ def convert_numpy_data_to_jax_data(
     numpy_data: dict[str, np.ndarray | np.floating],
     sharding: Any | None = None,
     natoms_axis_size: int = 1,
+    trace_label: str | None = None,
 ) -> dict[str, jnp.ndarray | bool]:
-    jax_data = {
-        kk: jnp.asarray(vv) if not kk.startswith("find_") else bool(vv.item())
-        for kk, vv in numpy_data.items()
-    }
+    if trace_label is not None:
+        _debug_hang_trace(
+            f"{trace_label}.convert_start",
+            keys=sorted(numpy_data.keys()),
+            sharding=sharding is not None,
+            natoms_axis_size=natoms_axis_size,
+        )
+    jax_data = {}
+    for kk, vv in numpy_data.items():
+        if kk.startswith("find_"):
+            jax_data[kk] = bool(vv.item())
+            continue
+        if trace_label is not None:
+            _debug_hang_trace(
+                f"{trace_label}.asarray_start",
+                key=kk,
+                shape=_debug_shape(vv),
+                dtype=getattr(vv, "dtype", None),
+            )
+        jax_data[kk] = jnp.asarray(vv)
+        if trace_label is not None:
+            _debug_block_until_ready(jax_data[kk], f"{trace_label}.asarray.{kk}")
     if sharding is not None:
-        jax_data = {
-            kk: jax.make_array_from_process_local_data(sharding, vv)
-            if not kk.startswith("find_")
-            and vv is not None
-            and kk not in {"natoms_vec", "default_mesh"}
-            else vv
-            for kk, vv in jax_data.items()
-        }
+        sharded_data = {}
+        for kk, vv in jax_data.items():
+            if kk.startswith("find_") or vv is None or kk in {"natoms_vec", "default_mesh"}:
+                sharded_data[kk] = vv
+                continue
+            if trace_label is not None:
+                _debug_hang_trace(
+                    f"{trace_label}.make_array_from_process_local_data_start",
+                    key=kk,
+                    shape=_debug_shape(vv),
+                    dtype=getattr(vv, "dtype", None),
+                )
+            sharded_data[kk] = jax.make_array_from_process_local_data(sharding, vv)
+            if trace_label is not None:
+                _debug_block_until_ready(
+                    sharded_data[kk],
+                    f"{trace_label}.make_array_from_process_local_data.{kk}",
+                )
+        jax_data = sharded_data
 
     def _label_sharding(key: str, value: jnp.ndarray) -> Any:
         if key in {"energy", "box", "numb_copy", "virial", "real_natoms_vec"}:
@@ -1908,15 +2166,27 @@ def convert_numpy_data_to_jax_data(
             return None
         return spec
 
-    jax_data = {
-        kk: jax.device_put(
-            vv,
-            _label_sharding(kk, vv),
+    placed_data = {}
+    for kk, vv in jax_data.items():
+        if kk.startswith("find_") or vv is None or kk in {"natoms_vec", "default_mesh"}:
+            placed_data[kk] = vv
+            continue
+        label_sharding = _label_sharding(kk, vv)
+        if trace_label is not None:
+            _debug_hang_trace(
+                f"{trace_label}.device_put_start",
+                key=kk,
+                shape=_debug_shape(vv),
+                dtype=getattr(vv, "dtype", None),
+                label_sharding=repr(label_sharding),
+            )
+        placed_data[kk] = jax.device_put(vv, label_sharding)
+        if trace_label is not None:
+            _debug_block_until_ready(placed_data[kk], f"{trace_label}.device_put.{kk}")
+    jax_data = placed_data
+    if trace_label is not None:
+        _debug_hang_trace(
+            f"{trace_label}.convert_end",
+            shapes={kk: _debug_shape(vv) for kk, vv in jax_data.items()},
         )
-        if not kk.startswith("find_")
-        and vv is not None
-        and kk not in {"natoms_vec", "default_mesh"}
-        else vv
-        for kk, vv in jax_data.items()
-    }
     return jax_data
