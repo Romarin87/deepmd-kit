@@ -150,6 +150,10 @@ def _debug_block_until_ready(value: Any, label: str) -> None:
     _debug_hang_trace(f"{label}.block_end")
 
 
+def _is_process0_or_single_process() -> bool:
+    return jax.process_count() <= 1 or jax.process_index() == 0
+
+
 def _merge_init_frz_model_data(
     target_node: Any,
     source_node: Any,
@@ -1142,13 +1146,21 @@ class DPTrainer:
             and self.restart is None
             and (self.finetune_model is None or finetune_has_new_type)
         ):
-            _compute_single_data_stat(model, train_data)
+            if _is_process0_or_single_process():
+                _compute_single_data_stat(model, train_data)
+            else:
+                _debug_hang_trace("train_single_skip_data_stat_nonzero_process")
 
         if self.finetune_model is not None:
-            self._finetune_single(train_data)
-            model = self.model
-            if isinstance(model, ModelWrapper):
-                raise TypeError("single-task JAX finetune produced a multitask model unexpectedly.")
+            if _is_process0_or_single_process():
+                self._finetune_single(train_data)
+                model = self.model
+                if isinstance(model, ModelWrapper):
+                    raise TypeError(
+                        "single-task JAX finetune produced a multitask model unexpectedly."
+                    )
+            else:
+                _debug_hang_trace("train_single_skip_finetune_nonzero_process")
 
         model = _sync_model_from_process0(model)
         self._apply_hessian_flags(model)
@@ -1416,28 +1428,34 @@ class DPTrainer:
         )
         if self.init_model is None and self.restart is None:
             if self.finetune_model is None or finetune_has_new_type:
-                _debug_hang_trace("train_multi_data_stat_start")
-                data_stat_protect_map = {
-                    model_key: float(
-                        self.model_def_script["model_dict"][model_key].get(
-                            "data_stat_protect", 1e-2
+                if _is_process0_or_single_process():
+                    _debug_hang_trace("train_multi_data_stat_start")
+                    data_stat_protect_map = {
+                        model_key: float(
+                            self.model_def_script["model_dict"][model_key].get(
+                                "data_stat_protect", 1e-2
+                            )
                         )
+                        for model_key in self.model_keys
+                    }
+                    _compute_multitask_data_stat(
+                        model,
+                        train_data,
+                        dict(zip(self.model_keys, self.model_prob, strict=True)),
+                        data_stat_protect_map,
                     )
-                    for model_key in self.model_keys
-                }
-                _compute_multitask_data_stat(
-                    model,
-                    train_data,
-                    dict(zip(self.model_keys, self.model_prob, strict=True)),
-                    data_stat_protect_map,
-                )
-                _debug_hang_trace("train_multi_data_stat_end")
+                    _debug_hang_trace("train_multi_data_stat_end")
+                else:
+                    _debug_hang_trace("train_multi_skip_data_stat_nonzero_process")
         if self.finetune_model is not None:
-            _debug_hang_trace("train_multi_finetune_start")
-            self._finetune_multi(train_data)
-            _debug_hang_trace("train_multi_finetune_end")
-            model = self.model
-            assert isinstance(model, ModelWrapper)
+            if _is_process0_or_single_process():
+                _debug_hang_trace("train_multi_finetune_start")
+                self._finetune_multi(train_data)
+                _debug_hang_trace("train_multi_finetune_end")
+                model = self.model
+                assert isinstance(model, ModelWrapper)
+            else:
+                _debug_hang_trace("train_multi_skip_finetune_nonzero_process")
         _debug_hang_trace("train_multi_model_sync_start")
         model = _sync_model_from_process0(
             model,
