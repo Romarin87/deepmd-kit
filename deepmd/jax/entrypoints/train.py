@@ -4,6 +4,7 @@
 Can handle local or distributed training.
 """
 
+import inspect
 import json
 import logging
 import os
@@ -47,6 +48,58 @@ from deepmd.utils.summary import SummaryPrinter as BaseSummaryPrinter
 __all__ = ["train"]
 
 log = logging.getLogger(__name__)
+
+
+def _get_jax_distributed_config() -> Optional[tuple[str, int, int]]:
+    """Get explicit JAX distributed config from DP or PET environment variables."""
+    multi_nproc = os.environ.get("DP_JAX_MULTI_NPROC") or os.environ.get("PET_NNODES")
+    if not multi_nproc or int(multi_nproc) <= 1:
+        return None
+    multi_nproc_int = int(multi_nproc)
+
+    multi_iproc = os.environ.get("DP_JAX_MULTI_IPROC") or os.environ.get("PET_NODE_RANK")
+    if multi_iproc is None or int(multi_iproc) < 0:
+        raise ValueError(
+            "DP_JAX_MULTI_IPROC/PET_NODE_RANK is not given or is less than 0"
+        )
+    multi_iproc_int = int(multi_iproc)
+
+    multi_host = os.environ.get("DP_JAX_MULTI_HOST")
+    if not multi_host:
+        master_addr = os.environ.get("PET_MASTER_ADDR")
+        master_port = os.environ.get("PET_MASTER_PORT")
+        if master_addr and master_port:
+            multi_host = f"{master_addr}:{master_port}"
+    if not multi_host:
+        raise ValueError(
+            "DP_JAX_MULTI_HOST or PET_MASTER_ADDR/PET_MASTER_PORT is not given"
+        )
+
+    return multi_host, multi_nproc_int, multi_iproc_int
+
+
+def _get_jax_local_device_ids() -> Optional[list[int]]:
+    """Get local device ids for one JAX process using all visible local GPUs."""
+    local_device_ids = os.environ.get("DP_JAX_LOCAL_DEVICE_IDS")
+    if local_device_ids:
+        return [int(ii) for ii in local_device_ids.split(",") if ii.strip()]
+
+    local_device_count = os.environ.get("DP_JAX_LOCAL_DEVICE_COUNT")
+    if local_device_count:
+        return list(range(int(local_device_count)))
+
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices:
+        visible_device_count = len(
+            [ii for ii in visible_devices.split(",") if ii.strip()]
+        )
+        return list(range(visible_device_count))
+
+    pet_nproc_per_node = os.environ.get("PET_NPROC_PER_NODE")
+    if pet_nproc_per_node:
+        return list(range(int(pet_nproc_per_node)))
+
+    return None
 
 
 class SummaryPrinter(BaseSummaryPrinter):
@@ -94,21 +147,30 @@ def train(
     model_branch: str = "",
     **kwargs: Any,
 ) -> None:
-    if int(os.environ.get("DP_JAX_MULTI_NPROC", "0")) > 1:
-        multi_nproc = int(os.environ.get("DP_JAX_MULTI_NPROC", "0"))
-        if multi_nproc <= 0:
-            raise ValueError("DP_JAX_MULTI_NPROC is less than or equal to 0")
-        multi_iproc = int(os.environ.get("DP_JAX_MULTI_IPROC", "-1"))
-        if multi_iproc < 0:
-            raise ValueError("DP_JAX_MULTI_IPROC is less than 0")
-        multi_host = os.environ.get("DP_JAX_MULTI_HOST")
-        if multi_host is None:
-            raise ValueError("DP_JAX_MULTI_HOST is not given")
-        jax.distributed.initialize(
+    distributed_config = _get_jax_distributed_config()
+    if distributed_config is not None:
+        multi_host, multi_nproc, multi_iproc = distributed_config
+        init_kwargs = dict(
             coordinator_address=multi_host,
             num_processes=multi_nproc,
             process_id=multi_iproc,
         )
+        local_device_ids = _get_jax_local_device_ids()
+        if local_device_ids is not None:
+            init_kwargs["local_device_ids"] = local_device_ids
+        if "cluster_detection_method" in inspect.signature(
+            jax.distributed.initialize
+        ).parameters:
+            init_kwargs["cluster_detection_method"] = "deactivate"
+        print(
+            "JAX distributed initialize: "
+            f"coordinator_address={multi_host}, "
+            f"num_processes={multi_nproc}, "
+            f"process_id={multi_iproc}, "
+            f"local_device_ids={local_device_ids}",
+            flush=True,
+        )
+        jax.distributed.initialize(**init_kwargs)
 
     jdata = j_loader(INPUT)
 
