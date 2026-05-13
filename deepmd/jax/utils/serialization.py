@@ -36,16 +36,6 @@ from deepmd.utils.model_branch_dict import (
 )
 
 
-def _is_topology_mismatch_error(exc: Exception) -> bool:
-    message = str(exc)
-    return (
-        "Topology mismatch detected" in message
-        or "available devices are different from the devices used to save the checkpoint"
-        in message
-        or "was not found in jax.local_devices()" in message
-    )
-
-
 def select_model_branch(
     data: dict,
     model_branch: str | None,
@@ -217,52 +207,41 @@ def serialize_from_file(model_file: str) -> dict:
         with ocp.Checkpointer(
             ocp.CompositeCheckpointHandler("state", "model_def_script")
         ) as checkpointer:
-            try:
-                data = checkpointer.restore(
-                    Path(model_file).absolute(),
-                    ocp.args.Composite(
-                        state=ocp.args.StandardRestore(),
-                        model_def_script=ocp.args.JsonRestore(),
+            model_def_script = checkpointer.restore(
+                Path(model_file).absolute(),
+                ocp.args.Composite(model_def_script=ocp.args.JsonRestore()),
+            ).model_def_script
+            shared_links = model_def_script.get("shared_links")
+            abstract_model = get_model_for_wrapper(
+                model_def_script,
+                shared_links=shared_links,
+            )
+            if "model_dict" in model_def_script:
+                for model_key in model_def_script["model_dict"]:
+                    if model_def_script["model_dict"][model_key].get(
+                        "hessian_mode", False
+                    ):
+                        abstract_model[model_key].enable_hessian()
+            elif model_def_script.get("hessian_mode", False):
+                abstract_model.enable_hessian()
+            _, abstract_state = nnx.split(abstract_model)
+            data = checkpointer.restore(
+                Path(model_file).absolute(),
+                ocp.args.Composite(
+                    state=ocp.args.StandardRestore(
+                        item=abstract_state.to_pure_dict(),
+                        strict=False,
                     ),
-                )
-            except ValueError as exc:
-                if not _is_topology_mismatch_error(exc):
-                    raise
-                model_def_script = checkpointer.restore(
-                    Path(model_file).absolute(),
-                    ocp.args.Composite(model_def_script=ocp.args.JsonRestore()),
-                ).model_def_script
-                shared_links = model_def_script.get("shared_links")
-                abstract_model = get_model_for_wrapper(
-                    model_def_script,
-                    shared_links=shared_links,
-                )
-                if "model_dict" in model_def_script:
-                    for model_key in model_def_script["model_dict"]:
-                        if model_def_script["model_dict"][model_key].get(
-                            "hessian_mode", False
-                        ):
-                            abstract_model[model_key].enable_hessian()
-                elif model_def_script.get("hessian_mode", False):
-                    abstract_model.enable_hessian()
-                _, abstract_state = nnx.split(abstract_model)
-                data = checkpointer.restore(
-                    Path(model_file).absolute(),
-                    ocp.args.Composite(
-                        state=ocp.args.StandardRestore(
-                            item=abstract_state.to_pure_dict(),
-                            strict=False,
-                        ),
-                        model_def_script=ocp.args.JsonRestore(),
-                    ),
-                )
+                    model_def_script=ocp.args.JsonRestore(),
+                ),
+            )
         state = data.state
 
         def convert_str_to_int_key(item: dict) -> None:
             for key, value in item.copy().items():
                 if isinstance(value, dict):
                     convert_str_to_int_key(value)
-                if key.isdigit():
+                if isinstance(key, str) and key.isdigit():
                     item[int(key)] = item.pop(key)
 
         convert_str_to_int_key(state)

@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import logging
 import os
-import pickle
 import shutil
 import socket
 import time
@@ -71,6 +70,11 @@ from deepmd.jax.model.multitask import (
 )
 from deepmd.jax.utils.finetune import (
     merge_finetune_model_data,
+)
+from deepmd.jax.utils.distributed import (
+    broadcast_object_from_process0,
+    is_process0_or_single_process,
+    run_on_process0_or_raise,
 )
 from deepmd.jax.utils.multi_task import (
     get_case_embd_config,
@@ -152,7 +156,7 @@ def _debug_block_until_ready(value: Any, label: str) -> None:
 
 
 def _is_process0_or_single_process() -> bool:
-    return jax.process_count() <= 1 or jax.process_index() == 0
+    return is_process0_or_single_process()
 
 
 def _sync_global_devices(name: str) -> None:
@@ -320,39 +324,11 @@ def _make_multitask_task_rng(seed: int | list[int] | None) -> np.random.RandomSt
 
 
 def _broadcast_object_from_process0(data: Any, *, purpose: str) -> Any:
-    if jax.process_count() <= 1:
-        return data
-    from jax.experimental import multihost_utils
+    return broadcast_object_from_process0(data, purpose=purpose)
 
-    payload = (
-        np.array(
-            np.frombuffer(
-                pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL),
-                dtype=np.uint8,
-            ),
-            copy=True,
-        )
-        if jax.process_index() == 0
-        else np.zeros(0, dtype=np.uint8)
-    )
-    payload_size = np.array([payload.size], dtype=np.int64)
-    shared_size = multihost_utils.broadcast_one_to_all(
-        payload_size,
-        is_source=(jax.process_index() == 0),
-    )
-    shared_size = int(np.asarray(shared_size)[0])
-    if jax.process_index() != 0:
-        payload = np.zeros(shared_size, dtype=np.uint8)
-    elif payload.size != shared_size:
-        raise ValueError(
-            f"Unexpected {purpose} payload size mismatch: "
-            f"{payload.size} != {shared_size}"
-        )
-    shared_payload = multihost_utils.broadcast_one_to_all(
-        payload,
-        is_source=(jax.process_index() == 0),
-    )
-    return pickle.loads(np.asarray(shared_payload, dtype=np.uint8).tobytes())
+
+def _run_on_process0_or_raise(name: str, func: Any) -> Any:
+    return run_on_process0_or_raise(name, func)
 
 
 def _strip_array_leaves(data: Any) -> Any:
@@ -1232,21 +1208,25 @@ class DPTrainer:
             and self.restart is None
             and (self.finetune_model is None or finetune_has_new_type)
         ):
-            if _is_process0_or_single_process():
+            def run_data_stat() -> None:
                 _compute_single_data_stat(model, train_data)
-            else:
+
+            if not _is_process0_or_single_process():
                 _debug_hang_trace("train_single_skip_data_stat_nonzero_process")
+            _run_on_process0_or_raise("single-task data statistics", run_data_stat)
 
         if self.finetune_model is not None:
-            if _is_process0_or_single_process():
+            def run_finetune() -> None:
                 self._finetune_single(train_data)
-                model = self.model
-                if isinstance(model, ModelWrapper):
+                if isinstance(self.model, ModelWrapper):
                     raise TypeError(
                         "single-task JAX finetune produced a multitask model unexpectedly."
                     )
-            else:
+
+            if not _is_process0_or_single_process():
                 _debug_hang_trace("train_single_skip_finetune_nonzero_process")
+            _run_on_process0_or_raise("single-task finetune", run_finetune)
+            model = self.model
 
         model = _sync_model_from_process0(model)
         self._apply_hessian_flags(model)
@@ -1521,7 +1501,7 @@ class DPTrainer:
         )
         if self.init_model is None and self.restart is None:
             if self.finetune_model is None or finetune_has_new_type:
-                if _is_process0_or_single_process():
+                def run_data_stat() -> None:
                     _debug_hang_trace("train_multi_data_stat_start")
                     data_stat_protect_map = {
                         model_key: float(
@@ -1538,17 +1518,22 @@ class DPTrainer:
                         data_stat_protect_map,
                     )
                     _debug_hang_trace("train_multi_data_stat_end")
-                else:
+
+                if not _is_process0_or_single_process():
                     _debug_hang_trace("train_multi_skip_data_stat_nonzero_process")
+                _run_on_process0_or_raise("multitask data statistics", run_data_stat)
         if self.finetune_model is not None:
-            if _is_process0_or_single_process():
+            def run_finetune() -> None:
                 _debug_hang_trace("train_multi_finetune_start")
                 self._finetune_multi(train_data)
                 _debug_hang_trace("train_multi_finetune_end")
-                model = self.model
-                assert isinstance(model, ModelWrapper)
-            else:
+                assert isinstance(self.model, ModelWrapper)
+
+            if not _is_process0_or_single_process():
                 _debug_hang_trace("train_multi_skip_finetune_nonzero_process")
+            _run_on_process0_or_raise("multitask finetune", run_finetune)
+            model = self.model
+            assert isinstance(model, ModelWrapper)
         _debug_hang_trace("train_multi_model_sync_start")
         model = _sync_model_from_process0(
             model,

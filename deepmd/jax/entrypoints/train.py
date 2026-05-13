@@ -8,6 +8,10 @@ import inspect
 import json
 import logging
 import os
+import pickle
+import subprocess
+import sys
+import tempfile
 import time
 from typing import (
     Any,
@@ -23,6 +27,9 @@ from deepmd.jax.env import (
 )
 from deepmd.jax.train.trainer import (
     DPTrainer,
+)
+from deepmd.jax.utils.distributed import (
+    broadcast_object_from_process0,
 )
 from deepmd.jax.utils.finetune import (
     get_finetune_rules,
@@ -48,6 +55,59 @@ from deepmd.utils.summary import SummaryPrinter as BaseSummaryPrinter
 __all__ = ["train"]
 
 log = logging.getLogger(__name__)
+
+
+def _serialize_finetune_in_subprocess(finetune: str) -> dict[str, Any]:
+    """Read a .jax checkpoint outside the distributed parent process."""
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as fp:
+        output = fp.name
+    code = (
+        "import pickle, sys\n"
+        "from deepmd.jax.utils.serialization import serialize_from_file\n"
+        "data = serialize_from_file(sys.argv[1])\n"
+        "with open(sys.argv[2], 'wb') as fp:\n"
+        "    pickle.dump(data, fp, protocol=pickle.HIGHEST_PROTOCOL)\n"
+    )
+    try:
+        subprocess.run(
+            [sys.executable, "-c", code, finetune, output],
+            check=True,
+            env=os.environ.copy(),
+        )
+        with open(output, "rb") as fp:
+            return pickle.load(fp)
+    finally:
+        try:
+            os.remove(output)
+        except OSError:
+            pass
+
+
+def _load_finetune_data(finetune: str) -> dict[str, Any]:
+    if jax.process_count() <= 1:
+        return serialize_from_file(finetune)
+
+    finetune_data = None
+    status: dict[str, Any] = {"ok": True}
+    if jax.process_index() == 0:
+        try:
+            finetune_data = _serialize_finetune_in_subprocess(finetune)
+            status["model_def_script"] = finetune_data["model_def_script"]
+        except Exception as exc:
+            status = {
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+    status = broadcast_object_from_process0(status, purpose="finetune metadata")
+    if not status["ok"]:
+        raise RuntimeError(
+            "JAX process 0 failed to load finetune checkpoint: "
+            f"{status['error_type']}: {status['error']}"
+        )
+    if finetune_data is None:
+        finetune_data = {"model_def_script": status["model_def_script"]}
+    return finetune_data
 
 
 def _get_jax_distributed_config() -> Optional[tuple[str, int, int]]:
@@ -184,11 +244,13 @@ def train(
     finetune_links = None
     finetune_data = None
     if finetune is not None:
+        finetune_data = _load_finetune_data(finetune)
         jdata["model"], finetune_links, finetune_data = get_finetune_rules(
             finetune,
             jdata["model"],
             model_branch=model_branch,
             change_model_params=use_pretrain_script,
+            finetune_data=finetune_data,
         )
     if (init_model is not None or init_frz_model) and use_pretrain_script:
         source_model = init_model if init_model is not None else init_frz_model

@@ -116,8 +116,10 @@ def get_finetune_rules(
     *,
     model_branch: str = "",
     change_model_params: bool = True,
+    finetune_data: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, FinetuneRuleItem], dict[str, Any]]:
-    finetune_data = _validate_finetune_source(finetune_model)
+    if finetune_data is None:
+        finetune_data = _validate_finetune_source(finetune_model)
     pretrained_model_config = finetune_data["model_def_script"]
     finetune_from_multi_task = "model_dict" in pretrained_model_config
     multi_task = "model_dict" in model_config
