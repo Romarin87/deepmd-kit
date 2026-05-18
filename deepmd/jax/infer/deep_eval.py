@@ -554,12 +554,10 @@ class DeepEval(DeepEvalBackend):
         eye = jnp.eye(dim, dtype=coord_frame.dtype)
         for start in range(0, dim, chunk_size):
             basis = eye[start : start + chunk_size]
-            rows = jax.vmap(
-                lambda cotangent: jax.grad(
-                    lambda coord: jnp.vdot(grad_fn(coord), cotangent)
-                )(coord_frame)
+            columns_t = jax.vmap(
+                lambda tangent: jax.jvp(grad_fn, (coord_frame,), (tangent,))[1]
             )(basis)
-            hessian = hessian.at[start : start + basis.shape[0], :].set(rows)
+            hessian = hessian.at[:, start : start + basis.shape[0]].set(columns_t.T)
         return to_numpy_array(hessian)
 
     def get_model(self) -> Any:
