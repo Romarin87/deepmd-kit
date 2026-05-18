@@ -184,12 +184,6 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
             serialized_hessian_block = _export_hessian_block(
                 model,
                 hessian_chunk_size,
-                has_box=True,
-            ).serialize()
-            serialized_hessian_block_no_box = _export_hessian_block(
-                model,
-                hessian_chunk_size,
-                has_box=False,
             ).serialize()
 
         data = data.copy()
@@ -205,9 +199,6 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
         if hessian_chunk_size > 0:
             data["@variables"]["stablehlo_hessian_block"] = np.void(
                 serialized_hessian_block
-            )
-            data["@variables"]["stablehlo_hessian_block_no_box"] = np.void(
-                serialized_hessian_block_no_box
             )
         data["constants"] = {
             "type_map": model.get_type_map(),
@@ -345,15 +336,14 @@ def _get_hessian_chunk_size() -> int:
 def _export_hessian_block(
     model: BaseModel,
     chunk_size: int,
-    *,
-    has_box: bool,
 ) -> "jax_export.Exported":
     nf, nloc = jax_export.symbolic_shape("nf, nloc")
 
     def call_hessian_block(
-        coord: jnp.ndarray,
-        atype: jnp.ndarray,
-        box: jnp.ndarray | None,
+        extended_coord: jnp.ndarray,
+        extended_atype: jnp.ndarray,
+        nlist: jnp.ndarray,
+        mapping: jnp.ndarray,
         fparam: jnp.ndarray | None,
         aparam: jnp.ndarray | None,
         block_index: jnp.ndarray,
@@ -361,16 +351,18 @@ def _export_hessian_block(
         block_index = jnp.asarray(block_index, dtype=jnp.int32)
 
         def energy_one(
-            coord_one: jnp.ndarray,
-            atype_one: jnp.ndarray,
-            box_one: jnp.ndarray | None,
+            extended_coord_one: jnp.ndarray,
+            extended_atype_one: jnp.ndarray,
+            nlist_one: jnp.ndarray,
+            mapping_one: jnp.ndarray,
             fparam_one: jnp.ndarray | None,
             aparam_one: jnp.ndarray | None,
         ) -> jnp.ndarray:
-            output = model.call_common(
-                coord_one[None, ...],
-                atype_one[None, ...],
-                box=None if box_one is None else box_one[None, ...],
+            output = model.call_common_lower(
+                extended_coord_one[None, ...],
+                extended_atype_one[None, ...],
+                nlist_one[None, ...],
+                mapping=mapping_one[None, ...],
                 fparam=None if fparam_one is None else fparam_one[None, ...],
                 aparam=None if aparam_one is None else aparam_one[None, ...],
                 do_atomic_virial=False,
@@ -380,13 +372,14 @@ def _export_hessian_block(
         grad_one = jax.grad(energy_one, argnums=0)
 
         def hessian_block_one(
-            coord_one: jnp.ndarray,
-            atype_one: jnp.ndarray,
-            box_one: jnp.ndarray | None,
+            extended_coord_one: jnp.ndarray,
+            extended_atype_one: jnp.ndarray,
+            nlist_one: jnp.ndarray,
+            mapping_one: jnp.ndarray,
             fparam_one: jnp.ndarray | None,
             aparam_one: jnp.ndarray | None,
         ) -> jnp.ndarray:
-            dim = coord_one.size
+            dim = extended_coord_one.size
             row_ids = block_index * chunk_size + jnp.arange(chunk_size)
             safe_row_ids = jnp.minimum(row_ids, dim - 1)
 
@@ -394,21 +387,23 @@ def _export_hessian_block(
                 return jax.grad(
                     lambda cc: grad_one(
                         cc,
-                        atype_one,
-                        box_one,
+                        extended_atype_one,
+                        nlist_one,
+                        mapping_one,
                         fparam_one,
                         aparam_one,
                     ).reshape(-1)[row_id]
-                )(coord_one).reshape(-1)
+                )(extended_coord_one).reshape(-1)
 
             rows = jax.vmap(hessian_row)(safe_row_ids)
             return jnp.where(row_ids[:, None] < dim, rows, 0.0)
 
         return {
             "energy_derv_r_derv_r_block": jax.vmap(hessian_block_one)(
-                coord,
-                atype,
-                box,
+                extended_coord,
+                extended_atype,
+                nlist,
+                mapping,
                 fparam,
                 aparam,
             )
@@ -417,7 +412,8 @@ def _export_hessian_block(
     exported = jax_export.export(jax.jit(call_hessian_block))(
         jax.ShapeDtypeStruct((nf, nloc, 3), jnp.float64),
         jax.ShapeDtypeStruct((nf, nloc), jnp.int32),
-        jax.ShapeDtypeStruct((nf, 3, 3), jnp.float64) if has_box else None,
+        jax.ShapeDtypeStruct((nf, nloc, model.get_nnei()), jnp.int64),
+        jax.ShapeDtypeStruct((nf, nloc), jnp.int64),
         jax.ShapeDtypeStruct((nf, model.get_dim_fparam()), jnp.float64)
         if model.get_dim_fparam()
         else None,

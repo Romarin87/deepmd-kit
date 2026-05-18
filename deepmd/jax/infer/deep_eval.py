@@ -109,13 +109,6 @@ class DeepEval(DeepEvalBackend):
                     if "stablehlo_hessian_block" in model_data["@variables"]
                     else None
                 ),
-                stablehlo_hessian_block_no_box=(
-                    model_data["@variables"][
-                        "stablehlo_hessian_block_no_box"
-                    ].tobytes()
-                    if "stablehlo_hessian_block_no_box" in model_data["@variables"]
-                    else None
-                ),
                 model_def_script=json.dumps(model_data["model_def_script"]),
                 **model_data["constants"],
             )
