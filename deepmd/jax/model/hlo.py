@@ -12,6 +12,10 @@ from deepmd.dpmodel.output_def import (
     ModelOutputDef,
     OutputVariableDef,
 )
+from deepmd.dpmodel.utils import (
+    build_neighbor_list,
+    extend_coord_with_ghosts,
+)
 from deepmd.jax.env import (
     jax_export,
     jnp,
@@ -68,7 +72,6 @@ class HLO(BaseModel):
         min_nbor_dist: float | None,
         sel: list[int],
         stablehlo_hessian_block: bytearray | None = None,
-        stablehlo_hessian_block_no_box: bytearray | None = None,
         # new in v3.1.1
         has_default_fparam: bool = False,
         default_fparam: list[float] | None = None,
@@ -85,11 +88,6 @@ class HLO(BaseModel):
         self._call_hessian_block = (
             jax_export.deserialize(stablehlo_hessian_block).call
             if stablehlo_hessian_block is not None
-            else None
-        )
-        self._call_hessian_block_no_box = (
-            jax_export.deserialize(stablehlo_hessian_block_no_box).call
-            if stablehlo_hessian_block_no_box is not None
             else None
         )
         self.stablehlo = stablehlo
@@ -249,25 +247,32 @@ class HLO(BaseModel):
     ) -> dict[str, jnp.ndarray]:
         if self.hessian_chunk_size <= 0:
             raise RuntimeError("This HLO model does not contain Hessian block output.")
-        if box is None:
-            if self._call_hessian_block_no_box is None:
-                raise RuntimeError(
-                    "This HLO model does not contain no-box Hessian block output."
-                )
-            return self._call_hessian_block_no_box(
-                coord,
-                atype,
-                None,
-                fparam,
-                aparam,
-                jnp.asarray(block_index, dtype=jnp.int32),
-            )
+        if box is not None:
+            raise NotImplementedError("Chunked Hessian HLO only supports no-PBC input.")
         if self._call_hessian_block is None:
             raise RuntimeError("This HLO model does not contain Hessian block output.")
-        return self._call_hessian_block(
+        nframes, nloc = atype.shape[:2]
+        coord = coord.reshape(nframes, nloc, 3)
+        extended_coord, extended_atype, mapping = extend_coord_with_ghosts(
             coord,
             atype,
-            box,
+            None,
+            self.get_rcut(),
+        )
+        nlist = build_neighbor_list(
+            extended_coord,
+            extended_atype,
+            nloc,
+            self.get_rcut(),
+            self.get_sel(),
+            distinguish_types=False,
+        )
+        extended_coord = extended_coord.reshape(nframes, -1, 3)
+        return self._call_hessian_block(
+            extended_coord,
+            extended_atype,
+            nlist,
+            mapping,
             fparam,
             aparam,
             jnp.asarray(block_index, dtype=jnp.int32),
