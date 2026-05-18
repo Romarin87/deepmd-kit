@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import json
-import os
 from collections.abc import (
     Callable,
 )
@@ -48,10 +47,6 @@ from deepmd.infer.deep_wfc import (
 from deepmd.jax.common import (
     to_jax_array,
 )
-from deepmd.jax.env import (
-    jax,
-    jnp,
-)
 from deepmd.jax.model.hlo import (
     HLO,
 )
@@ -61,21 +56,6 @@ from deepmd.jax.utils.auto_batch_size import (
 
 if TYPE_CHECKING:
     import ase.neighborlist
-
-
-def _get_hessian_chunk_size() -> int:
-    raw_value = os.environ.get("DP_JAX_HESSIAN_CHUNK_SIZE")
-    if raw_value is None or raw_value == "":
-        return 0
-    try:
-        chunk_size = int(raw_value)
-    except ValueError as err:
-        raise ValueError(
-            "DP_JAX_HESSIAN_CHUNK_SIZE must be a positive integer"
-        ) from err
-    if chunk_size <= 0:
-        raise ValueError("DP_JAX_HESSIAN_CHUNK_SIZE must be a positive integer")
-    return chunk_size
 
 
 class DeepEval(DeepEvalBackend):
@@ -135,17 +115,6 @@ class DeepEval(DeepEvalBackend):
             self.dp = TFModelWrapper(model_file)
         else:
             raise ValueError("Unsupported file extension")
-        self.hessian_chunk_size = _get_hessian_chunk_size()
-        if self.hessian_chunk_size > 0:
-            if not isinstance(self.dp, HLO):
-                raise NotImplementedError(
-                    "DP_JAX_HESSIAN_CHUNK_SIZE is only supported for JAX HLO models"
-                )
-            if self._has_builtin_hessian():
-                raise ValueError(
-                    "DP_JAX_HESSIAN_CHUNK_SIZE requires an EF-only HLO. "
-                    "Please freeze the model without --hessian."
-                )
         self.rcut = self.dp.get_rcut()
         self.type_map = self.dp.get_type_map()
         if isinstance(auto_batch_size, bool):
@@ -417,18 +386,6 @@ class DeepEval(DeepEvalBackend):
             batch_output = batch_output[0]
         for kk, vv in batch_output.items():
             batch_output[kk] = to_numpy_array(vv)
-        if self.hessian_chunk_size > 0 and any(
-            x.category == OutputVariableCategory.DERV_R_DERV_R for x in request_defs
-        ):
-            batch_output["energy_derv_r_derv_r"] = self._eval_chunked_hessian(
-                model,
-                coord_input,
-                type_input,
-                box_input,
-                fparam_input,
-                aparam_input,
-                self.hessian_chunk_size,
-            )
 
         results = []
         for odef in request_defs:
@@ -477,88 +434,9 @@ class DeepEval(DeepEvalBackend):
         """Get model definition script."""
         return json.loads(self.dp.get_model_def_script())
 
-    def _has_builtin_hessian(self) -> bool:
+    def get_has_hessian(self) -> bool:
         model_def_script = self.get_model_def_script()
         return model_def_script.get("hessian_mode", False)
-
-    def get_has_hessian(self) -> bool:
-        return self._has_builtin_hessian() or self.hessian_chunk_size > 0
-
-    def _eval_chunked_hessian(
-        self,
-        model: Any,
-        coord_input: np.ndarray,
-        type_input: np.ndarray,
-        box_input: np.ndarray | None,
-        fparam_input: np.ndarray | None,
-        aparam_input: np.ndarray | None,
-        chunk_size: int,
-    ) -> np.ndarray:
-        nframes, natoms = coord_input.shape[:2]
-        hessians = []
-        for iframe in range(nframes):
-            coord_frame = to_jax_array(coord_input[iframe]).reshape(-1)
-            type_frame = to_jax_array(type_input[iframe])
-            box_frame = (
-                None if box_input is None else to_jax_array(box_input[iframe])
-            )
-            fparam_frame = (
-                None if fparam_input is None else to_jax_array(fparam_input[iframe])
-            )
-            aparam_frame = (
-                None if aparam_input is None else to_jax_array(aparam_input[iframe])
-            )
-            hessians.append(
-                self._eval_chunked_hessian_frame(
-                    model,
-                    coord_frame,
-                    type_frame,
-                    box_frame,
-                    fparam_frame,
-                    aparam_frame,
-                    natoms,
-                    chunk_size,
-                )
-            )
-        return np.stack(hessians, axis=0)
-
-    def _eval_chunked_hessian_frame(
-        self,
-        model: Any,
-        coord_frame: jnp.ndarray,
-        type_frame: jnp.ndarray,
-        box_frame: jnp.ndarray | None,
-        fparam_frame: jnp.ndarray | None,
-        aparam_frame: jnp.ndarray | None,
-        natoms: int,
-        chunk_size: int,
-    ) -> np.ndarray:
-        dim = natoms * 3
-
-        def energy_fn(coord_flat: jnp.ndarray) -> jnp.ndarray:
-            coord = coord_flat.reshape(1, natoms, 3)
-            output = model(
-                coord,
-                type_frame[None, ...],
-                box=None if box_frame is None else box_frame[None, ...],
-                fparam=None if fparam_frame is None else fparam_frame[None, ...],
-                aparam=None if aparam_frame is None else aparam_frame[None, ...],
-                do_atomic_virial=False,
-            )
-            if isinstance(output, tuple):
-                output = output[0]
-            return jnp.sum(output["energy_redu"])
-
-        grad_fn = jax.grad(energy_fn)
-        hessian = jnp.zeros((dim, dim), dtype=coord_frame.dtype)
-        eye = jnp.eye(dim, dtype=coord_frame.dtype)
-        for start in range(0, dim, chunk_size):
-            basis = eye[start : start + chunk_size]
-            columns_t = jax.vmap(
-                lambda tangent: jax.jvp(grad_fn, (coord_frame,), (tangent,))[1]
-            )(basis)
-            hessian = hessian.at[:, start : start + basis.shape[0]].set(columns_t.T)
-        return to_numpy_array(hessian)
 
     def get_model(self) -> Any:
         """Get the JAX model as BaseModel.
