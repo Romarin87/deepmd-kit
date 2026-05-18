@@ -2,6 +2,7 @@
 from copy import (
     deepcopy,
 )
+import os
 from pathlib import (
     Path,
 )
@@ -112,9 +113,13 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
             )
         model = BaseModel.deserialize(data["model"])
         model_def_script = data["model_def_script"]
+        hessian_chunk_size = _get_hessian_chunk_size() if hessian else 0
         if hessian:
-            model.enable_hessian()
-            model_def_script["hessian_mode"] = True
+            if hessian_chunk_size > 0:
+                model_def_script["hessian_chunk_size"] = hessian_chunk_size
+            else:
+                model.enable_hessian()
+                model_def_script["hessian_mode"] = True
         call_lower = model.call_common_lower
 
         nf, nloc, nghost = jax_export.symbolic_shape("nf, nloc, nghost")
@@ -175,6 +180,17 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
         )
         serialized_no_ghost: bytearray = exported_no_ghost.serialize()
         serialized_atomic_virial_no_ghost = exported_atomic_virial_no_ghost.serialize()
+        if hessian_chunk_size > 0:
+            serialized_hessian_block = _export_hessian_block(
+                model,
+                hessian_chunk_size,
+                has_box=True,
+            ).serialize()
+            serialized_hessian_block_no_box = _export_hessian_block(
+                model,
+                hessian_chunk_size,
+                has_box=False,
+            ).serialize()
 
         data = data.copy()
         data.setdefault("@variables", {})
@@ -186,6 +202,13 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
         data["@variables"]["stablehlo_atomic_virial_no_ghost"] = np.void(
             serialized_atomic_virial_no_ghost
         )
+        if hessian_chunk_size > 0:
+            data["@variables"]["stablehlo_hessian_block"] = np.void(
+                serialized_hessian_block
+            )
+            data["@variables"]["stablehlo_hessian_block_no_box"] = np.void(
+                serialized_hessian_block_no_box
+            )
         data["constants"] = {
             "type_map": model.get_type_map(),
             "rcut": model.get_rcut(),
@@ -199,6 +222,7 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
             "sel": model.get_sel(),
             "has_default_fparam": model.has_default_fparam(),
             "default_fparam": model.get_default_fparam(),
+            "hessian_chunk_size": hessian_chunk_size,
         }
         save_dp_model(filename=model_file, model_dict=data)
     elif model_file.endswith(".savedmodel"):
@@ -301,3 +325,105 @@ def serialize_from_file(model_file: str) -> dict:
         return data
     else:
         raise ValueError("JAX backend only supports converting .jax directory")
+
+
+def _get_hessian_chunk_size() -> int:
+    raw_value = os.environ.get("DP_JAX_HESSIAN_CHUNK_SIZE")
+    if raw_value is None or raw_value == "":
+        return 0
+    try:
+        chunk_size = int(raw_value)
+    except ValueError as err:
+        raise ValueError(
+            "DP_JAX_HESSIAN_CHUNK_SIZE must be a positive integer"
+        ) from err
+    if chunk_size <= 0:
+        raise ValueError("DP_JAX_HESSIAN_CHUNK_SIZE must be a positive integer")
+    return chunk_size
+
+
+def _export_hessian_block(
+    model: BaseModel,
+    chunk_size: int,
+    *,
+    has_box: bool,
+) -> "jax_export.Exported":
+    nf, nloc = jax_export.symbolic_shape("nf, nloc")
+
+    def call_hessian_block(
+        coord: jnp.ndarray,
+        atype: jnp.ndarray,
+        box: jnp.ndarray | None,
+        fparam: jnp.ndarray | None,
+        aparam: jnp.ndarray | None,
+        block_index: jnp.ndarray,
+    ) -> dict[str, jnp.ndarray]:
+        block_index = jnp.asarray(block_index, dtype=jnp.int32)
+
+        def energy_one(
+            coord_one: jnp.ndarray,
+            atype_one: jnp.ndarray,
+            box_one: jnp.ndarray | None,
+            fparam_one: jnp.ndarray | None,
+            aparam_one: jnp.ndarray | None,
+        ) -> jnp.ndarray:
+            output = model.call_common(
+                coord_one[None, ...],
+                atype_one[None, ...],
+                box=None if box_one is None else box_one[None, ...],
+                fparam=None if fparam_one is None else fparam_one[None, ...],
+                aparam=None if aparam_one is None else aparam_one[None, ...],
+                do_atomic_virial=False,
+            )
+            return jnp.sum(output["energy_redu"])
+
+        grad_one = jax.grad(energy_one, argnums=0)
+
+        def hessian_block_one(
+            coord_one: jnp.ndarray,
+            atype_one: jnp.ndarray,
+            box_one: jnp.ndarray | None,
+            fparam_one: jnp.ndarray | None,
+            aparam_one: jnp.ndarray | None,
+        ) -> jnp.ndarray:
+            dim = coord_one.size
+            row_ids = block_index * chunk_size + jnp.arange(chunk_size)
+            safe_row_ids = jnp.minimum(row_ids, dim - 1)
+
+            def hessian_row(row_id: jnp.ndarray) -> jnp.ndarray:
+                return jax.grad(
+                    lambda cc: grad_one(
+                        cc,
+                        atype_one,
+                        box_one,
+                        fparam_one,
+                        aparam_one,
+                    ).reshape(-1)[row_id]
+                )(coord_one).reshape(-1)
+
+            rows = jax.vmap(hessian_row)(safe_row_ids)
+            return jnp.where(row_ids[:, None] < dim, rows, 0.0)
+
+        return {
+            "energy_derv_r_derv_r_block": jax.vmap(hessian_block_one)(
+                coord,
+                atype,
+                box,
+                fparam,
+                aparam,
+            )
+        }
+
+    exported = jax_export.export(jax.jit(call_hessian_block))(
+        jax.ShapeDtypeStruct((nf, nloc, 3), jnp.float64),
+        jax.ShapeDtypeStruct((nf, nloc), jnp.int32),
+        jax.ShapeDtypeStruct((nf, 3, 3), jnp.float64) if has_box else None,
+        jax.ShapeDtypeStruct((nf, model.get_dim_fparam()), jnp.float64)
+        if model.get_dim_fparam()
+        else None,
+        jax.ShapeDtypeStruct((nf, nloc, model.get_dim_aparam()), jnp.float64)
+        if model.get_dim_aparam()
+        else None,
+        jax.ShapeDtypeStruct((), jnp.int32),
+    )
+    return exported
