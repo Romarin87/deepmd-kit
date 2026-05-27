@@ -1509,6 +1509,8 @@ class DPTrainer:
     ) -> None:
         model = self.model
         assert isinstance(model, ModelWrapper)
+        if not hasattr(self, "start_step"):
+            self.start_step = 0
         _debug_hang_trace(
             "train_multi_start",
             model_keys=self.model_keys,
