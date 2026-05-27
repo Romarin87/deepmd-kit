@@ -244,7 +244,8 @@ def train(
     finetune_links = None
     finetune_data = None
     if finetune is not None:
-        finetune_data = _load_finetune_data(finetune)
+        if jax.process_count() > 1:
+            finetune_data = _load_finetune_data(finetune)
         jdata["model"], finetune_links, finetune_data = get_finetune_rules(
             finetune,
             jdata["model"],

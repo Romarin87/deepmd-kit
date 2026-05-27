@@ -555,7 +555,10 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
                 m_real_nei = nlist >= 0
                 ret = xp.where(m_real_nei, nlist, 0)
                 coord0 = extended_coord[:, :n_nloc, :]
-                index = ret.reshape(n_nf, n_nloc * n_nnei, 1).repeat(3, axis=2)
+                index = xp.broadcast_to(
+                    ret.reshape(n_nf, n_nloc * n_nnei, 1),
+                    (n_nf, n_nloc * n_nnei, 3),
+                )
                 coord1 = xp.take_along_axis(extended_coord, index, axis=1)
                 coord1 = coord1.reshape(n_nf, n_nloc, n_nnei, 3)
                 rr = xp.linalg.norm(coord0[:, :, None, :] - coord1, axis=-1)
@@ -597,6 +600,14 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
             If there are new types in `type_map`, statistics will be updated accordingly to `model_with_new_type_stat` for these new types.
             """
             self.atomic_model.change_type_map(type_map=type_map)
+
+        def compute_or_load_stat(
+            self,
+            sampled_func: Callable[[], Any],
+            stat_file_path: Any | None = None,
+        ) -> None:
+            """Compute or load the statistics."""
+            return self.atomic_model.compute_or_load_stat(sampled_func, stat_file_path)
 
         def serialize(self) -> dict:
             return self.atomic_model.serialize()

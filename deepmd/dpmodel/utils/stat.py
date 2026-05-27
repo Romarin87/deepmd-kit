@@ -132,7 +132,8 @@ def _fill_stat_with_global(
     if atomic_stat is None:
         return global_stat
     else:
-        atomic_stat = atomic_stat.reshape(*global_stat.shape)
+        if atomic_stat.shape != global_stat.shape:
+            global_stat = np.broadcast_to(global_stat, atomic_stat.shape)
         return np.nan_to_num(
             np.where(
                 np.isnan(atomic_stat) & ~np.isnan(global_stat), global_stat, atomic_stat
@@ -329,6 +330,8 @@ def compute_output_stats(
             if (bias_atom_e[kk] is None) or (std_atom_e[kk] is None):
                 raise RuntimeError("Fail to compute stat.")
 
+        bias_atom_e, std_atom_e = _post_process_stat(bias_atom_e, std_atom_e)
+
         if stat_file_path is not None:
             _save_to_file(stat_file_path, bias_atom_e, std_atom_e)
 
@@ -430,11 +433,14 @@ def compute_output_stats_global(
                     assigned_bias=assigned_atom_ener[kk],
                     rcond=rcond,
                 )
+                std_atom_e[kk] = np.where(
+                    np.abs(std_atom_e[kk]) < 10 * np.finfo(std_atom_e[kk].dtype).eps,
+                    np.zeros_like(std_atom_e[kk]),
+                    std_atom_e[kk],
+                )
         else:
             # this key does not have global labels, skip it.
             continue
-    bias_atom_e, std_atom_e = _post_process_stat(bias_atom_e, std_atom_e)
-
     # compute and log rmse
     def rmse(x: np.ndarray) -> float:
         return np.sqrt(np.mean(np.square(x)))

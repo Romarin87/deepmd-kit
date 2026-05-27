@@ -185,10 +185,10 @@ class SpinModel(NativeOP):
         nlist_shift = nlist + nall
         nlist[~nlist_mask] = -1
         nlist_shift[~nlist_mask] = -1
-        self_real = (
-            np.arange(0, nloc, dtype=nlist.dtype)
-            .reshape(1, -1, 1)
-            .repeat(nframes, axis=0)
+        self_real = np.repeat(
+            np.arange(0, nloc, dtype=nlist.dtype).reshape(1, -1, 1),
+            nframes,
+            axis=0,
         )
         self_spin = self_real + nall
         # real atom's neighbors: self spin + real neighbor + virtual neighbor
