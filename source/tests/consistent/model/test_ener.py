@@ -588,6 +588,7 @@ class TestEnerModelAPIs(unittest.TestCase):
         self.dp_model = get_model_dp(data)
         serialized = self.dp_model.serialize()
         self.pt_model = EnergyModelPT.deserialize(serialized)
+        self.pt_expt_model = EnergyModelPTExpt.deserialize(serialized)
 
         # Coords / atype / box
         self.coords = np.array(
