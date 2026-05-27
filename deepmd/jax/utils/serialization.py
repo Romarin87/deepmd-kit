@@ -40,6 +40,17 @@ from deepmd.utils.model_branch_dict import (
 log = logging.getLogger(__name__)
 
 
+def _is_topology_mismatch_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "Ranks do not match" in message
+        or "Topology mismatch detected" in message
+        or "available devices are different from the devices used to save the checkpoint"
+        in message
+        or "was not found in jax.local_devices()" in message
+    )
+
+
 def select_model_branch(
     data: dict,
     model_branch: str | None,
@@ -255,10 +266,10 @@ def serialize_from_file(model_file: str) -> dict:
                     ),
                 )
             except ValueError as err:
-                if "Ranks do not match" not in str(err):
+                if not _is_topology_mismatch_error(err):
                     raise
                 log.warning(
-                    "Targeted Orbax restore failed due to TensorStore rank mismatch; "
+                    "Targeted Orbax restore failed due to checkpoint topology mismatch; "
                     "falling back to topology-dependent restore for %s.",
                     model_file,
                 )
