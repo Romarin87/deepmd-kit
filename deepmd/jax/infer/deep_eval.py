@@ -376,15 +376,50 @@ class DeepEval(DeepEvalBackend):
         else:
             aparam_input = None
 
+        padding_counts = self._get_padding_valid_counts(type_input)
+        if padding_counts is not None and len(np.unique(padding_counts)) > 1:
+            grouped_results: list[np.ndarray] | None = None
+            for count in np.unique(padding_counts):
+                frame_idx = np.nonzero(padding_counts == count)[0]
+                group_results = self._eval_model(
+                    coord_input[frame_idx].reshape(len(frame_idx), -1),
+                    box_input[frame_idx] if box_input is not None else None,
+                    type_input[frame_idx],
+                    fparam_input[frame_idx] if fparam_input is not None else None,
+                    aparam_input[frame_idx] if aparam_input is not None else None,
+                    request_defs,
+                )
+                if grouped_results is None:
+                    grouped_results = [
+                        np.zeros((nframes, *result.shape[1:]), dtype=result.dtype)
+                        for result in group_results
+                    ]
+                for target, result in zip(grouped_results, group_results, strict=True):
+                    target[frame_idx] = result
+            assert grouped_results is not None
+            return tuple(grouped_results)
+
+        eval_natoms = self._get_padding_trim_natoms(type_input)
+        if eval_natoms < natoms:
+            eval_coord_input = coord_input[:, :eval_natoms, :]
+            eval_type_input = type_input[:, :eval_natoms]
+            eval_aparam_input = (
+                aparam_input[:, :eval_natoms, :] if aparam_input is not None else None
+            )
+        else:
+            eval_coord_input = coord_input
+            eval_type_input = type_input
+            eval_aparam_input = aparam_input
+
         do_atomic_virial = any(
             x.category == OutputVariableCategory.DERV_C_REDU for x in request_defs
         )
         batch_output = model(
-            to_jax_array(coord_input),
-            to_jax_array(type_input),
+            to_jax_array(eval_coord_input),
+            to_jax_array(eval_type_input),
             box=to_jax_array(box_input),
             fparam=to_jax_array(fparam_input),
-            aparam=to_jax_array(aparam_input),
+            aparam=to_jax_array(eval_aparam_input),
             do_atomic_virial=do_atomic_virial,
         )
         if isinstance(batch_output, tuple):
@@ -396,11 +431,19 @@ class DeepEval(DeepEvalBackend):
         ):
             batch_output["energy_derv_r_derv_r"] = self._eval_hessian_block_model(
                 model,
-                coord_input,
-                type_input,
+                eval_coord_input,
+                eval_type_input,
                 box_input,
                 fparam_input,
-                aparam_input,
+                eval_aparam_input,
+            )
+        if eval_natoms < natoms:
+            batch_output = self._pad_trimmed_outputs(
+                batch_output,
+                request_defs,
+                nframes,
+                eval_natoms,
+                natoms,
             )
 
         results = []
@@ -421,6 +464,102 @@ class DeepEval(DeepEvalBackend):
                     np.full(np.abs(shape), np.nan, dtype=GLOBAL_NP_FLOAT_PRECISION)
                 )  # this is kinda hacky
         return tuple(results)
+
+    def _get_padding_trim_natoms(self, type_input: np.ndarray) -> int:
+        """Trim suffix padding atoms marked by negative per-frame atom types."""
+        natoms = type_input.shape[1]
+        valid_counts = self._get_padding_valid_counts(type_input)
+        if valid_counts is None:
+            return natoms
+        trim_natoms = int(np.max(valid_counts))
+        if not np.all(valid_counts == trim_natoms):
+            return natoms
+        if trim_natoms >= natoms:
+            return natoms
+        return trim_natoms
+
+    def _get_padding_valid_counts(self, type_input: np.ndarray) -> np.ndarray | None:
+        valid = type_input >= 0
+        if np.all(valid):
+            return None
+        valid_counts = np.sum(valid, axis=1)
+        if np.any(valid_counts == 0):
+            raise ValueError("JAX HLO inference does not support all-padding frames.")
+        for row, count in zip(valid, valid_counts, strict=True):
+            if not np.all(row[:count]) or np.any(row[count:]):
+                raise ValueError(
+                    "JAX HLO inference only supports suffix padding atoms marked by "
+                    "negative atom types."
+                )
+        return valid_counts
+
+    def _pad_trimmed_outputs(
+        self,
+        batch_output: dict[str, np.ndarray],
+        request_defs: list[OutputVariableDef],
+        nframes: int,
+        trim_natoms: int,
+        natoms: int,
+    ) -> dict[str, np.ndarray]:
+        padded_output: dict[str, np.ndarray] = {}
+        trim_dim = 3 * trim_natoms
+        full_dim = 3 * natoms
+        output_defs = {odef.name: odef for odef in request_defs}
+        for kk, vv in batch_output.items():
+            arr = np.asarray(vv)
+            odef = output_defs.get(kk)
+            category = None if odef is None else odef.category
+            if category == OutputVariableCategory.DERV_R_DERV_R:
+                padded = np.zeros(
+                    (*arr.shape[:-2], full_dim, full_dim),
+                    dtype=arr.dtype,
+                )
+                padded[..., :trim_dim, :trim_dim] = arr
+                padded_output[kk] = padded
+            elif category in (
+                OutputVariableCategory.DERV_R,
+                OutputVariableCategory.DERV_C,
+            ):
+                assert odef is not None
+                component_dim = 3 if category == OutputVariableCategory.DERV_R else 9
+                prefix_shape = tuple(odef.shape[:-1])
+                if arr.shape[-1] != component_dim:
+                    raise ValueError(
+                        f"Unexpected shape for {kk}: {arr.shape}; expected suffix "
+                        f"component dimension {component_dim}."
+                    )
+                interior_shape = arr.shape[1:-1]
+                if interior_shape == (*prefix_shape, trim_natoms):
+                    normalized = arr
+                elif interior_shape == (trim_natoms, *prefix_shape):
+                    normalized = np.moveaxis(arr, 1, -2)
+                elif interior_shape == (trim_natoms,) and np.prod(
+                    prefix_shape, dtype=int
+                ) == 1:
+                    normalized = arr.reshape(
+                        (arr.shape[0], *prefix_shape, trim_natoms, component_dim)
+                    )
+                else:
+                    raise ValueError(
+                        f"Unexpected shape for {kk}: {arr.shape}; expected atom axis "
+                        f"with {trim_natoms} atoms and prefix {prefix_shape}."
+                    )
+                padded = np.zeros(
+                    (normalized.shape[0], *prefix_shape, natoms, component_dim),
+                    dtype=normalized.dtype,
+                )
+                padded[..., :trim_natoms, :] = normalized
+                padded_output[kk] = padded
+            elif category == OutputVariableCategory.OUT:
+                padded = np.zeros(
+                    (arr.shape[0], natoms, *arr.shape[2:]),
+                    dtype=arr.dtype,
+                )
+                padded[:, :trim_natoms, ...] = arr
+                padded_output[kk] = padded
+            else:
+                padded_output[kk] = arr
+        return padded_output
 
     def _get_output_shape(
         self, odef: OutputVariableDef, nframes: int, natoms: int

@@ -2,6 +2,7 @@
 from copy import (
     deepcopy,
 )
+import logging
 import os
 from pathlib import (
     Path,
@@ -35,6 +36,8 @@ from deepmd.jax.utils.multi_task import (
 from deepmd.utils.model_branch_dict import (
     get_model_dict,
 )
+
+log = logging.getLogger(__name__)
 
 
 def select_model_branch(
@@ -240,16 +243,32 @@ def serialize_from_file(model_file: str) -> dict:
             elif model_def_script.get("hessian_mode", False):
                 abstract_model.enable_hessian()
             _, abstract_state = nnx.split(abstract_model)
-            data = checkpointer.restore(
-                Path(model_file).absolute(),
-                ocp.args.Composite(
-                    state=ocp.args.StandardRestore(
-                        item=abstract_state.to_pure_dict(),
-                        strict=False,
+            try:
+                data = checkpointer.restore(
+                    Path(model_file).absolute(),
+                    ocp.args.Composite(
+                        state=ocp.args.StandardRestore(
+                            item=abstract_state.to_pure_dict(),
+                            strict=False,
+                        ),
+                        model_def_script=ocp.args.JsonRestore(),
                     ),
-                    model_def_script=ocp.args.JsonRestore(),
-                ),
-            )
+                )
+            except ValueError as err:
+                if "Ranks do not match" not in str(err):
+                    raise
+                log.warning(
+                    "Targeted Orbax restore failed due to TensorStore rank mismatch; "
+                    "falling back to topology-dependent restore for %s.",
+                    model_file,
+                )
+                data = checkpointer.restore(
+                    Path(model_file).absolute(),
+                    ocp.args.Composite(
+                        state=ocp.args.StandardRestore(strict=False),
+                        model_def_script=ocp.args.JsonRestore(),
+                    ),
+                )
         state = data.state
 
         def convert_str_to_int_key(item: dict) -> None:
@@ -316,7 +335,11 @@ def _export_hessian_block(
     model: BaseModel,
     chunk_size: int,
 ) -> "jax_export.Exported":
-    nf, nloc = jax_export.symbolic_shape("nf, nloc")
+    nf, nloc, nghost = jax_export.symbolic_shape(
+        "nf, nloc, nghost",
+        constraints=("nghost >= 0",),
+    )
+    nall = nloc + nghost
 
     def call_hessian_block(
         extended_coord: jnp.ndarray,
@@ -358,24 +381,36 @@ def _export_hessian_block(
             fparam_one: jnp.ndarray | None,
             aparam_one: jnp.ndarray | None,
         ) -> jnp.ndarray:
-            dim = extended_coord_one.size
+            local_natoms = nlist_one.shape[0]
+            local_dim = local_natoms * 3
             row_ids = block_index * chunk_size + jnp.arange(chunk_size)
-            safe_row_ids = jnp.minimum(row_ids, dim - 1)
+            safe_row_ids = jnp.minimum(row_ids, local_dim - 1)
+
+            def local_grad(coord_ext: jnp.ndarray) -> jnp.ndarray:
+                grad_ext = grad_one(
+                    coord_ext,
+                    extended_atype_one,
+                    nlist_one,
+                    mapping_one,
+                    fparam_one,
+                    aparam_one,
+                )
+                return jnp.zeros(
+                    (local_natoms, 3),
+                    dtype=grad_ext.dtype,
+                ).at[mapping_one].add(grad_ext)
 
             def hessian_row(row_id: jnp.ndarray) -> jnp.ndarray:
-                return jax.grad(
-                    lambda cc: grad_one(
-                        cc,
-                        extended_atype_one,
-                        nlist_one,
-                        mapping_one,
-                        fparam_one,
-                        aparam_one,
-                    ).reshape(-1)[row_id]
-                )(extended_coord_one).reshape(-1)
+                row_ext = jax.grad(
+                    lambda coord_ext: local_grad(coord_ext).reshape(-1)[row_id]
+                )(extended_coord_one)
+                return jnp.zeros(
+                    (local_natoms, 3),
+                    dtype=row_ext.dtype,
+                ).at[mapping_one].add(row_ext).reshape(-1)
 
             rows = jax.vmap(hessian_row)(safe_row_ids)
-            return jnp.where(row_ids[:, None] < dim, rows, 0.0)
+            return jnp.where(row_ids[:, None] < local_dim, rows, 0.0)
 
         return {
             "energy_derv_r_derv_r_block": jax.vmap(hessian_block_one)(
@@ -389,10 +424,10 @@ def _export_hessian_block(
         }
 
     exported = jax_export.export(jax.jit(call_hessian_block))(
-        jax.ShapeDtypeStruct((nf, nloc, 3), jnp.float64),
-        jax.ShapeDtypeStruct((nf, nloc), jnp.int32),
+        jax.ShapeDtypeStruct((nf, nall, 3), jnp.float64),
+        jax.ShapeDtypeStruct((nf, nall), jnp.int32),
         jax.ShapeDtypeStruct((nf, nloc, model.get_nnei()), jnp.int64),
-        jax.ShapeDtypeStruct((nf, nloc), jnp.int64),
+        jax.ShapeDtypeStruct((nf, nall), jnp.int64),
         jax.ShapeDtypeStruct((nf, model.get_dim_fparam()), jnp.float64)
         if model.get_dim_fparam()
         else None,
