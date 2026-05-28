@@ -328,12 +328,44 @@ def _build_single_data_stat(
     return all_stat_sys, all_stat
 
 
+def _with_default_fparam(
+    component: Any,
+    sampled_stats: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if (
+        getattr(component, "numb_fparam", 0) <= 0
+        or not sampled_stats
+        or "fparam" in sampled_stats[0]
+    ):
+        return sampled_stats
+    if not component.has_default_fparam():
+        raise ValueError(
+            "Fitting net requires fparam, but no fparam was found in the data "
+            "and no default_fparam is set."
+        )
+    default_fparam = component.get_default_fparam()
+    if default_fparam is None:
+        raise ValueError("default_fparam is unexpectedly None.")
+    default_fparam_array = np.asarray(default_fparam)
+    filled_stats = []
+    for frame in sampled_stats:
+        frame = dict(frame)
+        nframe = np.asarray(frame["atype"]).shape[0]
+        frame["fparam"] = np.tile(default_fparam_array.reshape(1, -1), (nframe, 1))
+        filled_stats.append(frame)
+    return filled_stats
+
+
 def _apply_weighted_shared_fitting_input_stats(
     component: Any,
     sampled_stats_by_branch: list[list[dict[str, Any]]],
     branch_weights: list[float],
     protection: float,
 ) -> None:
+    sampled_stats_by_branch = [
+        _with_default_fparam(component, sampled_stats)
+        for sampled_stats in sampled_stats_by_branch
+    ]
     if getattr(component, "numb_fparam", 0) > 0:
         weighted_sum = np.zeros(component.numb_fparam, dtype=np.float64)
         weighted_sum_sq = np.zeros(component.numb_fparam, dtype=np.float64)
@@ -1040,7 +1072,7 @@ class DPTrainer:
             )
             loss, _ = self.loss(
                 learning_rate=lr,
-                natoms=label_dict["coord"].shape[1],
+                natoms=label_dict["type"].shape[1],
                 model_dict=model_dict,
                 label_dict=label_dict,
             )
@@ -1074,7 +1106,7 @@ class DPTrainer:
             )
             _, more_loss = self.loss(
                 learning_rate=lr,
-                natoms=label_dict["coord"].shape[1],
+                natoms=label_dict["type"].shape[1],
                 model_dict=model_dict,
                 label_dict=label_dict,
             )
@@ -1140,8 +1172,6 @@ class DPTrainer:
                 ap,
             )
             if self.display_in_training and (step == 0 or (step + 1) % self.disp_freq == 0):
-                wall_time = time.time() - start_time
-                log.info(format_training_message(batch=step + 1, wall_time=wall_time))
                 more_loss = loss_fn_more_loss(
                     model,
                     self.lr.value(step),
@@ -1191,6 +1221,8 @@ class DPTrainer:
                     cur_batch=step + 1,
                     cur_lr=self.lr.value(step),
                 )
+                wall_time = time.time() - start_time
+                log.info(format_training_message(batch=step + 1, wall_time=wall_time))
                 start_time = time.time()
             if (step + 1) % self.save_freq == 0:
                 self._save_checkpoint(model, step + 1)
@@ -1297,7 +1329,7 @@ class DPTrainer:
                     )
                     loss, _ = task_loss(
                         learning_rate=lr,
-                        natoms=label_dict["coord"].shape[1],
+                        natoms=label_dict["type"].shape[1],
                         model_dict=model_dict,
                         label_dict=label_dict,
                     )
@@ -1335,7 +1367,7 @@ class DPTrainer:
                     )
                     _, more_loss = task_loss(
                         learning_rate=lr,
-                        natoms=label_dict["coord"].shape[1],
+                        natoms=label_dict["type"].shape[1],
                         model_dict=model_dict,
                         label_dict=label_dict,
                     )
@@ -1417,8 +1449,6 @@ class DPTrainer:
                 ap,
             )
             if self.display_in_training and (step == 0 or (step + 1) % self.disp_freq == 0):
-                wall_time = time.time() - start_time
-                log.info(format_training_message(batch=step + 1, wall_time=wall_time))
                 train_results = {_key: {} for _key in self.model_keys}
                 valid_results = {_key: {} for _key in self.model_keys}
                 model.set_case_embd(task_key)
@@ -1517,6 +1547,8 @@ class DPTrainer:
                     cur_batch=step + 1,
                     cur_lr=self.lr.value(step),
                 )
+                wall_time = time.time() - start_time
+                log.info(format_training_message(batch=step + 1, wall_time=wall_time))
                 start_time = time.time()
             if (step + 1) % self.save_freq == 0:
                 self._save_checkpoint(model, step + 1)

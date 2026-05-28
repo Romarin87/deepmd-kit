@@ -12,6 +12,10 @@ from deepmd.dpmodel.output_def import (
     ModelOutputDef,
     OutputVariableDef,
 )
+from deepmd.dpmodel.utils import (
+    build_neighbor_list,
+    extend_coord_with_ghosts,
+)
 from deepmd.jax.env import (
     jax_export,
     jnp,
@@ -67,9 +71,11 @@ class HLO(BaseModel):
         mixed_types: bool,
         min_nbor_dist: float | None,
         sel: list[int],
+        stablehlo_hessian_block: bytearray | None = None,
         # new in v3.1.1
         has_default_fparam: bool = False,
         default_fparam: list[float] | None = None,
+        hessian_chunk_size: int = 0,
     ) -> None:
         self._call_lower = jax_export.deserialize(stablehlo).call
         self._call_lower_atomic_virial = jax_export.deserialize(
@@ -79,6 +85,11 @@ class HLO(BaseModel):
         self._call_lower_atomic_virial_no_ghost = jax_export.deserialize(
             stablehlo_atomic_virial_no_ghost
         ).call
+        self._call_hessian_block = (
+            jax_export.deserialize(stablehlo_hessian_block).call
+            if stablehlo_hessian_block is not None
+            else None
+        )
         self.stablehlo = stablehlo
         self.type_map = type_map
         self.rcut = rcut
@@ -93,6 +104,7 @@ class HLO(BaseModel):
         self.model_def_script = model_def_script
         self._has_default_fparam = has_default_fparam
         self.default_fparam = default_fparam
+        self.hessian_chunk_size = hessian_chunk_size
 
     def __call__(
         self,
@@ -223,6 +235,56 @@ class HLO(BaseModel):
             fparam,
             aparam,
         )
+
+    def call_hessian_block(
+        self,
+        coord: jnp.ndarray,
+        atype: jnp.ndarray,
+        box: jnp.ndarray | None = None,
+        fparam: jnp.ndarray | None = None,
+        aparam: jnp.ndarray | None = None,
+        block_index: jnp.ndarray | int = 0,
+    ) -> dict[str, jnp.ndarray]:
+        if self.hessian_chunk_size <= 0:
+            raise RuntimeError("This HLO model does not contain Hessian block output.")
+        if self._call_hessian_block is None:
+            raise RuntimeError("This HLO model does not contain Hessian block output.")
+        nframes, nloc = atype.shape[:2]
+        coord = coord.reshape(nframes, nloc, 3)
+        extended_coord, extended_atype, mapping = extend_coord_with_ghosts(
+            coord,
+            atype,
+            box,
+            self.get_rcut(),
+        )
+        nlist = build_neighbor_list(
+            extended_coord,
+            extended_atype,
+            nloc,
+            self.get_rcut(),
+            self.get_sel(),
+            distinguish_types=False,
+        )
+        extended_coord = extended_coord.reshape(nframes, -1, 3)
+        if extended_coord.shape[1] == nloc:
+            dummy_coord = jnp.zeros((nframes, 1, 3), dtype=extended_coord.dtype)
+            dummy_atype = -jnp.ones((nframes, 1), dtype=extended_atype.dtype)
+            dummy_mapping = jnp.zeros((nframes, 1), dtype=mapping.dtype)
+            extended_coord = jnp.concatenate([extended_coord, dummy_coord], axis=1)
+            extended_atype = jnp.concatenate([extended_atype, dummy_atype], axis=1)
+            mapping = jnp.concatenate([mapping, dummy_mapping], axis=1)
+        return self._call_hessian_block(
+            extended_coord,
+            extended_atype,
+            nlist,
+            mapping,
+            fparam,
+            aparam,
+            jnp.asarray(block_index, dtype=jnp.int32),
+        )
+
+    def get_hessian_chunk_size(self) -> int:
+        return self.hessian_chunk_size
 
     def get_type_map(self) -> list[str]:
         """Get the type map."""

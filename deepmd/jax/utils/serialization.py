@@ -2,6 +2,7 @@
 from copy import (
     deepcopy,
 )
+import os
 from pathlib import (
     Path,
 )
@@ -39,9 +40,11 @@ from deepmd.utils.model_branch_dict import (
 def _is_topology_mismatch_error(exc: Exception) -> bool:
     message = str(exc)
     return (
-        "Topology mismatch detected" in message
+        "Ranks do not match" in message
+        or "Topology mismatch detected" in message
         or "available devices are different from the devices used to save the checkpoint"
         in message
+        or "was not found in jax.local_devices()" in message
     )
 
 
@@ -111,9 +114,13 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
             )
         model = BaseModel.deserialize(data["model"])
         model_def_script = data["model_def_script"]
+        hessian_chunk_size = _get_hessian_chunk_size() if hessian else 0
         if hessian:
-            model.enable_hessian()
-            model_def_script["hessian_mode"] = True
+            if hessian_chunk_size > 0:
+                model_def_script["hessian_chunk_size"] = hessian_chunk_size
+            else:
+                model.enable_hessian()
+                model_def_script["hessian_mode"] = True
         call_lower = model.call_common_lower
 
         nf, nloc, nghost = jax_export.symbolic_shape("nf, nloc, nghost")
@@ -174,6 +181,11 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
         )
         serialized_no_ghost: bytearray = exported_no_ghost.serialize()
         serialized_atomic_virial_no_ghost = exported_atomic_virial_no_ghost.serialize()
+        if hessian_chunk_size > 0:
+            serialized_hessian_block = _export_hessian_block(
+                model,
+                hessian_chunk_size,
+            ).serialize()
 
         data = data.copy()
         data.setdefault("@variables", {})
@@ -185,6 +197,10 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
         data["@variables"]["stablehlo_atomic_virial_no_ghost"] = np.void(
             serialized_atomic_virial_no_ghost
         )
+        if hessian_chunk_size > 0:
+            data["@variables"]["stablehlo_hessian_block"] = np.void(
+                serialized_hessian_block
+            )
         data["constants"] = {
             "type_map": model.get_type_map(),
             "rcut": model.get_rcut(),
@@ -198,6 +214,7 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
             "sel": model.get_sel(),
             "has_default_fparam": model.has_default_fparam(),
             "default_fparam": model.get_default_fparam(),
+            "hessian_chunk_size": hessian_chunk_size,
         }
         save_dp_model(filename=model_file, model_dict=data)
     elif model_file.endswith(".savedmodel"):
@@ -300,3 +317,126 @@ def serialize_from_file(model_file: str) -> dict:
         return data
     else:
         raise ValueError("JAX backend only supports converting .jax directory")
+
+
+def _get_hessian_chunk_size() -> int:
+    raw_value = os.environ.get("DP_JAX_HESSIAN_CHUNK_SIZE")
+    if raw_value is None or raw_value == "":
+        return 0
+    try:
+        chunk_size = int(raw_value)
+    except ValueError as err:
+        raise ValueError(
+            "DP_JAX_HESSIAN_CHUNK_SIZE must be a positive integer"
+        ) from err
+    if chunk_size <= 0:
+        raise ValueError("DP_JAX_HESSIAN_CHUNK_SIZE must be a positive integer")
+    return chunk_size
+
+
+def _export_hessian_block(
+    model: BaseModel,
+    chunk_size: int,
+) -> "jax_export.Exported":
+    nf, nloc, nghost = jax_export.symbolic_shape(
+        "nf, nloc, nghost",
+        constraints=("nghost >= 0",),
+    )
+    nall = nloc + nghost
+
+    def call_hessian_block(
+        extended_coord: jnp.ndarray,
+        extended_atype: jnp.ndarray,
+        nlist: jnp.ndarray,
+        mapping: jnp.ndarray,
+        fparam: jnp.ndarray | None,
+        aparam: jnp.ndarray | None,
+        block_index: jnp.ndarray,
+    ) -> dict[str, jnp.ndarray]:
+        block_index = jnp.asarray(block_index, dtype=jnp.int32)
+
+        def energy_one(
+            extended_coord_one: jnp.ndarray,
+            extended_atype_one: jnp.ndarray,
+            nlist_one: jnp.ndarray,
+            mapping_one: jnp.ndarray,
+            fparam_one: jnp.ndarray | None,
+            aparam_one: jnp.ndarray | None,
+        ) -> jnp.ndarray:
+            output = model.call_common_lower(
+                extended_coord_one[None, ...],
+                extended_atype_one[None, ...],
+                nlist_one[None, ...],
+                mapping=mapping_one[None, ...],
+                fparam=None if fparam_one is None else fparam_one[None, ...],
+                aparam=None if aparam_one is None else aparam_one[None, ...],
+                do_atomic_virial=False,
+            )
+            return jnp.sum(output["energy_redu"])
+
+        grad_one = jax.grad(energy_one, argnums=0)
+
+        def hessian_block_one(
+            extended_coord_one: jnp.ndarray,
+            extended_atype_one: jnp.ndarray,
+            nlist_one: jnp.ndarray,
+            mapping_one: jnp.ndarray,
+            fparam_one: jnp.ndarray | None,
+            aparam_one: jnp.ndarray | None,
+        ) -> jnp.ndarray:
+            local_natoms = nlist_one.shape[0]
+            local_dim = local_natoms * 3
+            row_ids = block_index * chunk_size + jnp.arange(chunk_size)
+            safe_row_ids = jnp.minimum(row_ids, local_dim - 1)
+
+            def local_grad(coord_ext: jnp.ndarray) -> jnp.ndarray:
+                grad_ext = grad_one(
+                    coord_ext,
+                    extended_atype_one,
+                    nlist_one,
+                    mapping_one,
+                    fparam_one,
+                    aparam_one,
+                )
+                return jnp.zeros(
+                    (local_natoms, 3),
+                    dtype=grad_ext.dtype,
+                ).at[mapping_one].add(grad_ext)
+
+            def hessian_row(row_id: jnp.ndarray) -> jnp.ndarray:
+                row_ext = jax.grad(
+                    lambda coord_ext: local_grad(coord_ext).reshape(-1)[row_id]
+                )(extended_coord_one)
+                return jnp.zeros(
+                    (local_natoms, 3),
+                    dtype=row_ext.dtype,
+                ).at[mapping_one].add(row_ext).reshape(-1)
+
+            rows = jax.vmap(hessian_row)(safe_row_ids)
+            return jnp.where(row_ids[:, None] < local_dim, rows, 0.0)
+
+        return {
+            "energy_derv_r_derv_r_block": jax.vmap(hessian_block_one)(
+                extended_coord,
+                extended_atype,
+                nlist,
+                mapping,
+                fparam,
+                aparam,
+            )
+        }
+
+    exported = jax_export.export(jax.jit(call_hessian_block))(
+        jax.ShapeDtypeStruct((nf, nall, 3), jnp.float64),
+        jax.ShapeDtypeStruct((nf, nall), jnp.int32),
+        jax.ShapeDtypeStruct((nf, nloc, model.get_nnei()), jnp.int64),
+        jax.ShapeDtypeStruct((nf, nall), jnp.int64),
+        jax.ShapeDtypeStruct((nf, model.get_dim_fparam()), jnp.float64)
+        if model.get_dim_fparam()
+        else None,
+        jax.ShapeDtypeStruct((nf, nloc, model.get_dim_aparam()), jnp.float64)
+        if model.get_dim_aparam()
+        else None,
+        jax.ShapeDtypeStruct((), jnp.int32),
+    )
+    return exported

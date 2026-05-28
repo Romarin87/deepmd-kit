@@ -635,7 +635,10 @@ def make_model(
                 m_real_nei = nlist >= 0
                 ret = xp.where(m_real_nei, nlist, 0)
                 coord0 = xp_take_first_n(extended_coord, 1, n_nloc)
-                index = xp.tile(ret.reshape(n_nf, n_nloc * n_nnei, 1), (1, 1, 3))
+                index = xp.broadcast_to(
+                    ret.reshape(n_nf, n_nloc * n_nnei, 1),
+                    (n_nf, n_nloc * n_nnei, 3),
+                )
                 coord1 = xp_take_along_axis(extended_coord, index, axis=1)
                 coord1 = coord1.reshape(n_nf, n_nloc, n_nnei, 3)
                 rr = xp.linalg.norm(coord0[:, :, None, :] - coord1, axis=-1)
@@ -682,6 +685,14 @@ def make_model(
                 if model_with_new_type_stat is not None
                 else None,
             )
+
+        def compute_or_load_stat(
+            self,
+            sampled_func: Callable[[], Any],
+            stat_file_path: Any | None = None,
+        ) -> None:
+            """Compute or load the statistics."""
+            return self.atomic_model.compute_or_load_stat(sampled_func, stat_file_path)
 
         def serialize(self) -> dict:
             return self.atomic_model.serialize()

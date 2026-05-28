@@ -40,6 +40,7 @@ from deepmd.jax.utils.multi_task import (
     preprocess_shared_params,
 )
 from deepmd.jax.utils.serialization import (
+    _is_topology_mismatch_error,
     select_model_branch,
     serialize_from_file,
 )
@@ -54,6 +55,10 @@ from ..pt.model.test_permutation import (
     "JAX requires Python 3.10 or later",
 )
 class TestJAXMultiTaskHelpers(unittest.TestCase):
+    def test_orbax_missing_local_device_is_topology_mismatch(self) -> None:
+        exc = ValueError("Device cuda:0 was not found in jax.local_devices().")
+        self.assertTrue(_is_topology_mismatch_error(exc))
+
     def test_preprocess_shared_params_and_case_embd(self) -> None:
         model_config = {
             "shared_dict": {

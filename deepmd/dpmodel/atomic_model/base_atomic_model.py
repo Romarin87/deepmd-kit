@@ -421,7 +421,10 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
                 if default_fparam is not None:
                     default_fparam_np = np.array(default_fparam)
                     for sample in sampled:
-                        if "find_fparam" in sample and not sample["find_fparam"]:
+                        if "fparam" not in sample or (
+                            "find_fparam" in sample
+                            and not np.any(np.asarray(sample["find_fparam"]))
+                        ):
                             nframe = sample["atype"].shape[0]
                             sample["fparam"] = np.tile(
                                 default_fparam_np.reshape(1, -1), (nframe, 1)
