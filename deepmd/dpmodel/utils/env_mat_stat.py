@@ -202,6 +202,10 @@ class EnvMatStatSe(EnvMatStat):
                 system["atype"],
                 system["box"],
             )
+            coord = xp.reshape(coord, (coord.shape[0], -1, 3))  # (nframes, nloc, 3)
+            atype = xp.reshape(atype, (coord.shape[0], -1))  # (nframes, nloc)
+            if box is not None:
+                box = xp.reshape(box, (coord.shape[0], 3, 3))
             nframes, nloc = atype.shape[:2]
             (
                 extended_coord,
