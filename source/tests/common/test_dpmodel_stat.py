@@ -49,7 +49,8 @@ class TestDPModelStat(unittest.TestCase):
         )
 
         np.testing.assert_allclose(bias["energy"], true_bias)
-        np.testing.assert_allclose(std["energy"], np.zeros(1))
+        # Global reduced stats expose per-type protected std after post-processing.
+        np.testing.assert_allclose(std["energy"], np.ones_like(true_bias))
 
 
 if __name__ == "__main__":

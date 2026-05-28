@@ -247,8 +247,6 @@ class HLO(BaseModel):
     ) -> dict[str, jnp.ndarray]:
         if self.hessian_chunk_size <= 0:
             raise RuntimeError("This HLO model does not contain Hessian block output.")
-        if box is not None:
-            raise NotImplementedError("Chunked Hessian HLO only supports no-PBC input.")
         if self._call_hessian_block is None:
             raise RuntimeError("This HLO model does not contain Hessian block output.")
         nframes, nloc = atype.shape[:2]
@@ -256,7 +254,7 @@ class HLO(BaseModel):
         extended_coord, extended_atype, mapping = extend_coord_with_ghosts(
             coord,
             atype,
-            None,
+            box,
             self.get_rcut(),
         )
         nlist = build_neighbor_list(
@@ -268,6 +266,13 @@ class HLO(BaseModel):
             distinguish_types=False,
         )
         extended_coord = extended_coord.reshape(nframes, -1, 3)
+        if extended_coord.shape[1] == nloc:
+            dummy_coord = jnp.zeros((nframes, 1, 3), dtype=extended_coord.dtype)
+            dummy_atype = -jnp.ones((nframes, 1), dtype=extended_atype.dtype)
+            dummy_mapping = jnp.zeros((nframes, 1), dtype=mapping.dtype)
+            extended_coord = jnp.concatenate([extended_coord, dummy_coord], axis=1)
+            extended_atype = jnp.concatenate([extended_atype, dummy_atype], axis=1)
+            mapping = jnp.concatenate([mapping, dummy_mapping], axis=1)
         return self._call_hessian_block(
             extended_coord,
             extended_atype,

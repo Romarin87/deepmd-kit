@@ -1072,7 +1072,7 @@ class DPTrainer:
             )
             loss, _ = self.loss(
                 learning_rate=lr,
-                natoms=label_dict["coord"].shape[1],
+                natoms=label_dict["type"].shape[1],
                 model_dict=model_dict,
                 label_dict=label_dict,
             )
@@ -1106,7 +1106,7 @@ class DPTrainer:
             )
             _, more_loss = self.loss(
                 learning_rate=lr,
-                natoms=label_dict["coord"].shape[1],
+                natoms=label_dict["type"].shape[1],
                 model_dict=model_dict,
                 label_dict=label_dict,
             )
@@ -1329,7 +1329,7 @@ class DPTrainer:
                     )
                     loss, _ = task_loss(
                         learning_rate=lr,
-                        natoms=label_dict["coord"].shape[1],
+                        natoms=label_dict["type"].shape[1],
                         model_dict=model_dict,
                         label_dict=label_dict,
                     )
@@ -1367,7 +1367,7 @@ class DPTrainer:
                     )
                     _, more_loss = task_loss(
                         learning_rate=lr,
-                        natoms=label_dict["coord"].shape[1],
+                        natoms=label_dict["type"].shape[1],
                         model_dict=model_dict,
                         label_dict=label_dict,
                     )

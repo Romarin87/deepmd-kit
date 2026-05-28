@@ -598,6 +598,14 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
             """
             self.atomic_model.change_type_map(type_map=type_map)
 
+        def compute_or_load_stat(
+            self,
+            sampled_func: Callable[[], Any],
+            stat_file_path: Any | None = None,
+        ) -> None:
+            """Compute or load the statistics."""
+            return self.atomic_model.compute_or_load_stat(sampled_func, stat_file_path)
+
         def serialize(self) -> dict:
             return self.atomic_model.serialize()
 
