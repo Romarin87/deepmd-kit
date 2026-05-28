@@ -34,6 +34,7 @@ from ..common import (
 )
 from .common import (
     ModelTest,
+    compare_variables_recursive,
 )
 
 if INSTALLED_PT:
@@ -71,54 +72,6 @@ if INSTALLED_JAX:
     from deepmd.jax.model.model import get_model as get_model_jax
 else:
     EnergyModelJAX = None
-
-
-def compare_variables_recursive(
-    left: Any, right: Any, path: str = "", compare_all: bool = False
-) -> None:
-    """Compare all serialized ``@variables`` entries recursively."""
-    if isinstance(left, dict) and isinstance(right, dict):
-        if "@variables" in left or "@variables" in right:
-            assert "@variables" in left and "@variables" in right, path
-            compare_variables_recursive(
-                left["@variables"],
-                right["@variables"],
-                f"{path}/@variables",
-                compare_all=True,
-            )
-        if compare_all:
-            assert set(left) == set(right), path
-            keys = sorted(left)
-        else:
-            keys = sorted(set(left).intersection(right))
-        for key in keys:
-            if key == "@variables":
-                continue
-            if compare_all or (
-                isinstance(left[key], dict) and isinstance(right[key], dict)
-            ):
-                compare_variables_recursive(
-                    left[key],
-                    right[key],
-                    f"{path}/{key}",
-                    compare_all=compare_all,
-                )
-        return
-    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
-        assert len(left) == len(right), path
-        for ii, (left_item, right_item) in enumerate(zip(left, right)):
-            compare_variables_recursive(left_item, right_item, f"{path}/{ii}")
-        return
-    if left is None or right is None:
-        assert left is None and right is None, path
-        return
-    np.testing.assert_allclose(
-        to_numpy_array(left),
-        to_numpy_array(right),
-        rtol=1e-10,
-        atol=1e-10,
-        err_msg=path,
-    )
 
 
 @parameterized(

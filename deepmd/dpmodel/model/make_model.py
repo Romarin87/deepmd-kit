@@ -555,10 +555,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
                 m_real_nei = nlist >= 0
                 ret = xp.where(m_real_nei, nlist, 0)
                 coord0 = extended_coord[:, :n_nloc, :]
-                index = xp.broadcast_to(
-                    ret.reshape(n_nf, n_nloc * n_nnei, 1),
-                    (n_nf, n_nloc * n_nnei, 3),
-                )
+                index = xp.tile(ret.reshape(n_nf, n_nloc * n_nnei, 1), (1, 1, 3))
                 coord1 = xp.take_along_axis(extended_coord, index, axis=1)
                 coord1 = coord1.reshape(n_nf, n_nloc, n_nnei, 3)
                 rr = xp.linalg.norm(coord0[:, :, None, :] - coord1, axis=-1)

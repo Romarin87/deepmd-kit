@@ -118,8 +118,6 @@ def to_numpy_array(x: Optional["Array"]) -> np.ndarray | None:
     """
     if x is None:
         return None
-    if hasattr(x, "detach"):
-        x = x.detach()
     try:
         # asarray is not within Array API standard, so may fail
         return np.asarray(x)
