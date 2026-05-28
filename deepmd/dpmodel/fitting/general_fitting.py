@@ -39,6 +39,9 @@ from deepmd.utils.finetune import (
     get_index_between_two_maps,
     map_atom_exclude_types,
 )
+from deepmd.utils.path import (
+    DPPath,
+)
 
 from .base_fitting import (
     BaseFitting,
@@ -226,6 +229,7 @@ class GeneralFitting(NativeOP, BaseFitting):
         self,
         merged: Callable[[], list[dict]] | list[dict],
         protection: float = 1e-2,
+        stat_file_path: DPPath | None = None,
     ) -> None:
         """
         Compute the input statistics (e.g. mean and stddev) for the fittings from packed data.
@@ -241,20 +245,46 @@ class GeneralFitting(NativeOP, BaseFitting):
                 the lazy function helps by only sampling once.
         protection : float
             Divided-by-zero protection
+        stat_file_path : Optional[DPPath]
+            The path to the stat file.
         """
         if self.numb_fparam == 0 and self.numb_aparam == 0:
             # skip data statistics
             return
-        if callable(merged):
-            sampled = merged()
-        else:
-            sampled = merged
+        sampled = None
         # stat fparam
         if self.numb_fparam > 0:
-            cat_data = np.concatenate([frame["fparam"] for frame in sampled], axis=0)
-            cat_data = np.reshape(cat_data, [-1, self.numb_fparam])
-            fparam_avg = np.mean(cat_data, axis=0)
-            fparam_std = np.std(cat_data, axis=0, ddof=0)  # ddof=0 for population std
+            if (
+                stat_file_path is not None
+                and stat_file_path.is_dir()
+                and (stat_file_path / "fparam").is_file()
+            ):
+                fparam_stat = (stat_file_path / "fparam").load_numpy()
+                assert fparam_stat.shape == (self.numb_fparam, 3)
+                fparam_avg = fparam_stat[:, 1] / fparam_stat[:, 0]
+                fparam_std = np.sqrt(
+                    fparam_stat[:, 2] / fparam_stat[:, 0] - fparam_avg**2
+                )
+            else:
+                sampled = merged() if callable(merged) else merged
+                cat_data = np.concatenate(
+                    [frame["fparam"] for frame in sampled], axis=0
+                )
+                cat_data = np.reshape(cat_data, [-1, self.numb_fparam])
+                fparam_avg = np.mean(cat_data, axis=0)
+                fparam_std = np.std(cat_data, axis=0, ddof=0)
+                if stat_file_path is not None:
+                    stat_file_path.mkdir(exist_ok=True, parents=True)
+                    (stat_file_path / "fparam").save_numpy(
+                        np.stack(
+                            [
+                                np.full(self.numb_fparam, cat_data.shape[0]),
+                                np.sum(cat_data, axis=0),
+                                np.sum(cat_data * cat_data, axis=0),
+                            ],
+                            axis=1,
+                        )
+                    )
             fparam_std = np.where(
                 fparam_std < protection,
                 np.array(protection, dtype=fparam_std.dtype),
@@ -275,19 +305,45 @@ class GeneralFitting(NativeOP, BaseFitting):
             )
         # stat aparam
         if self.numb_aparam > 0:
-            sys_sumv = []
-            sys_sumv2 = []
-            sys_sumn = []
-            for ss_ in [frame["aparam"] for frame in sampled]:
-                ss = np.reshape(ss_, [-1, self.numb_aparam])
-                sys_sumv.append(np.sum(ss, axis=0))
-                sys_sumv2.append(np.sum(ss * ss, axis=0))
-                sys_sumn.append(ss.shape[0])
-            sumv = np.sum(np.stack(sys_sumv), axis=0)
-            sumv2 = np.sum(np.stack(sys_sumv2), axis=0)
-            sumn = sum(sys_sumn)
-            aparam_avg = sumv / sumn
-            aparam_std = np.sqrt(sumv2 / sumn - (sumv / sumn) ** 2)
+            if (
+                stat_file_path is not None
+                and stat_file_path.is_dir()
+                and (stat_file_path / "aparam").is_file()
+            ):
+                aparam_stat = (stat_file_path / "aparam").load_numpy()
+                assert aparam_stat.shape == (self.numb_aparam, 3)
+                aparam_avg = aparam_stat[:, 1] / aparam_stat[:, 0]
+                aparam_std = np.sqrt(
+                    aparam_stat[:, 2] / aparam_stat[:, 0] - aparam_avg**2
+                )
+            else:
+                if sampled is None:
+                    sampled = merged() if callable(merged) else merged
+                sys_sumv = []
+                sys_sumv2 = []
+                sys_sumn = []
+                for ss_ in [frame["aparam"] for frame in sampled]:
+                    ss = np.reshape(ss_, [-1, self.numb_aparam])
+                    sys_sumv.append(np.sum(ss, axis=0))
+                    sys_sumv2.append(np.sum(ss * ss, axis=0))
+                    sys_sumn.append(ss.shape[0])
+                sumv = np.sum(np.stack(sys_sumv), axis=0)
+                sumv2 = np.sum(np.stack(sys_sumv2), axis=0)
+                sumn = sum(sys_sumn)
+                aparam_avg = sumv / sumn
+                aparam_std = np.sqrt(sumv2 / sumn - (sumv / sumn) ** 2)
+                if stat_file_path is not None:
+                    stat_file_path.mkdir(exist_ok=True, parents=True)
+                    (stat_file_path / "aparam").save_numpy(
+                        np.stack(
+                            [
+                                np.full(self.numb_aparam, sumn),
+                                sumv,
+                                sumv2,
+                            ],
+                            axis=1,
+                        )
+                    )
             aparam_std = np.where(
                 aparam_std < protection,
                 np.array(protection, dtype=aparam_std.dtype),

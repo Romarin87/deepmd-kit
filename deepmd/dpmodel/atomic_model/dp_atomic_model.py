@@ -301,18 +301,20 @@ class DPAtomicModel(BaseAtomicModel):
                 atom_exclude_types = self.atom_excl.get_exclude_types()
                 for sample in sampled:
                     sample["atom_exclude_types"] = list(atom_exclude_types)
-            if (
-                "find_fparam" not in sampled[0]
-                and "fparam" not in sampled[0]
-                and self.has_default_fparam()
+            if self.has_default_fparam() and (
+                "fparam" not in sampled[0]
+                or (
+                    "find_fparam" in sampled[0]
+                    and not np.any(np.asarray(sampled[0]["find_fparam"]))
+                )
             ):
                 default_fparam = self.get_default_fparam()
                 assert default_fparam is not None
                 default_fparam = np.asarray(default_fparam)
                 for sample in sampled:
                     nframe = sample["atype"].shape[0]
-                    sample["fparam"] = np.repeat(
-                        default_fparam.reshape(1, -1), nframe, axis=0
+                    sample["fparam"] = np.tile(
+                        default_fparam.reshape(1, -1), (nframe, 1)
                     )
             return sampled
 
@@ -330,6 +332,7 @@ class DPAtomicModel(BaseAtomicModel):
         self.fitting.compute_input_stats(
             sample_merged,
             protection=self.data_stat_protect,
+            stat_file_path=stat_file_path,
         )
 
     def get_dim_fparam(self) -> int:

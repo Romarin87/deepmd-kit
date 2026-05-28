@@ -460,6 +460,8 @@ class DescrptBlockRepflows(NativeOP, DescriptorBlock):
             The path to the stat file.
 
         """
+        if self.set_stddev_constant and self.set_davg_zero:
+            return
         env_mat_stat = EnvMatStatSe(self)
         if path is not None:
             path = path / env_mat_stat.get_hash()
