@@ -547,7 +547,7 @@ class TestEnerLower(CommonTest, ModelTest, unittest.TestCase):
         raise ValueError(f"Unknown backend: {backend}")
 
 
-@unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+@unittest.skipUnless(INSTALLED_PT and INSTALLED_PT_EXPT, "PyTorch is not installed")
 class TestEnerModelAPIs(unittest.TestCase):
     """Test consistency of model-level APIs between pt and dpmodel backends.
 
@@ -585,10 +585,11 @@ class TestEnerModelAPIs(unittest.TestCase):
             },
             trim_pattern="_*",
         )
-        # Build dpmodel first, then deserialize into pt to share weights
+        # Build dpmodel first, then deserialize into pt/pt_expt to share weights
         self.dp_model = get_model_dp(data)
         serialized = self.dp_model.serialize()
         self.pt_model = EnergyModelPT.deserialize(serialized)
+        self.pt_expt_model = EnergyModelPTExpt.deserialize(serialized)
 
         # Coords / atype / box
         self.coords = np.array(
