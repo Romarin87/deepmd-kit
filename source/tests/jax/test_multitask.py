@@ -174,26 +174,28 @@ class TestJAXMultiTaskHelpers(unittest.TestCase):
             numb_fparam=0,
             numb_aparam=0,
             nets=shared_nets,
-            compute_output_stats=Mock(),
         )
         fitting_b = SimpleNamespace(
             numb_fparam=0,
             numb_aparam=0,
             nets=shared_nets,
-            compute_output_stats=Mock(),
+        )
+        atomic_a = SimpleNamespace(
+            descriptor=shared_descriptor,
+            fitting_net=fitting_a,
+            compute_or_load_out_stat=Mock(),
+        )
+        atomic_b = SimpleNamespace(
+            descriptor=shared_descriptor,
+            fitting_net=fitting_b,
+            compute_or_load_out_stat=Mock(),
         )
         model_dict = {
             "task_a": SimpleNamespace(
-                atomic_model=SimpleNamespace(
-                    descriptor=shared_descriptor,
-                    fitting=fitting_a,
-                )
+                atomic_model=atomic_a,
             ),
             "task_b": SimpleNamespace(
-                atomic_model=SimpleNamespace(
-                    descriptor=shared_descriptor,
-                    fitting=fitting_b,
-                )
+                atomic_model=atomic_b,
             ),
         }
         wrapper = FakeWrapper(model_dict)
@@ -205,20 +207,8 @@ class TestJAXMultiTaskHelpers(unittest.TestCase):
         with patch(
             "deepmd.jax.train.trainer._build_single_data_stat",
             side_effect=[
-                (
-                    [{"coord": "a"}],
-                    {
-                        "energy": [[[np.array([2.0])]]],
-                        "natoms_vec": [[np.array([0.0, 0.0, 1.0, 0.0])]],
-                    },
-                ),
-                (
-                    [{"coord": "b"}],
-                    {
-                        "energy": [[[np.array([4.0])]]],
-                        "natoms_vec": [[np.array([0.0, 0.0, 0.0, 1.0])]],
-                    },
-                ),
+                [{"coord": "a"}],
+                [{"coord": "b"}],
             ],
         ):
             _compute_multitask_data_stat(
@@ -230,20 +220,8 @@ class TestJAXMultiTaskHelpers(unittest.TestCase):
         shared_descriptor.compute_input_stats.assert_called_once_with(
             [{"coord": "a"}, {"coord": "b"}]
         )
-        fitting_a.compute_output_stats.assert_called_once()
-        fitting_b.compute_output_stats.assert_called_once()
-        fitting_stat_a = fitting_a.compute_output_stats.call_args.args[0]
-        fitting_stat_b = fitting_b.compute_output_stats.call_args.args[0]
-        np.testing.assert_allclose(fitting_stat_a["energy"][0][0][0], np.array([2.0]))
-        np.testing.assert_allclose(fitting_stat_b["energy"][0][0][0], np.array([4.0]))
-        np.testing.assert_allclose(
-            fitting_stat_a["natoms_vec"][0][0], np.array([0.0, 0.0, 1.0, 0.0])
-        )
-        np.testing.assert_allclose(
-            fitting_stat_b["natoms_vec"][0][0], np.array([0.0, 0.0, 0.0, 1.0])
-        )
-        self.assertFalse(fitting_a.compute_output_stats.call_args.kwargs["mixed_type"])
-        self.assertFalse(fitting_b.compute_output_stats.call_args.kwargs["mixed_type"])
+        atomic_a.compute_or_load_out_stat.assert_called_once_with([{"coord": "a"}])
+        atomic_b.compute_or_load_out_stat.assert_called_once_with([{"coord": "b"}])
 
     def test_multitask_shared_fitting_input_stats_follow_weights_and_protection(self) -> None:
         class FakeWrapper:
@@ -265,20 +243,23 @@ class TestJAXMultiTaskHelpers(unittest.TestCase):
             fparam_inv_std=np.ones(1, dtype=np.float64),
             aparam_avg=np.zeros(1, dtype=np.float64),
             aparam_inv_std=np.ones(1, dtype=np.float64),
-            compute_output_stats=Mock(),
+        )
+        atomic_a = SimpleNamespace(
+            descriptor=shared_descriptor,
+            fitting_net=shared_fitting,
+            compute_or_load_out_stat=Mock(),
+        )
+        atomic_b = SimpleNamespace(
+            descriptor=shared_descriptor,
+            fitting_net=shared_fitting,
+            compute_or_load_out_stat=Mock(),
         )
         model_dict = {
             "task_a": SimpleNamespace(
-                atomic_model=SimpleNamespace(
-                    descriptor=shared_descriptor,
-                    fitting=shared_fitting,
-                )
+                atomic_model=atomic_a,
             ),
             "task_b": SimpleNamespace(
-                atomic_model=SimpleNamespace(
-                    descriptor=shared_descriptor,
-                    fitting=shared_fitting,
-                )
+                atomic_model=atomic_b,
             ),
         }
         wrapper = FakeWrapper(model_dict)
@@ -289,32 +270,20 @@ class TestJAXMultiTaskHelpers(unittest.TestCase):
         with patch(
             "deepmd.jax.train.trainer._build_single_data_stat",
             side_effect=[
-                (
-                    [
-                        {
-                            "coord": "a",
-                            "fparam": np.array([[1.0], [3.0]]),
-                            "aparam": np.array([[[2.0]], [[4.0]]]),
-                        }
-                    ],
+                [
                     {
-                        "energy": [[[np.array([2.0])]]],
-                        "natoms_vec": [[np.array([0.0, 0.0, 1.0, 0.0])]],
-                    },
-                ),
-                (
-                    [
-                        {
-                            "coord": "b",
-                            "fparam": np.array([[10.0], [14.0]]),
-                            "aparam": np.array([[[12.0]], [[16.0]]]),
-                        }
-                    ],
+                        "coord": "a",
+                        "fparam": np.array([[1.0], [3.0]]),
+                        "aparam": np.array([[[2.0]], [[4.0]]]),
+                    }
+                ],
+                [
                     {
-                        "energy": [[[np.array([4.0])]]],
-                        "natoms_vec": [[np.array([0.0, 0.0, 0.0, 1.0])]],
-                    },
-                ),
+                        "coord": "b",
+                        "fparam": np.array([[10.0], [14.0]]),
+                        "aparam": np.array([[[12.0]], [[16.0]]]),
+                    }
+                ],
             ],
         ):
             _compute_multitask_data_stat(
@@ -350,19 +319,20 @@ class TestJAXMultiTaskHelpers(unittest.TestCase):
             numb_fparam=0,
             numb_aparam=0,
             nets=object(),
-            compute_output_stats=Mock(),
         )
         model_dict = {
             "task_a": SimpleNamespace(
                 atomic_model=SimpleNamespace(
                     descriptor=shared_descriptor,
-                    fitting=shared_fitting,
+                    fitting_net=shared_fitting,
+                    compute_or_load_out_stat=Mock(),
                 )
             ),
             "task_b": SimpleNamespace(
                 atomic_model=SimpleNamespace(
                     descriptor=shared_descriptor,
-                    fitting=shared_fitting,
+                    fitting_net=shared_fitting,
+                    compute_or_load_out_stat=Mock(),
                 )
             ),
         }
@@ -374,8 +344,8 @@ class TestJAXMultiTaskHelpers(unittest.TestCase):
         with patch(
             "deepmd.jax.train.trainer._build_single_data_stat",
             side_effect=[
-                ([{"coord": "a"}], {"energy": [[[np.array([1.0])]]], "natoms_vec": [[np.array([0.0, 0.0, 1.0, 0.0])]]}),
-                ([{"coord": "b"}], {"energy": [[[np.array([1.0])]]], "natoms_vec": [[np.array([0.0, 0.0, 1.0, 0.0])]]}),
+                [{"coord": "a"}],
+                [{"coord": "b"}],
             ],
         ):
             with self.assertRaisesRegex(ValueError, "data_stat_protect"):
@@ -556,24 +526,24 @@ class TestJAXMultiTaskTraining(unittest.TestCase):
             wrapper["model_2"].atomic_model.descriptor,
         )
         self.assertIsNot(
-            wrapper["model_1"].atomic_model.fitting,
-            wrapper["model_2"].atomic_model.fitting,
+            wrapper["model_1"].atomic_model.fitting_net,
+            wrapper["model_2"].atomic_model.fitting_net,
         )
         self.assertIs(
-            wrapper["model_1"].atomic_model.fitting.nets,
-            wrapper["model_2"].atomic_model.fitting.nets,
+            wrapper["model_1"].atomic_model.fitting_net.nets,
+            wrapper["model_2"].atomic_model.fitting_net.nets,
         )
         self.assertIs(
-            wrapper["model_1"].atomic_model.fitting.fparam_avg,
-            wrapper["model_2"].atomic_model.fitting.fparam_avg,
+            wrapper["model_1"].atomic_model.fitting_net.fparam_avg,
+            wrapper["model_2"].atomic_model.fitting_net.fparam_avg,
         )
         self.assertIs(
-            wrapper["model_1"].atomic_model.fitting.fparam_inv_std,
-            wrapper["model_2"].atomic_model.fitting.fparam_inv_std,
+            wrapper["model_1"].atomic_model.fitting_net.fparam_inv_std,
+            wrapper["model_2"].atomic_model.fitting_net.fparam_inv_std,
         )
         self.assertIsNot(
-            wrapper["model_1"].atomic_model.fitting.bias_atom_e,
-            wrapper["model_2"].atomic_model.fitting.bias_atom_e,
+            wrapper["model_1"].atomic_model.fitting_net.bias_atom_e,
+            wrapper["model_2"].atomic_model.fitting_net.bias_atom_e,
         )
         self.assertEqual(
             serialized["model_def_script"]["shared_links"]["my_fitting"]["links"][0]["shared_type"],
@@ -581,12 +551,12 @@ class TestJAXMultiTaskTraining(unittest.TestCase):
         )
 
         wrapper.set_case_embd("model_1")
-        case_embd = wrapper["model_1"].atomic_model.fitting.serialize()["@variables"]["case_embd"]
+        case_embd = wrapper["model_1"].atomic_model.fitting_net.serialize()["@variables"]["case_embd"]
         np.testing.assert_array_equal(case_embd, np.array([1.0, 0.0]))
         wrapper.set_case_embd("model_2")
-        case_embd = wrapper["model_2"].atomic_model.fitting.serialize()["@variables"]["case_embd"]
+        case_embd = wrapper["model_2"].atomic_model.fitting_net.serialize()["@variables"]["case_embd"]
         np.testing.assert_array_equal(case_embd, np.array([0.0, 1.0]))
-        case_embd_model_1 = wrapper["model_1"].atomic_model.fitting.serialize()["@variables"]["case_embd"]
+        case_embd_model_1 = wrapper["model_1"].atomic_model.fitting_net.serialize()["@variables"]["case_embd"]
         np.testing.assert_array_equal(case_embd_model_1, np.array([1.0, 0.0]))
 
     def test_entrypoint_multitask_train_dpa3(self) -> None:

@@ -681,7 +681,7 @@ class TestJAXFinetuneTypeMapConsistency(unittest.TestCase):
 
         pretrained_model.change_type_map(
             target_model.get_type_map(),
-            model_with_new_type_stat=target_model.atomic_model,
+            model_with_new_type_stat=target_model,
         )
         changed_pretrained_model = EnergyModel.deserialize(pretrained_model.serialize())
         merged = merge_finetune_model_data(
@@ -817,7 +817,7 @@ class TestJAXFinetuneWiring(unittest.TestCase):
             "deepmd.jax.train.trainer.EnergyLoss.get_loss",
             return_value=loss,
         ), patch(
-            "deepmd.jax.train.trainer.make_stat_input",
+            "deepmd.jax.train.trainer.collect_batches",
             return_value={"type": [[np.array([[0]], dtype=np.int32)]], "coord": [[np.zeros((1, 3))]]},
         ), patch(
             "deepmd.jax.train.trainer.jnp.asarray",
@@ -848,8 +848,8 @@ class TestJAXFinetuneWiring(unittest.TestCase):
             train_data.data_systems = [Mock(pbc=False)]
             with self.assertRaisesRegex(RuntimeError, "stop_after_stats"):
                 trainer._train_single(train_data)
-        dummy_model.atomic_model.descriptor.compute_input_stats.assert_called_once()
-        dummy_model.atomic_model.fitting.compute_output_stats.assert_called_once()
+        dummy_model.atomic_model.compute_or_load_stat.assert_called_once()
+        self.assertTrue(callable(dummy_model.atomic_model.compute_or_load_stat.call_args.args[0]))
 
     def test_train_entrypoint_wires_finetune_rule(self) -> None:
         fake_jdata = {

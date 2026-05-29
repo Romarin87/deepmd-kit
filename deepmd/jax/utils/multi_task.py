@@ -32,6 +32,7 @@ def preprocess_shared_params(
     shared_dict = model_config.get("shared_dict", {})
     shared_links: dict[str, Any] = {}
     type_map_keys: list[str] = []
+    type_map_values: list[tuple[str, ...]] = []
 
     def replace_one_item(
         params_dict: dict[str, Any],
@@ -70,6 +71,9 @@ def preprocess_shared_params(
 
     for model_key in model_config["model_dict"]:
         model_params_item = model_config["model_dict"][model_key]
+        type_map = model_params_item.get("type_map")
+        if isinstance(type_map, list):
+            type_map_values.append(tuple(type_map))
         for item_key in list(model_params_item.keys()):
             if item_key in supported_types:
                 item_params = model_params_item[item_key]
@@ -96,7 +100,13 @@ def preprocess_shared_params(
             shared_links[shared_key]["links"],
             key=lambda x: x["shared_level"],
         )
-    assert len(type_map_keys) == 1, "Multitask model must have only one type_map!"
+    for key_in_dict in type_map_keys:
+        shared_key = key_in_dict.split(":")[0]
+        type_map_values.append(tuple(shared_dict[shared_key]))
+    if not type_map_values:
+        raise ValueError("Multitask model must define a type_map.")
+    if len(set(type_map_values)) != 1:
+        raise ValueError("Multitask model branches must use the same type_map.")
     return model_config, shared_links
 
 

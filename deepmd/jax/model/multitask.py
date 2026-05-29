@@ -21,7 +21,7 @@ def _get_component(model: BaseModel, shared_type: str) -> Any:
     if shared_type == "descriptor":
         return model.atomic_model.descriptor
     if shared_type == "fitting_net":
-        return model.atomic_model.fitting
+        return model.atomic_model.fitting_net
     if shared_type.startswith("descriptor_hybrid_"):
         idx = int(shared_type.rsplit("_", 1)[1])
         return model.atomic_model.descriptor.descrpt_list[idx]
@@ -33,7 +33,7 @@ def _set_component(model: BaseModel, shared_type: str, value: Any) -> None:
         model.atomic_model.descriptor = value
         return
     if shared_type == "fitting_net":
-        model.atomic_model.fitting = value
+        model.atomic_model.fitting_net = value
         return
     if shared_type.startswith("descriptor_hybrid_"):
         idx = int(shared_type.rsplit("_", 1)[1])
@@ -50,8 +50,8 @@ def _share_fitting_component(base_model: BaseModel, link_model: BaseModel) -> No
     buffers. JAX needs the same behavior for multitask parity.
     """
 
-    base_fitting = base_model.atomic_model.fitting
-    link_fitting = link_model.atomic_model.fitting
+    base_fitting = base_model.atomic_model.fitting_net
+    link_fitting = link_model.atomic_model.fitting_net
     if base_fitting.__class__ is not link_fitting.__class__:
         raise TypeError("Only fitting nets of the same type can share params!")
     object.__setattr__(link_fitting, "nets", base_fitting.nets)

@@ -91,7 +91,7 @@ from deepmd.utils.finetune import (
     FinetuneRuleItem,
 )
 from deepmd.utils.model_stat import (
-    make_stat_input,
+    collect_batches,
 )
 
 log = logging.getLogger(__name__)
@@ -238,7 +238,7 @@ def _pack_data_for_bias_adjust(
     train_data: DeepmdDataSystem,
     nbatches: int,
 ) -> list[dict[str, np.ndarray | None]]:
-    all_stat = make_stat_input(train_data, nbatches, merge_sys=False)
+    all_stat = collect_batches(train_data, nbatches, merge_sys=False)
     all_stat["atype"] = all_stat.pop("type")
     if "natoms_vec" in all_stat:
         all_stat["natoms"] = all_stat["natoms_vec"]
@@ -300,32 +300,30 @@ def _build_loss(
     return EnergyLoss.get_loss(loss_cfg), False
 
 
+def _translate_model_dict_for_loss(model_dict: dict[str, Any]) -> dict[str, Any]:
+    """Add loss-facing aliases while keeping internal derivative keys."""
+    ret = dict(model_dict)
+    ret["atom_energy"] = model_dict["energy"]
+    ret["energy"] = model_dict["energy_redu"]
+    if model_dict.get("energy_derv_r") is not None:
+        ret["force"] = model_dict["energy_derv_r"].squeeze(-2)
+    if model_dict.get("energy_derv_c_redu") is not None:
+        ret["virial"] = model_dict["energy_derv_c_redu"].squeeze(-2)
+    if model_dict.get("energy_derv_c") is not None:
+        ret["atom_virial"] = model_dict["energy_derv_c"].squeeze(-2)
+    return ret
+
+
 def _compute_single_data_stat(model: BaseModel, train_data: DeepmdDataSystem) -> None:
-    descriptor_stat, fitting_stat = _build_single_data_stat(train_data)
-    model.atomic_model.descriptor.compute_input_stats(descriptor_stat)
-    model.atomic_model.fitting.compute_output_stats(
-        fitting_stat, mixed_type=train_data.mixed_type
-    )
+    stat_samples = _build_single_data_stat(train_data)
+    model.atomic_model.compute_or_load_stat(lambda: stat_samples)
 
 
 def _build_single_data_stat(
     train_data: DeepmdDataSystem,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> list[dict[str, Any]]:
     data_stat_nbatch = 10
-    all_stat = make_stat_input(train_data, data_stat_nbatch, merge_sys=False)
-    all_stat["atype"] = all_stat.pop("type")
-    all_stat_sys = [
-        {
-            kk: jnp.asarray(np.concatenate(vv[ii], axis=0))
-            for kk, vv in all_stat.items()
-            if not kk.startswith("find_")
-        }
-        for ii in range(train_data.get_nsystems())
-    ]
-    for ii, single_data in enumerate(all_stat_sys):
-        if not train_data.data_systems[ii].pbc:
-            single_data["box"] = None
-    return all_stat_sys, all_stat
+    return _pack_data_for_bias_adjust(train_data, data_stat_nbatch)
 
 
 def _with_default_fparam(
@@ -452,7 +450,7 @@ def _compute_multitask_data_stat(
     fitting_input_groups: dict[tuple[int, int | None, int | None], dict[str, Any]] = {}
     for model_key in model.keys():
         branch_model = model[model_key]
-        branch_fitting = branch_model.atomic_model.fitting
+        branch_fitting = branch_model.atomic_model.fitting_net
         descriptor_id = id(branch_model.atomic_model.descriptor)
         descriptor_groups.setdefault(
             descriptor_id,
@@ -460,7 +458,7 @@ def _compute_multitask_data_stat(
                 "component": branch_model.atomic_model.descriptor,
                 "stats": [],
             },
-        )["stats"].append(stat_cache[model_key][0])
+        )["stats"].append(stat_cache[model_key])
         fitting_group_id = (
             id(branch_fitting.nets),
             id(branch_fitting.fparam_avg)
@@ -497,7 +495,7 @@ def _compute_multitask_data_stat(
         fitting_input_groups[fitting_group_id]["weights"].append(
             model_key_prob_map[model_key]
         )
-        fitting_input_groups[fitting_group_id]["samples"].append(stat_cache[model_key][0])
+        fitting_input_groups[fitting_group_id]["samples"].append(stat_cache[model_key])
 
     for descriptor_group in descriptor_groups.values():
         merged_descriptor_stat = []
@@ -514,11 +512,7 @@ def _compute_multitask_data_stat(
         )
 
     for model_key in model.keys():
-        branch_fitting = model[model_key].atomic_model.fitting
-        branch_fitting.compute_output_stats(
-            stat_cache[model_key][1],
-            mixed_type=train_data[model_key].mixed_type,
-        )
+        model[model_key].atomic_model.compute_or_load_out_stat(stat_cache[model_key])
 
 
 def _resolve_model_prob_multi(
@@ -1070,6 +1064,7 @@ class DPTrainer:
                 mapping,
                 do_atomic_virial=False,
             )
+            model_dict = _translate_model_dict_for_loss(model_dict)
             loss, _ = self.loss(
                 learning_rate=lr,
                 natoms=label_dict["type"].shape[1],
@@ -1104,6 +1099,7 @@ class DPTrainer:
                 mapping,
                 do_atomic_virial=False,
             )
+            model_dict = _translate_model_dict_for_loss(model_dict)
             _, more_loss = self.loss(
                 learning_rate=lr,
                 natoms=label_dict["type"].shape[1],
@@ -1327,6 +1323,7 @@ class DPTrainer:
                         mapping,
                         do_atomic_virial=False,
                     )
+                    model_dict = _translate_model_dict_for_loss(model_dict)
                     loss, _ = task_loss(
                         learning_rate=lr,
                         natoms=label_dict["type"].shape[1],
@@ -1365,6 +1362,7 @@ class DPTrainer:
                         mapping,
                         do_atomic_virial=False,
                     )
+                    model_dict = _translate_model_dict_for_loss(model_dict)
                     _, more_loss = task_loss(
                         learning_rate=lr,
                         natoms=label_dict["type"].shape[1],
