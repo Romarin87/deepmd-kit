@@ -10,6 +10,10 @@ from pathlib import (
 import numpy as np
 import orbax.checkpoint as ocp
 
+from deepmd.dpmodel.output_def import (
+    get_deriv_name,
+    get_reduce_name,
+)
 from deepmd.dpmodel.utils.serialization import (
     load_dp_model,
     save_dp_model,
@@ -74,6 +78,105 @@ def select_model_branch(
     }
 
 
+def _call_common_lower_ef(
+    model: BaseModel,
+    extended_coord: jnp.ndarray,
+    extended_atype: jnp.ndarray,
+    nlist: jnp.ndarray,
+    mapping: jnp.ndarray,
+    fparam: jnp.ndarray,
+    aparam: jnp.ndarray,
+) -> dict[str, jnp.ndarray]:
+    """Lower JAX HLO path that computes only energy and force."""
+    nframes = extended_atype.shape[0]
+    extended_coord = extended_coord.reshape(nframes, -1, 3)
+    nlist = model.format_nlist(
+        extended_coord,
+        extended_atype,
+        nlist,
+        extra_nlist_sort=model.need_sorted_nlist_for_lower(),
+    )
+    cc_ext, _, fp, ap, input_prec = model._input_type_cast(
+        extended_coord, fparam=fparam, aparam=aparam
+    )
+    atomic_ret = model.atomic_model.forward_common_atomic(
+        cc_ext,
+        extended_atype,
+        nlist,
+        mapping=mapping,
+        fparam=fp,
+        aparam=ap,
+    )
+    atomic_output_def = model.atomic_output_def()
+    model_predict = {}
+    if "mask" in atomic_ret:
+        model_predict["mask"] = atomic_ret["mask"]
+    for kk, vv in atomic_ret.items():
+        vdef = atomic_output_def[kk]
+        if not vdef.reducible or not vdef.r_differentiable:
+            continue
+        shap = vdef.shape
+        atom_axis = -(len(shap) + 1)
+        kk_redu = get_reduce_name(kk)
+        kk_derv_r = get_deriv_name(kk)[0]
+        model_predict[kk] = vv
+        if vdef.intensive:
+            mask = atomic_ret["mask"] if "mask" in atomic_ret else None
+            if mask is not None:
+                model_predict[kk_redu] = jnp.sum(vv, axis=atom_axis) / jnp.sum(
+                    mask, axis=-1, keepdims=True
+                )
+            else:
+                model_predict[kk_redu] = jnp.mean(vv, axis=atom_axis)
+        else:
+            model_predict[kk_redu] = jnp.sum(vv, axis=atom_axis)
+
+        def eval_output(
+            cc_ext_one: jnp.ndarray,
+            extended_atype_one: jnp.ndarray,
+            nlist_one: jnp.ndarray,
+            mapping_one: jnp.ndarray,
+            fparam_one: jnp.ndarray,
+            aparam_one: jnp.ndarray,
+            *,
+            _kk: str = kk,
+            _atom_axis: int = atom_axis,
+        ) -> jnp.ndarray:
+            atomic_ret_one = model.atomic_model.forward_common_atomic(
+                cc_ext_one[None, ...],
+                extended_atype_one[None, ...],
+                nlist_one[None, ...],
+                mapping=mapping_one[None, ...],
+                fparam=fparam_one[None, ...] if fparam_one is not None else None,
+                aparam=aparam_one[None, ...] if aparam_one is not None else None,
+            )
+            return jnp.sum(atomic_ret_one[_kk][0], axis=_atom_axis)
+
+        ff = -jax.vmap(
+            jax.jacrev(eval_output, argnums=0),
+            in_axes=(
+                0,
+                0,
+                0,
+                0,
+                0 if fp is not None else None,
+                0 if ap is not None else None,
+            ),
+        )(
+            cc_ext,
+            extended_atype,
+            nlist,
+            mapping,
+            fp,
+            ap,
+        )
+        def_ndim = len(vdef.shape)
+        model_predict[kk_derv_r] = jnp.transpose(
+            ff, [0, def_ndim + 1, *range(1, def_ndim + 1), def_ndim + 2]
+        )
+    return model._output_type_cast(model_predict, input_prec)
+
+
 def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> None:
     """Deserialize the dictionary to a model file."""
     if model_file.endswith(".jax"):
@@ -126,7 +229,7 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
         nf, nloc, nghost = jax_export.symbolic_shape("nf, nloc, nghost")
 
         def exported_whether_do_atomic_virial(
-            do_atomic_virial: bool, has_ghost_atoms: bool
+            do_atomic_virial: bool, has_ghost_atoms: bool, ef_only: bool = False
         ) -> "jax_export.Exported":
             def call_lower_with_fixed_do_atomic_virial(
                 coord: jnp.ndarray,
@@ -136,7 +239,17 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
                 fparam: jnp.ndarray,
                 aparam: jnp.ndarray,
             ) -> dict[str, jnp.ndarray]:
-                return call_lower(
+                if ef_only:
+                    return _call_common_lower_ef(
+                        model,
+                        coord,
+                        atype,
+                        nlist,
+                        mapping,
+                        fparam,
+                        aparam,
+                    )
+                output = call_lower(
                     coord,
                     atype,
                     nlist,
@@ -145,6 +258,7 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
                     aparam,
                     do_atomic_virial=do_atomic_virial,
                 )
+                return output
 
             if has_ghost_atoms:
                 nghost_ = nghost
@@ -167,19 +281,27 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
         exported = exported_whether_do_atomic_virial(
             do_atomic_virial=False, has_ghost_atoms=True
         )
+        exported_ef = exported_whether_do_atomic_virial(
+            do_atomic_virial=False, has_ghost_atoms=True, ef_only=True
+        )
         exported_atomic_virial = exported_whether_do_atomic_virial(
             do_atomic_virial=True, has_ghost_atoms=True
         )
         serialized: bytearray = exported.serialize()
+        serialized_ef: bytearray = exported_ef.serialize()
         serialized_atomic_virial = exported_atomic_virial.serialize()
 
         exported_no_ghost = exported_whether_do_atomic_virial(
             do_atomic_virial=False, has_ghost_atoms=False
         )
+        exported_ef_no_ghost = exported_whether_do_atomic_virial(
+            do_atomic_virial=False, has_ghost_atoms=False, ef_only=True
+        )
         exported_atomic_virial_no_ghost = exported_whether_do_atomic_virial(
             do_atomic_virial=True, has_ghost_atoms=False
         )
         serialized_no_ghost: bytearray = exported_no_ghost.serialize()
+        serialized_ef_no_ghost: bytearray = exported_ef_no_ghost.serialize()
         serialized_atomic_virial_no_ghost = exported_atomic_virial_no_ghost.serialize()
         if hessian_chunk_size > 0:
             serialized_hessian_block = _export_hessian_block(
@@ -190,10 +312,14 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
         data = data.copy()
         data.setdefault("@variables", {})
         data["@variables"]["stablehlo"] = np.void(serialized)
+        data["@variables"]["stablehlo_ef"] = np.void(serialized_ef)
         data["@variables"]["stablehlo_atomic_virial"] = np.void(
             serialized_atomic_virial
         )
         data["@variables"]["stablehlo_no_ghost"] = np.void(serialized_no_ghost)
+        data["@variables"]["stablehlo_ef_no_ghost"] = np.void(
+            serialized_ef_no_ghost
+        )
         data["@variables"]["stablehlo_atomic_virial_no_ghost"] = np.void(
             serialized_atomic_virial_no_ghost
         )
@@ -278,7 +404,7 @@ def serialize_from_file(model_file: str) -> dict:
             for key, value in item.copy().items():
                 if isinstance(value, dict):
                     convert_str_to_int_key(value)
-                if key.isdigit():
+                if isinstance(key, str) and key.isdigit():
                     item[int(key)] = item.pop(key)
 
         convert_str_to_int_key(state)

@@ -35,6 +35,13 @@ OUTPUT_DEFS = {
         r_differentiable=True,
         c_differentiable=True,
     ),
+    "energy_ef": OutputVariableDef(
+        "energy",
+        shape=[1],
+        reducible=True,
+        r_differentiable=True,
+        c_differentiable=False,
+    ),
     "energy_hessian": OutputVariableDef(
         "energy",
         shape=[1],
@@ -72,6 +79,8 @@ class HLO(BaseModel):
         min_nbor_dist: float | None,
         sel: list[int],
         stablehlo_hessian_block: bytearray | None = None,
+        stablehlo_ef: bytearray | None = None,
+        stablehlo_ef_no_ghost: bytearray | None = None,
         # new in v3.1.1
         has_default_fparam: bool = False,
         default_fparam: list[float] | None = None,
@@ -85,6 +94,16 @@ class HLO(BaseModel):
         self._call_lower_atomic_virial_no_ghost = jax_export.deserialize(
             stablehlo_atomic_virial_no_ghost
         ).call
+        self._call_lower_ef = (
+            jax_export.deserialize(stablehlo_ef).call
+            if stablehlo_ef is not None
+            else None
+        )
+        self._call_lower_ef_no_ghost = (
+            jax_export.deserialize(stablehlo_ef_no_ghost).call
+            if stablehlo_ef_no_ghost is not None
+            else None
+        )
         self._call_hessian_block = (
             jax_export.deserialize(stablehlo_hessian_block).call
             if stablehlo_hessian_block is not None
@@ -207,6 +226,46 @@ class HLO(BaseModel):
             )
         )
 
+    def model_output_def_ef(self) -> ModelOutputDef:
+        return ModelOutputDef(
+            FittingOutputDef(
+                [
+                    OUTPUT_DEFS[f"{tt}_ef" if tt == "energy" else tt]
+                    for tt in self.model_output_type()
+                ]
+            )
+        )
+
+    def has_ef_only(self) -> bool:
+        return (
+            self._call_lower_ef is not None
+            and self._call_lower_ef_no_ghost is not None
+        )
+
+    def call_ef(
+        self,
+        coord: jnp.ndarray,
+        atype: jnp.ndarray,
+        box: jnp.ndarray | None = None,
+        fparam: jnp.ndarray | None = None,
+        aparam: jnp.ndarray | None = None,
+    ) -> dict[str, jnp.ndarray]:
+        if not self.has_ef_only():
+            raise RuntimeError("This HLO model does not contain an E/F-only output.")
+        return model_call_from_call_lower(
+            call_lower=self.call_lower_ef,
+            rcut=self.get_rcut(),
+            sel=self.get_sel(),
+            mixed_types=self.mixed_types(),
+            model_output_def=self.model_output_def_ef(),
+            coord=coord,
+            atype=atype,
+            box=box,
+            fparam=fparam,
+            aparam=aparam,
+            do_atomic_virial=False,
+        )
+
     def call_lower(
         self,
         extended_coord: jnp.ndarray,
@@ -227,6 +286,33 @@ class HLO(BaseModel):
                 call_lower = self._call_lower_atomic_virial_no_ghost
             else:
                 call_lower = self._call_lower_no_ghost
+        return call_lower(
+            extended_coord,
+            extended_atype,
+            nlist,
+            mapping,
+            fparam,
+            aparam,
+        )
+
+    def call_lower_ef(
+        self,
+        extended_coord: jnp.ndarray,
+        extended_atype: jnp.ndarray,
+        nlist: jnp.ndarray,
+        mapping: jnp.ndarray | None = None,
+        fparam: jnp.ndarray | None = None,
+        aparam: jnp.ndarray | None = None,
+        do_atomic_virial: bool = False,
+    ) -> dict[str, jnp.ndarray]:
+        del do_atomic_virial
+        if not self.has_ef_only():
+            raise RuntimeError("This HLO model does not contain an E/F-only output.")
+        if extended_coord.shape[1] > nlist.shape[1]:
+            call_lower = self._call_lower_ef
+        else:
+            call_lower = self._call_lower_ef_no_ghost
+        assert call_lower is not None
         return call_lower(
             extended_coord,
             extended_atype,

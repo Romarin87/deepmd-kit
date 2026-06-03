@@ -109,6 +109,16 @@ class DeepEval(DeepEvalBackend):
                     if "stablehlo_hessian_block" in model_data["@variables"]
                     else None
                 ),
+                stablehlo_ef=(
+                    model_data["@variables"]["stablehlo_ef"].tobytes()
+                    if "stablehlo_ef" in model_data["@variables"]
+                    else None
+                ),
+                stablehlo_ef_no_ghost=(
+                    model_data["@variables"]["stablehlo_ef_no_ghost"].tobytes()
+                    if "stablehlo_ef_no_ghost" in model_data["@variables"]
+                    else None
+                ),
                 model_def_script=json.dumps(model_data["model_def_script"]),
                 **model_data["constants"],
             )
@@ -243,10 +253,111 @@ class DeepEval(DeepEvalBackend):
         coords = np.array(coords)
         if cells is not None:
             cells = np.array(cells)
+        if fparam is not None:
+            fparam = np.array(fparam)
+        if aparam is not None:
+            aparam = np.array(aparam)
         natoms, numb_test = self._get_natoms_and_nframes(
             coords, atom_types, len(atom_types.shape) > 1
         )
         request_defs = self._get_request_defs(atomic)
+        out = self._eval_func(self._eval_model, numb_test, natoms)(
+            coords, cells, atom_types, fparam, aparam, request_defs
+        )
+        return dict(
+            zip(
+                [x.name for x in request_defs],
+                out,
+                strict=True,
+            )
+        )
+
+    def eval_energy_force(
+        self,
+        coords: np.ndarray,
+        cells: np.ndarray | None,
+        atom_types: np.ndarray,
+        fparam: np.ndarray | None = None,
+        aparam: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Evaluate energy and force without requesting virial or Hessian."""
+        return self._eval_categories(
+            coords,
+            cells,
+            atom_types,
+            fparam,
+            aparam,
+            (
+                OutputVariableCategory.REDU,
+                OutputVariableCategory.DERV_R,
+            ),
+        )
+
+    def eval_energy_force_virial(
+        self,
+        coords: np.ndarray,
+        cells: np.ndarray | None,
+        atom_types: np.ndarray,
+        fparam: np.ndarray | None = None,
+        aparam: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Evaluate energy, force, and reduced virial."""
+        return self._eval_categories(
+            coords,
+            cells,
+            atom_types,
+            fparam,
+            aparam,
+            (
+                OutputVariableCategory.REDU,
+                OutputVariableCategory.DERV_R,
+                OutputVariableCategory.DERV_C_REDU,
+            ),
+        )
+
+    def eval_energy_force_hessian(
+        self,
+        coords: np.ndarray,
+        cells: np.ndarray | None,
+        atom_types: np.ndarray,
+        fparam: np.ndarray | None = None,
+        aparam: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Evaluate energy, force, and Hessian without requesting virial."""
+        return self._eval_categories(
+            coords,
+            cells,
+            atom_types,
+            fparam,
+            aparam,
+            (
+                OutputVariableCategory.REDU,
+                OutputVariableCategory.DERV_R,
+                OutputVariableCategory.DERV_R_DERV_R,
+            ),
+        )
+
+    def _eval_categories(
+        self,
+        coords: np.ndarray,
+        cells: np.ndarray | None,
+        atom_types: np.ndarray,
+        fparam: np.ndarray | None,
+        aparam: np.ndarray | None,
+        categories: tuple[OutputVariableCategory, ...],
+    ) -> dict[str, np.ndarray]:
+        atom_types = np.array(atom_types, dtype=np.int32)
+        coords = np.array(coords)
+        if cells is not None:
+            cells = np.array(cells)
+        if fparam is not None:
+            fparam = np.array(fparam)
+        if aparam is not None:
+            aparam = np.array(aparam)
+        natoms, numb_test = self._get_natoms_and_nframes(
+            coords, atom_types, len(atom_types.shape) > 1
+        )
+        request_defs = self._get_request_defs_by_categories(categories)
         out = self._eval_func(self._eval_model, numb_test, natoms)(
             coords, cells, atom_types, fparam, aparam, request_defs
         )
@@ -289,6 +400,13 @@ class DeepEval(DeepEvalBackend):
                     OutputVariableCategory.DERV_R_DERV_R,
                 )
             ]
+
+    def _get_request_defs_by_categories(
+        self, categories: tuple[OutputVariableCategory, ...]
+    ) -> list[OutputVariableDef]:
+        return [
+            x for x in self.output_def.var_defs.values() if x.category in categories
+        ]
 
     def _eval_func(self, inner_func: Callable, numb_test: int, natoms: int) -> Callable:
         """Wrapper method with auto batch size.
@@ -414,14 +532,40 @@ class DeepEval(DeepEvalBackend):
         do_atomic_virial = any(
             x.category == OutputVariableCategory.DERV_C_REDU for x in request_defs
         )
-        batch_output = model(
-            to_jax_array(eval_coord_input),
-            to_jax_array(eval_type_input),
-            box=to_jax_array(box_input),
-            fparam=to_jax_array(fparam_input),
-            aparam=to_jax_array(eval_aparam_input),
-            do_atomic_virial=do_atomic_virial,
+        needs_virial = any(
+            x.category
+            in (
+                OutputVariableCategory.DERV_C,
+                OutputVariableCategory.DERV_C_REDU,
+            )
+            for x in request_defs
         )
+        needs_hessian = any(
+            x.category == OutputVariableCategory.DERV_R_DERV_R for x in request_defs
+        )
+        use_ef_only = (
+            isinstance(model, HLO)
+            and model.has_ef_only()
+            and not needs_virial
+            and (not needs_hessian or self._has_hessian_block())
+        )
+        if use_ef_only:
+            batch_output = model.call_ef(
+                to_jax_array(eval_coord_input),
+                to_jax_array(eval_type_input),
+                box=to_jax_array(box_input),
+                fparam=to_jax_array(fparam_input),
+                aparam=to_jax_array(eval_aparam_input),
+            )
+        else:
+            batch_output = model(
+                to_jax_array(eval_coord_input),
+                to_jax_array(eval_type_input),
+                box=to_jax_array(box_input),
+                fparam=to_jax_array(fparam_input),
+                aparam=to_jax_array(eval_aparam_input),
+                do_atomic_virial=do_atomic_virial,
+            )
         if isinstance(batch_output, tuple):
             batch_output = batch_output[0]
         for kk, vv in batch_output.items():
