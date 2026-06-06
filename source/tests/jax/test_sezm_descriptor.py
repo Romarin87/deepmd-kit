@@ -150,12 +150,28 @@ class TestSeZMDescriptor(unittest.TestCase):
         nlist = jnp.asarray([[[1, -1], [0, -1]]], dtype=jnp.int64)
         mapping = jnp.asarray([[0, 1]], dtype=jnp.int64)
         cache = descriptor._build_edge_cache(coord_ext, atype_ext, nlist, mapping)
-        self.assertEqual(cache.edge_vec.shape, (2, 3))
-        self.assertEqual(cache.edge_rbf.shape, (2, 4))
-        self.assertEqual(cache.edge_type_feat.shape, (2, 8))
+        self.assertEqual(cache.edge_vec.shape, (4, 3))
+        self.assertEqual(cache.edge_rbf.shape, (4, 4))
+        self.assertEqual(cache.edge_type_feat.shape, (4, 8))
         self.assertEqual(cache.inv_sqrt_deg.shape, (2, 1, 1))
         self.assertTrue(bool(jnp.all(jnp.isfinite(cache.edge_rbf))))
         self.assertTrue(bool(jnp.all(jnp.isfinite(cache.inv_sqrt_deg))))
+        invalid = jnp.asarray([1, 3], dtype=jnp.int64)
+        np.testing.assert_allclose(
+            np.asarray(jnp.take(cache.edge_env, invalid, axis=0)),
+            0.0,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(jnp.take(cache.edge_rbf, invalid, axis=0)),
+            0.0,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(jnp.take(cache.edge_type_feat, invalid, axis=0)),
+            0.0,
+            atol=1e-6,
+        )
 
     def test_edge_frame_wigner_l1_and_lebedev(self) -> None:
         points, weights = load_lebedev_rule(3, float_precision="float32")
@@ -224,8 +240,8 @@ class TestSeZMDescriptor(unittest.TestCase):
             mapping,
             include_wigner=True,
         )
-        self.assertEqual(cache.D_full.shape, (2, 16, 16))
-        self.assertEqual(cache.Dt_full.shape, (2, 16, 16))
+        self.assertEqual(cache.D_full.shape, (4, 16, 16))
+        self.assertEqual(cache.Dt_full.shape, (4, 16, 16))
 
     def test_so3_indexing_and_linear_layers(self) -> None:
         self.assertEqual(get_so3_dim_of_lmax(3), 16)

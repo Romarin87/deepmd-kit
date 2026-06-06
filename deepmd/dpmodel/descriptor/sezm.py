@@ -1189,13 +1189,15 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
                 "JAX SeZM baseline forward requires `mapping` when extended "
                 "atoms are present."
             )
-        valid = nlist >= 0
-        frame_idx, loc_idx, nei_idx = xp.nonzero(valid)
-        neighbor_ext = xp.take(
-            xp.reshape(nlist, (-1,)),
-            frame_idx * nloc * nnei + loc_idx * nnei + nei_idx,
-            axis=0,
-        )
+        slot_count = nf * nloc * nnei
+        slot_idx = xp.arange(slot_count, dtype=xp.int64)
+        frame_idx = slot_idx // (nloc * nnei)
+        rem_idx = slot_idx - frame_idx * nloc * nnei
+        loc_idx = rem_idx // nnei
+        neighbor_ext_raw = xp.reshape(nlist, (-1,))
+        valid = neighbor_ext_raw >= 0
+        valid_f = xp.astype(xp.reshape(valid, (-1, 1)), coord.dtype)
+        neighbor_ext = xp.where(valid, neighbor_ext_raw, xp.zeros_like(neighbor_ext_raw))
         dst = frame_idx * nloc + loc_idx
         if mapping is not None:
             mapped = xp.take(
@@ -1216,14 +1218,14 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         edge_len = xp.sqrt(
             xp.sum(edge_vec * edge_vec, axis=-1, keepdims=True) + self.eps * self.eps
         )
-        edge_rbf = self.radial_basis(edge_len)
-        edge_env = self.edge_envelope(edge_len)
+        edge_rbf = self.radial_basis(edge_len) * valid_f
+        edge_env = self.edge_envelope(edge_len) * valid_f
 
         atype_local = atype_ext[:, :nloc]
         type_embedding = xp.reshape(self.type_embedding(atype_local), (nf * nloc, -1))
-        edge_type_feat = xp.take(type_embedding, src, axis=0) + xp.take(
-            type_embedding, dst, axis=0
-        )
+        edge_type_feat = (
+            xp.take(type_embedding, src, axis=0) + xp.take(type_embedding, dst, axis=0)
+        ) * valid_f
 
         edge_weight = xp.reshape(edge_env * edge_env, (-1,))
         deg = xp_bincount(dst, weights=edge_weight, minlength=nf * nloc)
@@ -1257,10 +1259,16 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         if self.random_gamma:
             xp = array_api_compat.array_namespace(edge_quat)
             edge_index = xp.arange(edge_quat.shape[0], dtype=edge_quat.dtype)
-            raw = xp.sin(edge_index * 12.9898 + 78.233) * 43758.5453
-            gamma = (raw - xp.floor(raw)) * (2.0 * math.pi)
+            c0 = xp.asarray(12.9898, dtype=edge_quat.dtype)
+            c1 = xp.asarray(78.233, dtype=edge_quat.dtype)
+            c2 = xp.asarray(43758.5453, dtype=edge_quat.dtype)
+            two_pi = xp.asarray(2.0 * math.pi, dtype=edge_quat.dtype)
+            raw = xp.sin(edge_index * c0 + c1) * c2
+            gamma = (raw - xp.floor(raw)) * two_pi
             edge_quat = quaternion_multiply(quaternion_z_rotation(gamma), edge_quat)
-        return self.wigner_calc(edge_quat)
+        D_full, Dt_full = self.wigner_calc(edge_quat)
+        xp = array_api_compat.array_namespace(D_full, Dt_full, edge_vec)
+        return xp.astype(D_full, edge_vec.dtype), xp.astype(Dt_full, edge_vec.dtype)
 
     def call(
         self,
@@ -1307,9 +1315,16 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             shift_logits = film[:, self.channels :]
             scale_hat = self.film_scale_norm(scale_logits)
             shift_hat = self.film_shift_norm(shift_logits)
-            scale_strength = xp.exp(self.film_scale_strength_log[...])
-            shift_strength = xp.exp(self.film_shift_strength_log[...])
-            scale = 1.0 + scale_strength * xp.tanh(scale_hat)
+            scale_strength = xp.astype(
+                xp.exp(self.film_scale_strength_log[...]),
+                type_feat.dtype,
+            )
+            shift_strength = xp.astype(
+                xp.exp(self.film_shift_strength_log[...]),
+                type_feat.dtype,
+            )
+            one = xp.asarray(1.0, dtype=type_feat.dtype)
+            scale = one + scale_strength * xp.tanh(scale_hat)
             shift = shift_strength * xp.tanh(shift_hat)
             x0_out = type_feat * scale + shift
 
@@ -1503,6 +1518,8 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
 
 
 def _set_l0_features(x: Array, values: Array) -> Array:
+    xp = array_api_compat.array_namespace(x, values)
+    values = xp.astype(values, x.dtype)
     if hasattr(x, "at"):
         return x.at[:, 0, 0, :].set(values)
     x[:, 0, 0, :] = values
