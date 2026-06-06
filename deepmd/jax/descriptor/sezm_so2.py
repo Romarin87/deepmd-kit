@@ -10,6 +10,7 @@ from packaging.version import (
 )
 
 from deepmd.dpmodel.descriptor.sezm_so2 import (
+    DynamicRadialDegreeMixer as DynamicRadialDegreeMixerDP,
     SO2Linear as SO2LinearDP,
 )
 from deepmd.jax.common import (
@@ -50,6 +51,18 @@ class SO2Linear(SO2LinearDP):
             value = [_to_jax_parameter(self, item) for item in value]
             value = _maybe_nnx_list(value)
         elif name in {"m0_idx", "pos_indices", "neg_indices"}:
+            value = to_jax_array(value)
+            if value is not None:
+                value = ArrayAPIVariable(value)
+        return super().__setattr__(name, value)
+
+
+@flax_module
+class DynamicRadialDegreeMixer(DynamicRadialDegreeMixerDP):
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"weight", "channel_basis"}:
+            value = _to_jax_parameter(self, value)
+        elif name in {"kernel_compact_index", "kernel_dense_index"}:
             value = to_jax_array(value)
             if value is not None:
                 value = ArrayAPIVariable(value)

@@ -39,6 +39,7 @@ from deepmd.jax.descriptor.sezm_so3 import (
     SO3Linear,
 )
 from deepmd.jax.descriptor.sezm_so2 import (
+    DynamicRadialDegreeMixer,
     SO2Linear,
 )
 
@@ -339,6 +340,52 @@ class TestSeZMDescriptor(unittest.TestCase):
         restored = SO2Linear.deserialize(so2.serialize())
         self.assertEqual(restored.reduced_dim, 7)
         np.testing.assert_allclose(np.asarray(restored(x)), expected, atol=1e-6)
+
+    def test_dynamic_radial_degree_mixer(self) -> None:
+        mixer = DynamicRadialDegreeMixer(
+            lmax=2,
+            mmax=1,
+            channels=1,
+            mode="degree",
+            precision="float32",
+            seed=7,
+        )
+        self.assertEqual(mixer.reduced_dim, 7)
+        self.assertEqual(mixer.degree_kernel_size, 13)
+        compact_identity = jnp.asarray(
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+            dtype=jnp.float32,
+        )
+        mixer.weight = jnp.zeros((3, 13), dtype=jnp.float32)
+        mixer.weight = mixer.weight[...].at[0].set(compact_identity)
+        x = jnp.arange(1, 8, dtype=jnp.float32).reshape(1, 7, 1)
+        radial = jnp.zeros_like(x).at[0, 0, 0].set(1.0)
+        np.testing.assert_allclose(np.asarray(mixer(x, radial)), np.asarray(x))
+
+        restored = DynamicRadialDegreeMixer.deserialize(mixer.serialize())
+        np.testing.assert_allclose(np.asarray(restored(x, radial)), np.asarray(x))
+
+        rank_mixer = DynamicRadialDegreeMixer(
+            lmax=1,
+            mmax=1,
+            channels=2,
+            mode="degree_channel",
+            rank=1,
+            precision="float32",
+            seed=7,
+        )
+        rank_mixer.weight = jnp.zeros((4, 5), dtype=jnp.float32)
+        rank_mixer.weight = rank_mixer.weight[...].at[0].set(
+            jnp.asarray([1.0, 0.0, 0.0, 1.0, 1.0], dtype=jnp.float32)
+        )
+        rank_mixer.channel_basis = jnp.asarray([[2.0, 3.0]], dtype=jnp.float32)
+        x_rank = jnp.arange(1, 9, dtype=jnp.float32).reshape(1, 4, 2)
+        radial_rank = jnp.zeros_like(x_rank).at[0, 0, 0].set(1.0)
+        expected_rank = x_rank * jnp.asarray([2.0, 3.0], dtype=jnp.float32)
+        np.testing.assert_allclose(
+            np.asarray(rank_mixer(x_rank, radial_rank)),
+            np.asarray(expected_rank),
+        )
 
     def test_model_type_defaults_to_sezm_energy_fitting(self) -> None:
         model = get_model(
