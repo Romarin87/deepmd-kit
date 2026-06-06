@@ -7,6 +7,9 @@ import os
 import platform
 import shutil
 import time
+from copy import (
+    deepcopy,
+)
 from pathlib import (
     Path,
 )
@@ -22,6 +25,7 @@ from packaging.version import (
 )
 
 from deepmd.dpmodel.loss.ener import (
+    EnergyHessianLoss,
     EnergyLoss,
 )
 from deepmd.dpmodel.model.transform_output import (
@@ -68,6 +72,22 @@ from deepmd.utils.model_stat import (
 log = logging.getLogger(__name__)
 
 
+def _loss_uses_hessian(loss_param: dict) -> bool:
+    return (
+        loss_param.get("type", "ener") == "ener"
+        and loss_param.get("start_pref_h", 0.0) != 0.0
+        and loss_param.get("limit_pref_h", 0.0) != 0.0
+    )
+
+
+def _enable_hessian_output(model: BaseModel) -> None:
+    if not hasattr(model, "enable_hessian"):
+        raise NotImplementedError(
+            f"JAX model {type(model).__name__} does not support Hessian output."
+        )
+    model.enable_hessian()
+
+
 class DPTrainer:
     """Train JAX DeePMD models on local devices."""
 
@@ -80,7 +100,7 @@ class DPTrainer:
         """Initialize the trainer from input data and optional checkpoints."""
         self.init_model = init_model
         self.restart = restart
-        self.model_def_script = jdata["model"]
+        self.model_def_script = deepcopy(jdata["model"])
         self.start_step = 0
         if self.init_model is not None:
             model_dict = serialize_from_file(self.init_model)
@@ -113,9 +133,14 @@ class DPTrainer:
         self.lr = get_lr_and_coef(learning_rate_param)
         loss_param = jdata.get("loss", {})
         loss_param["starter_learning_rate"] = learning_rate_param["start_lr"]
+        self.has_hessian = _loss_uses_hessian(loss_param)
 
         loss_type = loss_param.get("type", "ener")
-        if loss_type == "ener":
+        if self.has_hessian:
+            self.loss = EnergyHessianLoss.get_loss(loss_param)
+            _enable_hessian_output(self.model)
+            self.model_def_script["hessian_mode"] = True
+        elif loss_type == "ener":
             self.loss = EnergyLoss.get_loss(loss_param)
         else:
             raise RuntimeError("unknown loss type " + loss_type)
@@ -495,7 +520,7 @@ class DPTrainer:
             for k in train_results.keys():
                 print_str += prop_fmt % (k + "_trn")
         print_str += "   {:8s}\n".format("lr")
-        print_str += "# If there is no available reference data, rmse_*_{val,trn} will print nan\n"
+        print_str += "# If there is no available reference data, metric_*_{val,trn} will print nan\n"
         fp.write(print_str)
         fp.flush()
 

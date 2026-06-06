@@ -2,6 +2,7 @@
 """End-to-end tests for the local JAX training entrypoint."""
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -27,8 +28,18 @@ from deepmd.jax.entrypoints.main import (
 from deepmd.jax.entrypoints.train import (
     update_sel,
 )
+from deepmd.jax.model.model import (
+    get_model,
+)
+from deepmd.jax.train.trainer import (
+    DPTrainer,
+)
+from deepmd.utils.argcheck import (
+    normalize,
+)
 from deepmd.utils.compat import (
     convert_optimizer_v31_to_v32,
+    update_deepmd_input,
 )
 
 MODEL_SE_E2_A = {
@@ -163,6 +174,32 @@ class TestJAXTraining(unittest.TestCase):
         self.assertEqual(min_nbor_dist, 0.5)
         get_data.assert_called_once_with({}, 0, ["O", "H"], None)
         get_nbor_stat.assert_called_once()
+
+    def test_hessian_loss_enables_model_and_label_requirement(self) -> None:
+        """Hessian loss turns on model Hessian output before data loading."""
+        config = copy.deepcopy(self.config)
+        config["loss"]["start_pref_h"] = 1.0
+        config["loss"]["limit_pref_h"] = 1.0
+        jdata = update_deepmd_input(config, warning=False)
+        jdata = normalize(jdata)
+
+        trainer = DPTrainer(jdata)
+        requirement_keys = {item.key for item in trainer.data_requirements}
+
+        self.assertTrue(trainer.has_hessian)
+        self.assertTrue(trainer.model.atomic_output_def()["energy"].r_hessian)
+        self.assertTrue(trainer.model_def_script["hessian_mode"])
+        self.assertIn("hessian", requirement_keys)
+
+    def test_model_factory_restores_hessian_mode(self) -> None:
+        """Checkpoint model definitions keep Hessian output mode."""
+        model_params = copy.deepcopy(MODEL_SE_E2_A)
+        model_params["hessian_mode"] = True
+
+        model = get_model(model_params)
+
+        self.assertTrue(model.atomic_output_def()["energy"].r_hessian)
+        self.assertTrue(model.model_output_def()["energy"].r_hessian)
 
     @patch("deepmd.jax.entrypoints.freeze.deserialize_to_file")
     @patch("deepmd.jax.entrypoints.freeze.serialize_from_file")

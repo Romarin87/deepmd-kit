@@ -3,6 +3,7 @@ from deepmd.dpmodel.loss.dos import (
     DOSLoss,
 )
 from deepmd.dpmodel.loss.ener import (
+    EnergyHessianLoss,
     EnergyLoss,
 )
 from deepmd.dpmodel.loss.ener_spin import (
@@ -17,6 +18,7 @@ from deepmd.dpmodel.loss.tensor import (
 
 __all__ = [
     "DOSLoss",
+    "EnergyHessianLoss",
     "EnergyLoss",
     "EnergySpinLoss",
     "PropertyLoss",
