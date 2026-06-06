@@ -43,6 +43,7 @@ from deepmd.jax.descriptor.sezm_so3 import (
 )
 from deepmd.jax.descriptor.sezm_so2 import (
     DynamicRadialDegreeMixer,
+    GatedActivation,
     SO2Convolution,
     SO2Linear,
 )
@@ -390,6 +391,32 @@ class TestSeZMDescriptor(unittest.TestCase):
             np.asarray(rank_mixer(x_rank, radial_rank)),
             np.asarray(expected_rank),
         )
+
+    def test_gated_activation_reduced_layout(self) -> None:
+        activation = GatedActivation(
+            lmax=2,
+            mmax=1,
+            channels=1,
+            n_focus=1,
+            activation_function="tanh",
+            precision="float32",
+            layout="nfdc",
+            seed=7,
+        )
+        activation.gate_linear.weight = jnp.zeros((1, 2), dtype=jnp.float32)
+        x = jnp.asarray(
+            [[[[1.0], [2.0], [3.0], [4.0], [5.0], [6.0], [7.0]]]],
+            dtype=jnp.float32,
+        )
+        y = activation(x)
+        expected = np.asarray(
+            [[[[np.tanh(1.0)], [1.0], [1.5], [2.0], [2.5], [3.0], [3.5]]]],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(np.asarray(y), expected, atol=1e-6)
+
+        restored = GatedActivation.deserialize(activation.serialize())
+        np.testing.assert_allclose(np.asarray(restored(x)), expected, atol=1e-6)
 
     def test_so2_convolution_minimal_message_path(self) -> None:
         conv = SO2Convolution(

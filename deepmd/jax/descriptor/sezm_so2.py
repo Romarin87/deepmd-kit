@@ -11,6 +11,7 @@ from packaging.version import (
 
 from deepmd.dpmodel.descriptor.sezm_so2 import (
     DynamicRadialDegreeMixer as DynamicRadialDegreeMixerDP,
+    GatedActivation as GatedActivationDP,
     SO2Convolution as SO2ConvolutionDP,
     SO2Linear as SO2LinearDP,
 )
@@ -25,6 +26,7 @@ from deepmd.jax.env import (
 )
 from deepmd.jax.descriptor.sezm_so3 import (
     ChannelLinear,
+    FocusLinear,
     SO3Linear,
 )
 from deepmd.jax.utils.network import (
@@ -75,6 +77,22 @@ class DynamicRadialDegreeMixer(DynamicRadialDegreeMixerDP):
 
 
 @flax_module
+class GatedActivation(GatedActivationDP):
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"gate_linear"} and value is not None:
+            value = (
+                value
+                if isinstance(value, FocusLinear)
+                else FocusLinear.deserialize(value.serialize())
+            )
+        elif name in {"expand_index"}:
+            value = to_jax_array(value)
+            if value is not None:
+                value = ArrayAPIVariable(value)
+        return super().__setattr__(name, value)
+
+
+@flax_module
 class SO2Convolution(SO2ConvolutionDP):
     def __setattr__(self, name: str, value: Any) -> None:
         if name in {
@@ -91,6 +109,16 @@ class SO2Convolution(SO2ConvolutionDP):
                 item
                 if isinstance(item, SO2Linear)
                 else SO2Linear.deserialize(item.serialize())
+                for item in value
+            ]
+            value = _maybe_nnx_list(value)
+        elif name in {"non_linearities"}:
+            value = [
+                None
+                if item is None
+                else item
+                if isinstance(item, GatedActivation)
+                else GatedActivation.deserialize(item.serialize())
                 for item in value
             ]
             value = _maybe_nnx_list(value)

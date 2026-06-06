@@ -17,9 +17,13 @@ from deepmd.dpmodel import (
 )
 from deepmd.dpmodel.array_api import (
     Array,
+    xp_sigmoid,
 )
 from deepmd.dpmodel.common import (
     to_numpy_array,
+)
+from deepmd.dpmodel.utils.network import (
+    get_activation_fn,
 )
 from deepmd.dpmodel.utils.seed import (
     child_seed,
@@ -30,6 +34,7 @@ from deepmd.utils.version import (
 
 from .sezm_so3 import (
     ChannelLinear,
+    FocusLinear,
     SO3Linear,
     _trunc_normal,
 )
@@ -560,6 +565,146 @@ def _set_flat_columns(target: Array, index: Array, source: Array) -> Array:
     return target
 
 
+class GatedActivation(NativeOP):
+    """Degree-wise gated activation for full or reduced SeZM layouts."""
+
+    def __init__(
+        self,
+        *,
+        lmax: int,
+        mmax: int | None = None,
+        channels: int,
+        n_focus: int = 1,
+        precision: str = DEFAULT_PRECISION,
+        activation_function: str = "silu",
+        mlp_bias: bool = False,
+        layout: str = "nfdc",
+        trainable: bool = True,
+        seed: int | list[int] | None = None,
+    ) -> None:
+        self.lmax = int(lmax)
+        self.mmax = None if mmax is None else int(mmax)
+        if self.mmax is not None:
+            if self.mmax < 0:
+                raise ValueError("`mmax` must be non-negative")
+            if self.mmax > self.lmax:
+                raise ValueError("`mmax` must be <= `lmax`")
+        self.channels = int(channels)
+        self.n_focus = int(n_focus)
+        self.precision = precision
+        self.activation_function = str(activation_function)
+        self.mlp_bias = bool(mlp_bias)
+        self.layout = str(layout).lower()
+        if self.layout not in {"nfdc", "ndfc"}:
+            raise ValueError("`layout` must be either 'nfdc' or 'ndfc'")
+        self.trainable = bool(trainable)
+        dtype = PRECISION_DICT[self.precision.lower()]
+
+        if self.lmax > 0:
+            if self.mmax is None:
+                expand_index = map_degree_idx(self.lmax)[1:] - 1
+            else:
+                expand_index = build_m_major_l_index(self.lmax, self.mmax)[1:] - 1
+            gate_linear = FocusLinear(
+                in_channels=self.channels,
+                out_channels=self.lmax * self.channels,
+                n_focus=self.n_focus,
+                precision=self.precision,
+                bias=self.mlp_bias,
+                trainable=self.trainable,
+                seed=seed,
+            )
+            rng = np.random.default_rng(child_seed(seed, 1))
+            gate_linear.weight = rng.normal(
+                0.0,
+                0.01,
+                gate_linear.weight.shape,
+            ).astype(dtype)
+            if gate_linear.bias is not None:
+                gate_linear.bias = np.zeros(gate_linear.bias.shape, dtype=dtype)
+            self.gate_linear = gate_linear
+        else:
+            expand_index = np.zeros(0, dtype=np.int64)
+            self.gate_linear = None
+        self.expand_index = np.asarray(expand_index, dtype=np.int64)
+
+    def call(self, x: Array, gate: Array | None = None) -> Array:
+        xp = array_api_compat.array_namespace(x)
+        degree_axis = 1 if self.layout == "ndfc" else 2
+        scalar_act = get_activation_fn(self.activation_function)
+
+        if self.layout == "ndfc":
+            gate_scalar_source = gate[:, 0, :, :] if gate is not None else x[:, 0, :, :]
+            if gate is not None:
+                x0 = x[:, :1, :, :] * scalar_act(gate[:, :1, :, :])
+            else:
+                x0 = scalar_act(x[:, :1, :, :])
+            x_rest = x[:, 1:, :, :]
+        else:
+            gate_scalar_source = gate[:, :, 0, :] if gate is not None else x[:, :, 0, :]
+            if gate is not None:
+                x0 = x[:, :, :1, :] * scalar_act(gate[:, :, :1, :])
+            else:
+                x0 = scalar_act(x[:, :, :1, :])
+            x_rest = x[:, :, 1:, :]
+
+        if self.lmax == 0:
+            return x0
+
+        gating_scalars = xp_sigmoid(self.gate_linear(gate_scalar_source))
+        gating_scalars = xp.reshape(
+            gating_scalars,
+            (x.shape[0], gate_scalar_source.shape[1], self.lmax, self.channels),
+        )
+        expand_index = xp.asarray(self.expand_index[...], dtype=xp.int64)
+        gates = xp.take(gating_scalars, expand_index, axis=2)
+        if self.layout == "ndfc":
+            gates = xp.permute_dims(gates, (0, 2, 1, 3))
+        return xp.concat([x0, x_rest * gates], axis=degree_axis)
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "@class": "GatedActivation",
+            "@version": 1,
+            "config": {
+                "lmax": self.lmax,
+                "mmax": self.mmax,
+                "channels": self.channels,
+                "n_focus": self.n_focus,
+                "precision": self.precision,
+                "activation_function": self.activation_function,
+                "mlp_bias": self.mlp_bias,
+                "layout": self.layout,
+                "trainable": self.trainable,
+                "seed": None,
+            },
+            "@variables": {
+                "gate_linear": (
+                    None if self.gate_linear is None else self.gate_linear.serialize()
+                ),
+                "expand_index": to_numpy_array(self.expand_index[...]),
+            },
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> "GatedActivation":
+        data = data.copy()
+        data_cls = data.pop("@class", None)
+        if data_cls != "GatedActivation":
+            raise ValueError(f"Invalid class for GatedActivation: {data_cls}")
+        check_version_compatibility(data.pop("@version", 1), 1, 1)
+        config = data.pop("config")
+        variables = data.pop("@variables")
+        obj = cls(**config)
+        obj.gate_linear = (
+            None
+            if variables["gate_linear"] is None
+            else FocusLinear.deserialize(variables["gate_linear"])
+        )
+        obj.expand_index = variables.get("expand_index", obj.expand_index)
+        return obj
+
+
 class SO2Convolution(NativeOP):
     """Minimal eager SO(2) message convolution for the staged JAX SeZM port."""
 
@@ -668,6 +813,21 @@ class SO2Convolution(NativeOP):
             )
             for ii in range(self.so2_layers)
         ]
+        self.non_linearities = [
+            GatedActivation(
+                lmax=self.lmax,
+                mmax=self.mmax,
+                channels=self.so2_focus_dim,
+                n_focus=self.n_focus,
+                precision=self.precision,
+                activation_function=self.activation_function,
+                mlp_bias=self.mlp_bias,
+                layout="nfdc",
+                trainable=self.trainable,
+                seed=child_seed(seed_so2_stack, 1000 + ii),
+            )
+            for ii in range(max(0, self.so2_layers - 1))
+        ] + [None]
         self.radial_hidden_proj = (
             ChannelLinear(
                 in_channels=self.channels,
@@ -782,9 +942,16 @@ class SO2Convolution(NativeOP):
             (n_edge, self.reduced_dim, self.n_focus, self.so2_focus_dim),
         )
         x_local = xp.permute_dims(x_local, (0, 2, 1, 3))
-        for so2_linear in self.so2_linears:
+        for so2_linear, non_linear in zip(
+            self.so2_linears,
+            self.non_linearities,
+            strict=True,
+        ):
             residual = x_local
-            x_local = residual + so2_linear(x_local)
+            update = so2_linear(x_local)
+            if non_linear is not None:
+                update = non_linear(update)
+            x_local = residual + update
 
         x_local = xp.permute_dims(x_local, (0, 2, 1, 3))
         x_local = xp.reshape(
@@ -851,6 +1018,10 @@ class SO2Convolution(NativeOP):
                     self.rotate_inv_rescale_full[...]
                 ),
                 "so2_linears": [layer.serialize() for layer in self.so2_linears],
+                "non_linearities": [
+                    None if layer is None else layer.serialize()
+                    for layer in self.non_linearities
+                ],
                 "radial_hidden_proj": (
                     None
                     if self.radial_hidden_proj is None
@@ -888,6 +1059,10 @@ class SO2Convolution(NativeOP):
         )
         obj.so2_linears = [
             SO2Linear.deserialize(item) for item in variables["so2_linears"]
+        ]
+        obj.non_linearities = [
+            None if item is None else GatedActivation.deserialize(item)
+            for item in variables.get("non_linearities", obj.non_linearities)
         ]
         obj.radial_hidden_proj = (
             None
