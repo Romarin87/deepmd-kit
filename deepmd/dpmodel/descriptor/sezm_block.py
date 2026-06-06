@@ -212,7 +212,9 @@ class SeZMInteractionBlock(NativeOP):
             "block_attn_res": self.block_attn_res != "none",
             "layer_scale": self.layer_scale,
             "grid_mlp": self.grid_mlp,
-            "ffn_s2_activation": self.ffn_s2_activation,
+            "ffn_s2_activation_without_lebedev": (
+                self.ffn_s2_activation and not self.ffn_lebedev_quadrature
+            ),
             "so2_s2_activation": self.so2_s2_activation,
         }
         enabled = [name for name, active in unsupported.items() if active]

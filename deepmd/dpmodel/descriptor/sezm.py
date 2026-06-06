@@ -726,7 +726,10 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             "block_attn_res": self.block_attn_res != "none",
             "layer_scale": self.layer_scale,
             "grid_mlp": self.grid_mlp,
-            "s2_activation": any(self.s2_activation),
+            "so2_s2_activation": self.so2_s2_activation,
+            "ffn_s2_activation_without_lebedev": (
+                self.ffn_s2_activation and not self.ffn_lebedev_quadrature
+            ),
             "mlp_bias": self.mlp_bias,
             "charge_spin": self.add_chg_spin_ebd,
             "exclude_types": bool(self.exclude_types),
