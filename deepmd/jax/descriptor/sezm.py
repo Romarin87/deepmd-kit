@@ -32,6 +32,12 @@ from deepmd.jax.common import (
 from deepmd.jax.descriptor.base_descriptor import (
     BaseDescriptor,
 )
+from deepmd.jax.descriptor.sezm_block import (
+    SeZMInteractionBlock,
+)
+from deepmd.jax.descriptor.sezm_ffn import (
+    EquivariantFFN,
+)
 from deepmd.jax.env import (
     flax_version,
     nnx,
@@ -166,4 +172,15 @@ class DescrptSeZM(DescrptSeZMDP):
         elif name in {"wigner_calc"}:
             if not isinstance(value, WignerDCalculator):
                 value = WignerDCalculator.deserialize(value.serialize())
+        elif name in {"blocks"}:
+            value = [
+                block
+                if isinstance(block, SeZMInteractionBlock)
+                else SeZMInteractionBlock.deserialize(block.serialize())
+                for block in value
+            ]
+            value = _maybe_nnx_list(value)
+        elif name in {"output_ffn"} and value is not None:
+            if not isinstance(value, EquivariantFFN):
+                value = EquivariantFFN.deserialize(value.serialize())
         return super().__setattr__(name, value)

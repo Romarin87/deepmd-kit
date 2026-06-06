@@ -8,6 +8,8 @@ from typing import (
     NamedTuple,
 )
 
+import math
+
 import array_api_compat
 import numpy as np
 
@@ -45,6 +47,15 @@ from deepmd.utils.version import (
 
 from .base_descriptor import (
     BaseDescriptor,
+)
+from .sezm_block import (
+    SeZMInteractionBlock,
+)
+from .sezm_ffn import (
+    EquivariantFFN,
+)
+from .sezm_indexing import (
+    get_so3_dim_of_lmax,
 )
 from .sezm_wignerd import (
     WignerDCalculator,
@@ -523,6 +534,21 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         self.lebedev_quadrature = _normalize_bool_pair(lebedev_quadrature, True)
         self.activation_function = str(activation_function)
         self.glu_activation = bool(glu_activation)
+        self.so2_s2_activation = self.s2_activation[0]
+        self.ffn_s2_activation = self.s2_activation[1]
+        self.so2_lebedev_quadrature = self.lebedev_quadrature[0]
+        self.ffn_lebedev_quadrature = self.lebedev_quadrature[1]
+        self.so2_activation_function = (
+            "silu" if self.so2_s2_activation else self.activation_function
+        )
+        self.ffn_activation_function = (
+            "silu" if self.ffn_s2_activation else self.activation_function
+        )
+        self.ffn_glu_activation = (
+            True if self.ffn_s2_activation else self.glu_activation
+        )
+        self.out_activation_function = self.activation_function
+        self.out_glu_activation = self.glu_activation
         self.use_amp = bool(use_amp)
         self.exclude_types = [] if exclude_types is None else list(exclude_types)
         self.precision = str(precision)
@@ -574,6 +600,75 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             eps=self.eps,
             precision=self.precision,
         )
+        self.block_ffn_neurons = self._resolve_ffn_neurons(
+            self.ffn_neurons,
+            glu_activation=self.ffn_glu_activation,
+        )
+        self.out_ffn_neurons = self._resolve_ffn_neurons(
+            self.ffn_neurons,
+            glu_activation=self.out_glu_activation,
+        )
+        self._baseline_forward_supported = self._is_baseline_forward_supported()
+        if self._baseline_forward_supported:
+            self.blocks = [
+                SeZMInteractionBlock(
+                    lmax=ll,
+                    mmax=mm,
+                    channels=self.channels,
+                    n_focus=self.n_focus,
+                    focus_dim=self.focus_dim,
+                    focus_compete=False,
+                    so2_norm=self.so2_norm,
+                    so2_layers=self.so2_layers,
+                    so2_attn_res=self.so2_attn_res,
+                    radial_so2_mode=self.radial_so2_mode,
+                    radial_so2_rank=self.radial_so2_rank,
+                    n_atten_head=self.n_atten_head,
+                    atten_f_mix=self.atten_f_mix,
+                    atten_v_proj=self.atten_v_proj,
+                    atten_o_proj=self.atten_o_proj,
+                    so2_pre_norm=self.sandwich_norm[0],
+                    so2_post_norm=self.sandwich_norm[1],
+                    ffn_pre_norm=self.sandwich_norm[2],
+                    ffn_post_norm=self.sandwich_norm[3],
+                    ffn_neurons=self.block_ffn_neurons,
+                    grid_mlp=self.grid_mlp,
+                    ffn_blocks=self.ffn_blocks,
+                    layer_scale=self.layer_scale,
+                    full_attn_res=self.full_attn_res,
+                    block_attn_res=self.block_attn_res,
+                    so2_s2_activation=self.so2_s2_activation,
+                    ffn_s2_activation=self.ffn_s2_activation,
+                    so2_lebedev_quadrature=self.so2_lebedev_quadrature,
+                    ffn_lebedev_quadrature=self.ffn_lebedev_quadrature,
+                    so2_activation_function=self.so2_activation_function,
+                    ffn_activation_function=self.ffn_activation_function,
+                    ffn_glu_activation=self.ffn_glu_activation,
+                    mlp_bias=self.mlp_bias,
+                    eps=self.eps,
+                    precision=self.precision,
+                    trainable=self.trainable,
+                    seed=child_seed(self.seed, 10 + ii),
+                )
+                for ii, (ll, mm) in enumerate(zip(self.l_schedule, self.m_schedule))
+            ]
+            self.output_ffn = EquivariantFFN(
+                lmax=0,
+                channels=self.channels,
+                hidden_channels=self.out_ffn_neurons,
+                grid_mlp=False,
+                precision=self.precision,
+                s2_activation=False,
+                lebedev_quadrature=False,
+                activation_function=self.out_activation_function,
+                glu_activation=self.out_glu_activation,
+                mlp_bias=self.mlp_bias,
+                trainable=self.trainable,
+                seed=child_seed(self.seed, 2),
+            )
+        else:
+            self.blocks = []
+            self.output_ffn = None
 
     def _validate_v1_path(self) -> None:
         if self.lmax != SUPPORTED_LMAX or any(x != SUPPORTED_LMAX for x in self.l_schedule):
@@ -603,6 +698,43 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             raise NotImplementedError(
                 "JAX SeZM v1 does not support: " + ", ".join(enabled)
             )
+
+    def _resolve_ffn_neurons(self, ffn_neurons: int, *, glu_activation: bool) -> int:
+        resolved = int(ffn_neurons)
+        if resolved < 0:
+            raise ValueError("`ffn_neurons` must be >= 0")
+        if resolved > 0:
+            return resolved
+        base_width = (
+            (8.0 * float(self.channels) / 3.0)
+            if glu_activation
+            else (4.0 * float(self.channels))
+        )
+        return int(32 * math.ceil(base_width / 32.0))
+
+    def _unsupported_forward_features(self) -> list[str]:
+        unsupported = {
+            "random_gamma": self.random_gamma,
+            "use_env_seed": self.use_env_seed,
+            "n_atten_head": self.n_atten_head != 0,
+            "atten_f_mix": self.atten_f_mix,
+            "atten_v_proj": self.atten_v_proj,
+            "atten_o_proj": self.atten_o_proj,
+            "so2_norm": self.so2_norm,
+            "so2_attn_res": self.so2_attn_res != "none",
+            "full_attn_res": self.full_attn_res != "none",
+            "block_attn_res": self.block_attn_res != "none",
+            "layer_scale": self.layer_scale,
+            "grid_mlp": self.grid_mlp,
+            "s2_activation": any(self.s2_activation),
+            "mlp_bias": self.mlp_bias,
+            "charge_spin": self.add_chg_spin_ebd,
+            "exclude_types": bool(self.exclude_types),
+        }
+        return [name for name, active in unsupported.items() if active]
+
+    def _is_baseline_forward_supported(self) -> bool:
+        return not self._unsupported_forward_features()
 
     def get_rcut(self) -> float:
         return self.rcut
@@ -712,6 +844,11 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         xp = array_api_compat.array_namespace(coord, atype_ext, nlist)
         nf, nloc, nnei = nlist.shape
         nall = coord.shape[1]
+        if mapping is None and nall != nloc:
+            raise NotImplementedError(
+                "JAX SeZM baseline forward requires `mapping` when extended "
+                "atoms are present."
+            )
         valid = nlist >= 0
         frame_idx, loc_idx, nei_idx = xp.nonzero(valid)
         neighbor_ext = xp.take(
@@ -793,10 +930,58 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         comm_dict: dict | None = None,
         charge_spin: Array | None = None,
     ) -> tuple[Array, Array, Array, Array, Array]:
-        raise NotImplementedError(
-            "JAX SeZM descriptor forward is being ported; construction and "
-            "serialization are available, but eager forward is not complete yet."
+        if not self._baseline_forward_supported:
+            raise NotImplementedError(
+                "JAX SeZM descriptor baseline forward does not support: "
+                + ", ".join(self._unsupported_forward_features())
+            )
+        if charge_spin is not None:
+            raise NotImplementedError("JAX SeZM baseline forward ignores charge_spin.")
+        coord = self._reshape_coord(coord_ext)
+        xp = array_api_compat.array_namespace(coord, atype_ext, nlist)
+        nf, nloc, _ = nlist.shape
+        n_nodes = nf * nloc
+        atype_loc = atype_ext[:, :nloc]
+        type_feat = xp.reshape(self.type_embedding(atype_loc), (n_nodes, self.channels))
+
+        edge_cache = self._build_edge_cache(
+            coord,
+            atype_ext,
+            nlist,
+            mapping,
+            include_wigner=True,
         )
+        ebed_dim_0 = get_so3_dim_of_lmax(self.l_schedule[0])
+        x = xp.zeros(
+            (n_nodes, ebed_dim_0, 1, self.channels),
+            dtype=type_feat.dtype,
+        )
+        x = _set_l0_features(x, type_feat)
+
+        radial_feat_flat = self.radial_embedding(edge_cache.edge_rbf)
+        radial_feat = xp.reshape(
+            radial_feat_flat,
+            (edge_cache.edge_rbf.shape[0], self.lmax + 1, self.channels),
+        )
+        radial_feat = radial_feat * xp.expand_dims(edge_cache.edge_env, axis=-1)
+        radial_feat = radial_feat + xp.expand_dims(edge_cache.edge_type_feat, axis=1)
+        radial_feat_per_block = [
+            radial_feat[:, : ll + 1, :] for ll in self.l_schedule
+        ]
+
+        if edge_cache.src.shape[0] > 0:
+            for block, block_radial in zip(
+                self.blocks,
+                radial_feat_per_block,
+                strict=True,
+            ):
+                x, _, _, _ = block(x, edge_cache, block_radial)
+
+        x_scalar = xp.reshape(x[:, 0:1, :, :], (n_nodes, 1, 1, self.channels))
+        x_scalar = x_scalar + self.output_ffn(x_scalar)
+        descriptor = xp.reshape(x_scalar, (nf, nloc, self.channels))
+        empty = xp.zeros((0,), dtype=descriptor.dtype)
+        return descriptor, empty, empty, empty, empty
 
     def serialize(self) -> dict[str, Any]:
         return {
@@ -862,6 +1047,10 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
                 "edge_envelope": self.edge_envelope.serialize(),
                 "radial_embedding": self.radial_embedding.serialize(),
                 "wigner_calc": self.wigner_calc.serialize(),
+                "blocks": [block.serialize() for block in self.blocks],
+                "output_ffn": (
+                    None if self.output_ffn is None else self.output_ffn.serialize()
+                ),
             },
         }
 
@@ -892,4 +1081,17 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             obj.radial_embedding = RadialMLP.deserialize(variables["radial_embedding"])
         if "wigner_calc" in variables:
             obj.wigner_calc = WignerDCalculator.deserialize(variables["wigner_calc"])
+        if "blocks" in variables:
+            obj.blocks = [
+                SeZMInteractionBlock.deserialize(block) for block in variables["blocks"]
+            ]
+        if "output_ffn" in variables and variables["output_ffn"] is not None:
+            obj.output_ffn = EquivariantFFN.deserialize(variables["output_ffn"])
         return obj
+
+
+def _set_l0_features(x: Array, values: Array) -> Array:
+    if hasattr(x, "at"):
+        return x.at[:, 0, 0, :].set(values)
+    x[:, 0, 0, :] = values
+    return x

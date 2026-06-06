@@ -528,6 +528,82 @@ class TestSeZMDescriptor(unittest.TestCase):
             atol=1e-6,
         )
 
+    def test_descriptor_baseline_forward_with_mapping(self) -> None:
+        descriptor = DescrptSeZM(
+            ntypes=2,
+            sel=2,
+            rcut=6.0,
+            channels=2,
+            n_radial=2,
+            radial_mlp=[0],
+            use_env_seed=False,
+            random_gamma=False,
+            lmax=3,
+            mmax=1,
+            n_blocks=1,
+            so2_layers=1,
+            radial_so2_mode="degree_channel",
+            radial_so2_rank=1,
+            n_focus=1,
+            focus_dim=0,
+            n_atten_head=0,
+            atten_f_mix=False,
+            atten_v_proj=False,
+            atten_o_proj=False,
+            ffn_neurons=1,
+            ffn_blocks=1,
+            sandwich_norm=[False, True, True, False],
+            s2_activation=[False, False],
+            lebedev_quadrature=[False, False],
+            activation_function="silu",
+            glu_activation=True,
+            mlp_bias=False,
+            layer_scale=False,
+            full_attn_res="none",
+            block_attn_res="none",
+            precision="float32",
+            seed=42,
+        )
+        coord_ext = jnp.asarray(
+            [
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ]
+            ],
+            dtype=jnp.float32,
+        )
+        atype_ext = jnp.asarray([[0, 1, 0]], dtype=jnp.int64)
+        nlist = jnp.asarray([[[1, -1], [2, -1]]], dtype=jnp.int64)
+        mapping = jnp.asarray([[0, 1, 0]], dtype=jnp.int64)
+
+        out, rot, g2, h2, sw = descriptor(
+            coord_ext,
+            atype_ext,
+            nlist,
+            mapping=mapping,
+        )
+        self.assertEqual(out.shape, (1, 2, 2))
+        self.assertEqual(rot.shape, (0,))
+        self.assertEqual(g2.shape, (0,))
+        self.assertEqual(h2.shape, (0,))
+        self.assertEqual(sw.shape, (0,))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(out))))
+
+        restored = DescrptSeZM.deserialize(descriptor.serialize())
+        restored_out, _, _, _, _ = restored(
+            coord_ext,
+            atype_ext,
+            nlist,
+            mapping=mapping,
+        )
+        np.testing.assert_allclose(
+            np.asarray(restored_out),
+            np.asarray(out),
+            atol=1e-6,
+        )
+
     def test_so2_convolution_minimal_message_path(self) -> None:
         conv = SO2Convolution(
             lmax=1,
