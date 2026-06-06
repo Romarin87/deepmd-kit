@@ -716,7 +716,6 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         unsupported = {
             "random_gamma": self.random_gamma,
             "use_env_seed": self.use_env_seed,
-            "n_atten_head": self.n_atten_head != 0,
             "atten_f_mix": self.atten_f_mix,
             "atten_v_proj": self.atten_v_proj,
             "atten_o_proj": self.atten_o_proj,
