@@ -22,6 +22,10 @@ from deepmd.jax.fitting.fitting import (
 from deepmd.jax.model.model import (
     get_model,
 )
+from deepmd.jax.utils.serialization import (
+    pack_zero_size_arrays_for_orbax,
+    restore_zero_size_arrays_from_abstract,
+)
 from deepmd.dpmodel.descriptor.sezm_lebedev import (
     load_lebedev_rule,
 )
@@ -447,6 +451,22 @@ class TestSeZMDescriptor(unittest.TestCase):
 
         restored = GatedActivation.deserialize(activation.serialize())
         np.testing.assert_allclose(np.asarray(restored(x)), expected, atol=1e-6)
+
+    def test_zero_size_state_pack_restore(self) -> None:
+        state = {
+            "empty": jnp.zeros((2, 0), dtype=jnp.float32),
+            "nested": [jnp.zeros((0,), dtype=jnp.int64)],
+            "full": jnp.ones((2,), dtype=jnp.float32),
+        }
+        packed = pack_zero_size_arrays_for_orbax(state)
+        self.assertEqual(packed["empty"].shape, (1,))
+        self.assertEqual(packed["nested"][0].shape, (1,))
+        self.assertEqual(packed["full"].shape, (2,))
+
+        restored = restore_zero_size_arrays_from_abstract(packed, state)
+        self.assertEqual(restored["empty"].shape, (2, 0))
+        self.assertEqual(restored["nested"][0].shape, (0,))
+        self.assertEqual(restored["full"].shape, (2,))
 
     def test_equivariant_ffn_glu_minimal_path(self) -> None:
         ffn = EquivariantFFN(

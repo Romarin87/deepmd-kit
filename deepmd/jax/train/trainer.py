@@ -53,6 +53,7 @@ from deepmd.jax.model.model import (
     get_model,
 )
 from deepmd.jax.utils.serialization import (
+    pack_zero_size_arrays_for_orbax,
     serialize_from_file,
 )
 from deepmd.loggers.training import (
@@ -443,7 +444,9 @@ class DPTrainer:
             checkpointer.save(
                 ckpt_path.absolute(),
                 ocp.args.Composite(
-                    state=ocp.args.StandardSave(state.to_pure_dict()),
+                    state=ocp.args.StandardSave(
+                        pack_zero_size_arrays_for_orbax(state.to_pure_dict()),
+                    ),
                     model_def_script=ocp.args.JsonSave(model_def_script_cpy),
                 ),
             )

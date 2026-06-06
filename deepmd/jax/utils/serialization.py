@@ -2,6 +2,9 @@
 from pathlib import (
     Path,
 )
+from typing import (
+    Any,
+)
 
 import numpy as np
 import orbax.checkpoint as ocp
@@ -20,6 +23,64 @@ from deepmd.jax.model.model import (
     BaseModel,
     get_model,
 )
+
+
+def _is_zero_size_array(value: Any) -> bool:
+    return (
+        hasattr(value, "shape")
+        and hasattr(value, "dtype")
+        and getattr(value, "size", None) == 0
+    )
+
+
+def pack_zero_size_arrays_for_orbax(state: Any) -> Any:
+    """Replace zero-size arrays by scalar sentinels before Orbax save.
+
+    Orbax refuses to checkpoint arrays with zero elements.  These arrays carry
+    no values, so they can be reconstructed from the model definition during
+    restore.
+    """
+    if _is_zero_size_array(state):
+        return jnp.zeros((1,), dtype=state.dtype)
+    if isinstance(state, dict):
+        return {
+            key: pack_zero_size_arrays_for_orbax(value)
+            for key, value in state.items()
+        }
+    if isinstance(state, list):
+        return [pack_zero_size_arrays_for_orbax(value) for value in state]
+    if isinstance(state, tuple):
+        return tuple(pack_zero_size_arrays_for_orbax(value) for value in state)
+    return state
+
+
+def restore_zero_size_arrays_from_abstract(state: Any, abstract_state: Any) -> Any:
+    """Restore zero-size leaves from an abstract model state after Orbax load."""
+    if _is_zero_size_array(abstract_state):
+        return abstract_state
+    if isinstance(state, dict) and isinstance(abstract_state, dict):
+        return {
+            key: restore_zero_size_arrays_from_abstract(
+                value,
+                abstract_state.get(key),
+            )
+            for key, value in state.items()
+        }
+    if isinstance(state, list) and isinstance(abstract_state, list):
+        return [
+            restore_zero_size_arrays_from_abstract(value, abstract_state[idx])
+            if idx < len(abstract_state)
+            else value
+            for idx, value in enumerate(state)
+        ]
+    if isinstance(state, tuple) and isinstance(abstract_state, tuple):
+        return tuple(
+            restore_zero_size_arrays_from_abstract(value, abstract_state[idx])
+            if idx < len(abstract_state)
+            else value
+            for idx, value in enumerate(state)
+        )
+    return state
 
 
 def deserialize_to_file(model_file: str, data: dict) -> None:
@@ -42,7 +103,9 @@ def deserialize_to_file(model_file: str, data: dict) -> None:
             checkpointer.save(
                 Path(model_file).absolute(),
                 ocp.args.Composite(
-                    state=ocp.args.StandardSave(state.to_pure_dict()),
+                    state=ocp.args.StandardSave(
+                        pack_zero_size_arrays_for_orbax(state.to_pure_dict()),
+                    ),
                     model_def_script=ocp.args.JsonSave(model_def_script),
                 ),
             )
@@ -186,6 +249,10 @@ def serialize_from_file(model_file: str) -> dict:
         model_def_script = data.model_def_script
         abstract_model = get_model(model_def_script)
         graphdef, abstract_state = nnx.split(abstract_model)
+        state = restore_zero_size_arrays_from_abstract(
+            state,
+            abstract_state.to_pure_dict(),
+        )
         abstract_state.replace_by_pure_dict(state)
         model = nnx.merge(graphdef, abstract_state)
         model_dict = model.serialize()
