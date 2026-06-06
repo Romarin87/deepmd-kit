@@ -50,6 +50,9 @@ from deepmd.utils.spin import (
     Spin,
 )
 
+SEZM_MODEL_TYPES = {"SeZM", "sezm", "DPA4", "dpa4"}
+SEZM_FITTING_TYPES = {"dpa4_ener", "sezm_ener"}
+
 
 def _get_standard_model_components(
     data: dict[str, Any], ntypes: int
@@ -60,7 +63,9 @@ def _get_standard_model_components(
     descriptor = BaseDescriptor(**data["descriptor"])
     # fitting
     fitting_net = data.get("fitting_net", {})
-    fitting_net["type"] = fitting_net.get("type", "ener")
+    descriptor_type = data["descriptor"].get("type")
+    default_fitting_type = "sezm_ener" if descriptor_type in SEZM_MODEL_TYPES else "ener"
+    fitting_net["type"] = fitting_net.get("type", default_fitting_type)
     fitting_net["ntypes"] = descriptor.get_ntypes()
     fitting_net["type_map"] = copy.deepcopy(data["type_map"])
     fitting_net["mixed_types"] = descriptor.mixed_types()
@@ -100,7 +105,7 @@ def get_standard_model(data: dict) -> EnergyModel:
         modelcls = PolarModel
     elif fitting_net_type == "dos":
         modelcls = DOSModel
-    elif fitting_net_type in ["ener", "direct_force_ener", "dpa4_ener", "sezm_ener"]:
+    elif fitting_net_type in ["ener", "direct_force_ener", *SEZM_FITTING_TYPES]:
         modelcls = EnergyModel
     elif fitting_net_type == "property":
         modelcls = PropertyModel
@@ -202,6 +207,14 @@ def get_model(data: dict) -> BaseModel:
         The data to construct the model.
     """
     model_type = data.get("type", "standard")
+    if model_type in SEZM_MODEL_TYPES:
+        data = copy.deepcopy(data)
+        data["type"] = "standard"
+        data.setdefault("descriptor", {})
+        data["descriptor"]["type"] = data["descriptor"].get("type", model_type)
+        data.setdefault("fitting_net", {})
+        data["fitting_net"]["type"] = data["fitting_net"].get("type", "sezm_ener")
+        return get_standard_model(data)
     if model_type == "standard":
         if "spin" in data:
             return get_spin_model(data)

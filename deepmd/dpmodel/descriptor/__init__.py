@@ -26,6 +26,9 @@ from .se_e2_a import (
 from .se_r import (
     DescrptSeR,
 )
+from .sezm import (
+    DescrptSeZM,
+)
 from .se_t import (
     DescrptSeT,
 )
@@ -42,6 +45,7 @@ __all__ = [
     "DescrptSeA",
     "DescrptSeAttenV2",
     "DescrptSeR",
+    "DescrptSeZM",
     "DescrptSeT",
     "DescrptSeTTebd",
     "make_base_descriptor",

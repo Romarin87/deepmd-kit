@@ -20,6 +20,9 @@ from deepmd.jax.descriptor.se_e2_a import (
 from deepmd.jax.descriptor.se_e2_r import (
     DescrptSeR,
 )
+from deepmd.jax.descriptor.sezm import (
+    DescrptSeZM,
+)
 from deepmd.jax.descriptor.se_t import (
     DescrptSeT,
 )
@@ -35,6 +38,7 @@ __all__ = [
     "DescrptSeA",
     "DescrptSeAttenV2",
     "DescrptSeR",
+    "DescrptSeZM",
     "DescrptSeT",
     "DescrptSeTTebd",
 ]
