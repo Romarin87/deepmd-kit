@@ -4,6 +4,7 @@ from deepmd.jax.fitting.fitting import (
     DOSFittingNet,
     EnergyFittingNet,
     PolarFittingNet,
+    SeZMEnergyFittingNet,
 )
 
 __all__ = [
@@ -11,4 +12,5 @@ __all__ = [
     "DipoleFittingNet",
     "EnergyFittingNet",
     "PolarFittingNet",
+    "SeZMEnergyFittingNet",
 ]

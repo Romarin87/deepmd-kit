@@ -13,6 +13,8 @@ from deepmd.dpmodel.utils.network import EmbeddingNet as EmbeddingNetDP
 from deepmd.dpmodel.utils.network import FittingNet as FittingNetDP
 from deepmd.dpmodel.utils.network import Identity as IdentityDP
 from deepmd.dpmodel.utils.network import LayerNorm as LayerNormDP
+from deepmd.dpmodel.utils.network import GLUFittingNet as GLUFittingNetDP
+from deepmd.dpmodel.utils.network import GLULayer as GLULayerDP
 from deepmd.dpmodel.utils.network import NativeLayer as NativeLayerDP
 from deepmd.dpmodel.utils.network import NativeNet as NativeNetDP
 from deepmd.dpmodel.utils.network import NetworkCollection as NetworkCollectionDP
@@ -75,6 +77,35 @@ class FittingNet(make_fitting_network(EmbeddingNet, NativeNet, NativeLayer)):
 
 
 @flax_module
+class GLULayer(GLULayerDP):
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "linear" and value is not None and not isinstance(
+            value, NativeLayer
+        ):
+            value = NativeLayer.deserialize(value.serialize())
+        return super().__setattr__(name, value)
+
+
+@flax_module
+class GLUFittingNet(GLUFittingNetDP):
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "hidden_layers":
+            value = [
+                item
+                if isinstance(item, GLULayer)
+                else GLULayer.deserialize(item.serialize())
+                for item in value
+            ]
+            if Version(flax_version) >= Version("0.12.0"):
+                value = nnx.List(value)
+        elif name == "output_layer" and value is not None and not isinstance(
+            value, NativeLayer
+        ):
+            value = NativeLayer.deserialize(value.serialize())
+        return super().__setattr__(name, value)
+
+
+@flax_module
 class NetworkCollection(NetworkCollectionDP):
     _jax_data_list_attrs: ClassVar[set[str]] = {"_networks"}
 
@@ -82,6 +113,7 @@ class NetworkCollection(NetworkCollectionDP):
         "network": NativeNet,
         "embedding_network": EmbeddingNet,
         "fitting_network": FittingNet,
+        "sezm_fitting_network": GLUFittingNet,
     }
 
 

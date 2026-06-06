@@ -10,6 +10,9 @@ from deepmd.dpmodel.fitting.polarizability_fitting import (
 from deepmd.dpmodel.fitting.property_fitting import (
     PropertyFittingNet as PropertyFittingNetDP,
 )
+from deepmd.dpmodel.fitting.sezm_ener_fitting import (
+    SeZMEnergyFittingNet as SeZMEnergyFittingNetDP,
+)
 from deepmd.jax.common import (
     flax_module,
 )
@@ -22,6 +25,15 @@ from deepmd.jax.fitting.base_fitting import (
 @flax_module
 class EnergyFittingNet(EnergyFittingNetDP):
     pass
+
+
+@BaseFitting.register("dpa4_ener")
+@BaseFitting.register("sezm_ener")
+@flax_module
+class SeZMEnergyFittingNet(SeZMEnergyFittingNetDP):
+    def __setattr__(self, name: str, value: Any) -> None:
+        value = setattr_for_general_fitting(name, value)
+        return super().__setattr__(name, value)
 
 
 @BaseFitting.register("property")

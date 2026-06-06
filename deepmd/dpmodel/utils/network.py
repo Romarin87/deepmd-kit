@@ -1133,6 +1133,184 @@ class FittingNet(EmbeddingNet):
         return obj
 
 
+class GLULayer(NativeOP):
+    """GLU block used by DPA4/SeZM fitting networks."""
+
+    def __init__(
+        self,
+        num_in: int,
+        num_out: int,
+        activation_function: str,
+        precision: str = DEFAULT_PRECISION,
+        seed: int | list[int] | None = None,
+        trainable: bool = True,
+        bias: bool = True,
+    ) -> None:
+        self.num_in = int(num_in)
+        self.num_out = int(num_out)
+        self.activation_function = (
+            activation_function if activation_function is not None else "none"
+        )
+        self.precision = precision
+        self.trainable = trainable
+        self.bias = bool(bias)
+        self.linear = NativeLayer(
+            self.num_in,
+            2 * self.num_out,
+            bias=self.bias,
+            use_timestep=False,
+            activation_function=None,
+            resnet=False,
+            precision=self.precision,
+            seed=seed,
+            trainable=self.trainable,
+        )
+
+    def dim_in(self) -> int:
+        return self.num_in
+
+    def dim_out(self) -> int:
+        return self.num_out
+
+    def call(self, x):  # noqa: ANN001, ANN201
+        yy = self.linear(x)
+        val = yy[..., : self.num_out]
+        gate = yy[..., self.num_out :]
+        return val * get_activation_fn(self.activation_function)(gate)
+
+    def serialize(self) -> dict:
+        return {
+            "@class": "GLULayer",
+            "@version": 1,
+            "num_in": self.num_in,
+            "num_out": self.num_out,
+            "activation_function": self.activation_function,
+            "precision": self.precision,
+            "trainable": self.trainable,
+            "bias": self.bias,
+            "linear": self.linear.serialize(),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "GLULayer":
+        data = data.copy()
+        check_version_compatibility(data.pop("@version", 1), 1, 1)
+        data.pop("@class", None)
+        linear = data.pop("linear")
+        obj = cls(**data)
+        obj.linear = NativeLayer.deserialize(linear)
+        return obj
+
+
+class GLUFittingNet(NativeOP):
+    """GLU fitting network used by DPA4/SeZM energy fitting."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        neuron: list[int] | None = None,
+        activation_function: str = "silu",
+        resnet_dt: bool = False,
+        precision: str = DEFAULT_PRECISION,
+        bias_out: bool = False,
+        seed: int | list[int] | None = None,
+        trainable: bool | list[bool] = True,
+        descriptor_dim: int | None = None,
+        dim_case_embd: int = 0,
+        case_film_embd: bool = False,
+    ) -> None:
+        if neuron is None:
+            neuron = []
+        if isinstance(trainable, list):
+            trainable = all(trainable)
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.neuron = [int(nn_dim) for nn_dim in neuron]
+        self.activation_function = activation_function
+        self.resnet_dt = bool(resnet_dt)
+        self.precision = precision
+        self.bias_out = bool(bias_out)
+        self.trainable = bool(trainable)
+        self.descriptor_dim = (
+            self.in_dim if descriptor_dim is None else int(descriptor_dim)
+        )
+        self.dim_case_embd = int(dim_case_embd)
+        self.case_film_embd = bool(case_film_embd and self.dim_case_embd > 0)
+        if self.case_film_embd:
+            raise NotImplementedError(
+                "case_film_embd is not implemented for dpmodel/JAX SeZM fitting"
+            )
+
+        hidden_layers = []
+        dim_in = self.in_dim
+        for layer_idx, hidden_dim in enumerate(self.neuron):
+            hidden_layers.append(
+                GLULayer(
+                    dim_in,
+                    hidden_dim,
+                    activation_function=self.activation_function,
+                    precision=self.precision,
+                    seed=child_seed(seed, layer_idx),
+                    trainable=self.trainable,
+                )
+            )
+            dim_in = hidden_dim
+        self.hidden_layers = hidden_layers
+        self.output_layer = NativeLayer(
+            dim_in,
+            self.out_dim,
+            bias=self.bias_out,
+            use_timestep=False,
+            activation_function=None,
+            resnet=False,
+            precision=self.precision,
+            seed=child_seed(seed, len(self.neuron)),
+            trainable=self.trainable,
+        )
+
+    def call(self, x):  # noqa: ANN001, ANN201
+        for layer in self.hidden_layers:
+            x = layer(x)
+        return self.output_layer(x)
+
+    def call_until_last(self, x):  # noqa: ANN001, ANN201
+        for layer in self.hidden_layers:
+            x = layer(x)
+        return x
+
+    def serialize(self) -> dict:
+        return {
+            "@class": "GLUFittingNet",
+            "@version": 1,
+            "in_dim": self.in_dim,
+            "out_dim": self.out_dim,
+            "neuron": self.neuron.copy(),
+            "activation_function": self.activation_function,
+            "resnet_dt": self.resnet_dt,
+            "precision": self.precision,
+            "bias_out": self.bias_out,
+            "trainable": self.trainable,
+            "descriptor_dim": self.descriptor_dim,
+            "dim_case_embd": self.dim_case_embd,
+            "case_film_embd": self.case_film_embd,
+            "hidden_layers": [layer.serialize() for layer in self.hidden_layers],
+            "output_layer": self.output_layer.serialize(),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "GLUFittingNet":
+        data = data.copy()
+        check_version_compatibility(data.pop("@version", 1), 1, 1)
+        data.pop("@class", None)
+        hidden_layers = data.pop("hidden_layers")
+        output_layer = data.pop("output_layer")
+        obj = cls(**data)
+        obj.hidden_layers = [GLULayer.deserialize(layer) for layer in hidden_layers]
+        obj.output_layer = NativeLayer.deserialize(output_layer)
+        return obj
+
+
 class NetworkCollection:
     """A collection of networks for multiple elements.
 
@@ -1156,6 +1334,7 @@ class NetworkCollection:
         "network": NativeNet,
         "embedding_network": EmbeddingNet,
         "fitting_network": FittingNet,
+        "sezm_fitting_network": GLUFittingNet,
     }
 
     def __init__(

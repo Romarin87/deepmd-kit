@@ -56,7 +56,10 @@ def get_standard_model(data: dict) -> BaseModel:
         mixed_types=descriptor.mixed_types(),
         **data["fitting_net"],
     )
-    model = BaseModel.get_class_by_type(fitting_type)(
+    model_type = (
+        "ener" if fitting_type in {"dpa4_ener", "sezm_ener"} else fitting_type
+    )
+    model = BaseModel.get_class_by_type(model_type)(
         descriptor=descriptor,
         fitting=fitting,
         type_map=data["type_map"],
