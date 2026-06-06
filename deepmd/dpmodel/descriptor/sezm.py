@@ -850,8 +850,8 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         self.default_chg_spin = (
             None if default_chg_spin is None else [float(x) for x in default_chg_spin]
         )
-        self.mean = np.zeros(0, dtype=PRECISION_DICT[self.precision.lower()])
-        self.stddev = np.ones(0, dtype=PRECISION_DICT[self.precision.lower()])
+        self.mean = np.zeros(1, dtype=PRECISION_DICT[self.precision.lower()])
+        self.stddev = np.ones(1, dtype=PRECISION_DICT[self.precision.lower()])
         self._validate_v1_path()
         self.type_embedding = SeZMTypeEmbedding(
             ntypes=self.ntypes,
