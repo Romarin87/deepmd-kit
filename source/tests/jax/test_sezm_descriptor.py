@@ -38,6 +38,9 @@ from deepmd.jax.descriptor.sezm_so3 import (
     FocusLinear,
     SO3Linear,
 )
+from deepmd.jax.descriptor.sezm_so2 import (
+    SO2Linear,
+)
 
 
 @unittest.skipIf(
@@ -297,6 +300,45 @@ class TestSeZMDescriptor(unittest.TestCase):
             np.asarray(restored(jnp.ones((1, 9, 2, 2), dtype=jnp.float32))[:, 0]),
             np.broadcast_to(expected_bias, (1, 2, 3)),
         )
+
+    def test_so2_linear_layout_and_block_coupling(self) -> None:
+        so2 = SO2Linear(
+            lmax=2,
+            mmax=1,
+            in_channels=1,
+            out_channels=1,
+            n_focus=1,
+            precision="float32",
+            mlp_bias=True,
+            seed=7,
+        )
+        self.assertEqual(so2.reduced_dim, 7)
+        so2.weight_m0 = jnp.eye(3, dtype=jnp.float32)
+        so2.bias0 = jnp.asarray([10.0], dtype=jnp.float32)
+        so2.weight_m = [
+            jnp.concatenate(
+                [
+                    jnp.eye(2, dtype=jnp.float32),
+                    2.0 * jnp.eye(2, dtype=jnp.float32),
+                ],
+                axis=1,
+            )
+        ]
+        x = jnp.asarray(
+            [[[[1.0], [2.0], [3.0], [4.0], [5.0], [6.0], [7.0]]]],
+            dtype=jnp.float32,
+        )
+        y = so2(x)
+        self.assertEqual(y.shape, (1, 1, 7, 1))
+        expected = np.asarray(
+            [[[[11.0], [2.0], [3.0], [-8.0], [-9.0], [14.0], [17.0]]]],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(np.asarray(y), expected, atol=1e-6)
+
+        restored = SO2Linear.deserialize(so2.serialize())
+        self.assertEqual(restored.reduced_dim, 7)
+        np.testing.assert_allclose(np.asarray(restored(x)), expected, atol=1e-6)
 
     def test_model_type_defaults_to_sezm_energy_fitting(self) -> None:
         model = get_model(
