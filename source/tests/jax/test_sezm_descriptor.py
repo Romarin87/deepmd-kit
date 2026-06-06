@@ -41,6 +41,9 @@ from deepmd.jax.descriptor.sezm_so3 import (
     FocusLinear,
     SO3Linear,
 )
+from deepmd.jax.descriptor.sezm_ffn import (
+    EquivariantFFN,
+)
 from deepmd.jax.descriptor.sezm_so2 import (
     DynamicRadialDegreeMixer,
     GatedActivation,
@@ -416,6 +419,34 @@ class TestSeZMDescriptor(unittest.TestCase):
         np.testing.assert_allclose(np.asarray(y), expected, atol=1e-6)
 
         restored = GatedActivation.deserialize(activation.serialize())
+        np.testing.assert_allclose(np.asarray(restored(x)), expected, atol=1e-6)
+
+    def test_equivariant_ffn_glu_minimal_path(self) -> None:
+        ffn = EquivariantFFN(
+            lmax=1,
+            channels=1,
+            hidden_channels=1,
+            activation_function="tanh",
+            glu_activation=True,
+            precision="float32",
+            seed=7,
+        )
+        ffn.so3_linear_1.weight = jnp.asarray(
+            [[[1.0, 0.0]], [[1.0, 0.0]]],
+            dtype=jnp.float32,
+        )
+        ffn.act.gate_linear.weight = jnp.zeros((1, 1), dtype=jnp.float32)
+        ffn.so3_linear_2.weight = jnp.ones((2, 1, 1), dtype=jnp.float32)
+        x = jnp.asarray(
+            [[[[1.0]], [[2.0]], [[3.0]], [[4.0]]]],
+            dtype=jnp.float32,
+        )
+        expected = np.asarray([[[[0.0]], [[1.0]], [[1.5]], [[2.0]]]], dtype=np.float32)
+        y = ffn(x)
+        self.assertEqual(y.shape, (1, 4, 1, 1))
+        np.testing.assert_allclose(np.asarray(y), expected, atol=1e-6)
+
+        restored = EquivariantFFN.deserialize(ffn.serialize())
         np.testing.assert_allclose(np.asarray(restored(x)), expected, atol=1e-6)
 
     def test_so2_convolution_minimal_message_path(self) -> None:
