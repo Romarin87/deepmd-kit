@@ -7,6 +7,7 @@ from typing import (
 
 from deepmd.dpmodel.descriptor.sezm_norm import (
     EquivariantRMSNorm as EquivariantRMSNormDP,
+    ScalarRMSNorm as ScalarRMSNormDP,
 )
 from deepmd.jax.common import (
     ArrayAPIVariable,
@@ -32,4 +33,17 @@ class EquivariantRMSNorm(EquivariantRMSNormDP):
             value = to_jax_array(value)
             if value is not None:
                 value = ArrayAPIVariable(value)
+        return super().__setattr__(name, value)
+
+
+@flax_module
+class ScalarRMSNorm(ScalarRMSNormDP):
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"adam_scale"}:
+            value = to_jax_array(value)
+            if value is not None:
+                if getattr(self, "trainable", True):
+                    value = ArrayAPIParam(value)
+                else:
+                    value = ArrayAPIVariable(value)
         return super().__setattr__(name, value)

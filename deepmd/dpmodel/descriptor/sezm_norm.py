@@ -133,3 +133,61 @@ class EquivariantRMSNorm(NativeOP):
         obj.expand_index = variables["expand_index"]
         obj.balance_weight = variables["balance_weight"]
         return obj
+
+
+class ScalarRMSNorm(NativeOP):
+    """Per-focus RMSNorm for scalar attention/gate branches."""
+
+    def __init__(
+        self,
+        *,
+        channels: int,
+        n_focus: int = 1,
+        eps: float = 1e-7,
+        precision: str = DEFAULT_PRECISION,
+        trainable: bool = True,
+    ) -> None:
+        self.channels = int(channels)
+        self.n_focus = int(n_focus)
+        self.eps = float(eps)
+        self.precision = precision
+        self.trainable = bool(trainable)
+        dtype = PRECISION_DICT[self.precision.lower()]
+        self.adam_scale = np.ones((self.n_focus, self.channels), dtype=dtype)
+
+    def call(self, x: Array) -> Array:
+        xp = array_api_compat.array_namespace(x, self.adam_scale)
+        inv_rms = 1.0 / xp.sqrt(xp.mean(x * x, axis=-1, keepdims=True) + self.eps)
+        x = x * inv_rms
+        if x.ndim == 2:
+            return x * self.adam_scale[0]
+        return x * xp.expand_dims(self.adam_scale[...], axis=0)
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "@class": "ScalarRMSNorm",
+            "@version": 1,
+            "config": {
+                "channels": self.channels,
+                "n_focus": self.n_focus,
+                "eps": self.eps,
+                "precision": self.precision,
+                "trainable": self.trainable,
+            },
+            "@variables": {
+                "adam_scale": to_numpy_array(self.adam_scale[...]),
+            },
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> "ScalarRMSNorm":
+        data = data.copy()
+        data_cls = data.pop("@class", None)
+        if data_cls != "ScalarRMSNorm":
+            raise ValueError(f"Invalid class for ScalarRMSNorm: {data_cls}")
+        check_version_compatibility(data.pop("@version", 1), 1, 1)
+        config = data.pop("config")
+        variables = data.pop("@variables")
+        obj = cls(**config)
+        obj.adam_scale = variables["adam_scale"]
+        return obj
