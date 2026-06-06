@@ -21,7 +21,6 @@ from deepmd.dpmodel import (
 from deepmd.dpmodel.array_api import (
     Array,
     xp_add_at,
-    xp_bincount,
 )
 from deepmd.dpmodel.common import (
     to_numpy_array,
@@ -1237,7 +1236,8 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         ) * valid_f
 
         edge_weight = xp.reshape(edge_env * edge_env, (-1,))
-        deg = xp_bincount(dst, weights=edge_weight, minlength=nf * nloc)
+        deg = xp.zeros((nf * nloc,), dtype=edge_weight.dtype)
+        deg = xp_add_at(deg, dst, edge_weight)
         inv_sqrt_deg = 1.0 / xp.sqrt(
             xp.reshape(deg + xp.asarray(0.25, dtype=deg.dtype), (nf * nloc, 1, 1))
         )
