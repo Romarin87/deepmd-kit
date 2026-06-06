@@ -9,6 +9,9 @@ from deepmd.jax.descriptor.base_descriptor import (
 )
 from deepmd.jax.descriptor.sezm import (
     DescrptSeZM,
+    WignerDCalculator,
+    build_edge_quaternion,
+    quaternion_to_rotation_matrix,
 )
 from deepmd.jax.env import (
     jnp,
@@ -18,6 +21,9 @@ from deepmd.jax.fitting.fitting import (
 )
 from deepmd.jax.model.model import (
     get_model,
+)
+from deepmd.dpmodel.descriptor.sezm_lebedev import (
+    load_lebedev_rule,
 )
 
 
@@ -117,6 +123,38 @@ class TestSeZMDescriptor(unittest.TestCase):
         self.assertEqual(cache.inv_sqrt_deg.shape, (2, 1, 1))
         self.assertTrue(bool(jnp.all(jnp.isfinite(cache.edge_rbf))))
         self.assertTrue(bool(jnp.all(jnp.isfinite(cache.inv_sqrt_deg))))
+
+    def test_edge_frame_wigner_l1_and_lebedev(self) -> None:
+        points, weights = load_lebedev_rule(3, float_precision="float32")
+        self.assertEqual(points.shape, (6, 3))
+        self.assertEqual(weights.shape, (6,))
+        np.testing.assert_allclose(np.sum(weights), 1.0, atol=1e-6)
+
+        edge_vec = jnp.asarray(
+            [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=jnp.float32,
+        )
+        edge_quat = build_edge_quaternion(edge_vec, eps=1e-7)
+        rot = quaternion_to_rotation_matrix(edge_quat)
+        edge_unit = edge_vec / jnp.sqrt(jnp.sum(edge_vec * edge_vec, axis=-1, keepdims=True))
+        aligned = jnp.einsum("nij,nj->ni", rot, edge_unit)
+        expected = jnp.asarray(
+            [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+            dtype=jnp.float32,
+        )
+        np.testing.assert_allclose(np.asarray(aligned), np.asarray(expected), atol=2e-6)
+
+        calc = WignerDCalculator(lmax=1, precision="float32")
+        D_full, Dt_full = calc(edge_quat)
+        self.assertEqual(D_full.shape, (2, 4, 4))
+        ident = jnp.matmul(D_full, Dt_full)
+        np.testing.assert_allclose(
+            np.asarray(ident),
+            np.asarray(jnp.broadcast_to(jnp.eye(4, dtype=jnp.float32), (2, 4, 4))),
+            atol=3e-6,
+        )
+        with self.assertRaisesRegex(NotImplementedError, "lmax<=1"):
+            WignerDCalculator(lmax=2, precision="float32")(edge_quat)
 
     def test_model_type_defaults_to_sezm_energy_fitting(self) -> None:
         model = get_model(
