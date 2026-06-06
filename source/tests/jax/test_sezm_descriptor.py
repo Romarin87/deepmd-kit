@@ -44,6 +44,12 @@ from deepmd.jax.descriptor.sezm_so3 import (
 from deepmd.jax.descriptor.sezm_ffn import (
     EquivariantFFN,
 )
+from deepmd.jax.descriptor.sezm_block import (
+    SeZMInteractionBlock,
+)
+from deepmd.jax.descriptor.sezm_norm import (
+    EquivariantRMSNorm,
+)
 from deepmd.jax.descriptor.sezm_so2 import (
     DynamicRadialDegreeMixer,
     GatedActivation,
@@ -448,6 +454,79 @@ class TestSeZMDescriptor(unittest.TestCase):
 
         restored = EquivariantFFN.deserialize(ffn.serialize())
         np.testing.assert_allclose(np.asarray(restored(x)), expected, atol=1e-6)
+
+    def test_equivariant_rms_norm_and_block_baseline(self) -> None:
+        norm = EquivariantRMSNorm(
+            lmax=1,
+            channels=1,
+            n_focus=1,
+            precision="float32",
+        )
+        x = jnp.asarray(
+            [
+                [[[1.0]], [[2.0]], [[3.0]], [[4.0]]],
+                [[[5.0]], [[6.0]], [[7.0]], [[8.0]]],
+            ],
+            dtype=jnp.float32,
+        )
+        y_norm = norm(x)
+        self.assertEqual(y_norm.shape, x.shape)
+        self.assertTrue(bool(jnp.all(jnp.isfinite(y_norm))))
+        restored_norm = EquivariantRMSNorm.deserialize(norm.serialize())
+        np.testing.assert_allclose(
+            np.asarray(restored_norm(x)),
+            np.asarray(y_norm),
+            atol=1e-6,
+        )
+
+        block = SeZMInteractionBlock(
+            lmax=1,
+            mmax=1,
+            channels=1,
+            n_focus=1,
+            so2_layers=1,
+            radial_so2_mode="none",
+            n_atten_head=0,
+            so2_post_norm=True,
+            ffn_pre_norm=True,
+            ffn_neurons=1,
+            ffn_blocks=1,
+            ffn_s2_activation=False,
+            precision="float32",
+            seed=7,
+        )
+        eye = jnp.eye(4, dtype=jnp.float32).reshape(1, 4, 4)
+        edge_cache = EdgeFeatureCache(
+            src=jnp.asarray([1], dtype=jnp.int64),
+            dst=jnp.asarray([0], dtype=jnp.int64),
+            edge_type_feat=jnp.zeros((1, 1), dtype=jnp.float32),
+            edge_vec=jnp.zeros((1, 3), dtype=jnp.float32),
+            edge_len=jnp.ones((1, 1), dtype=jnp.float32),
+            edge_rbf=jnp.ones((1, 1), dtype=jnp.float32),
+            edge_env=jnp.ones((1, 1), dtype=jnp.float32),
+            deg=jnp.ones((2,), dtype=jnp.float32),
+            inv_sqrt_deg=jnp.ones((2, 1, 1), dtype=jnp.float32),
+            D_full=eye,
+            Dt_full=eye,
+        )
+        radial_feat = jnp.ones((1, 2, 1), dtype=jnp.float32)
+        block_out, block_summary, so2_unit, ffn_units = block(
+            x,
+            edge_cache,
+            radial_feat,
+        )
+        self.assertIsNone(block_summary)
+        self.assertIsNone(so2_unit)
+        self.assertIsNone(ffn_units)
+        np.testing.assert_allclose(np.asarray(block_out), np.asarray(x), atol=1e-6)
+
+        restored_block = SeZMInteractionBlock.deserialize(block.serialize())
+        restored_out, _, _, _ = restored_block(x, edge_cache, radial_feat)
+        np.testing.assert_allclose(
+            np.asarray(restored_out),
+            np.asarray(x),
+            atol=1e-6,
+        )
 
     def test_so2_convolution_minimal_message_path(self) -> None:
         conv = SO2Convolution(
