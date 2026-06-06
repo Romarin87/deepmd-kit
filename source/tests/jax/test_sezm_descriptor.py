@@ -25,6 +25,19 @@ from deepmd.jax.model.model import (
 from deepmd.dpmodel.descriptor.sezm_lebedev import (
     load_lebedev_rule,
 )
+from deepmd.dpmodel.descriptor.sezm_indexing import (
+    build_l_major_index,
+    build_m_major_index,
+    build_m_major_l_index,
+    build_rotate_inv_rescale,
+    get_so3_dim_of_lmax,
+    map_degree_idx,
+)
+from deepmd.jax.descriptor.sezm_so3 import (
+    ChannelLinear,
+    FocusLinear,
+    SO3Linear,
+)
 
 
 @unittest.skipIf(
@@ -193,6 +206,97 @@ class TestSeZMDescriptor(unittest.TestCase):
         )
         self.assertEqual(cache.D_full.shape, (2, 16, 16))
         self.assertEqual(cache.Dt_full.shape, (2, 16, 16))
+
+    def test_so3_indexing_and_linear_layers(self) -> None:
+        self.assertEqual(get_so3_dim_of_lmax(3), 16)
+        np.testing.assert_array_equal(
+            map_degree_idx(3),
+            np.asarray([0, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3]),
+        )
+        np.testing.assert_array_equal(
+            build_l_major_index(3, 1),
+            np.asarray([0, 1, 2, 3, 5, 6, 7, 11, 12, 13]),
+        )
+        m_major = build_m_major_index(3, 1)
+        np.testing.assert_array_equal(
+            m_major,
+            np.asarray([0, 2, 6, 12, 1, 5, 11, 3, 7, 13]),
+        )
+        degree_m = build_m_major_l_index(3, 1)
+        np.testing.assert_array_equal(
+            degree_m,
+            np.asarray([0, 1, 2, 3, 1, 2, 3, 1, 2, 3]),
+        )
+        rescale = build_rotate_inv_rescale(
+            3,
+            1,
+            jnp.asarray(degree_m, dtype=jnp.int64),
+            dtype=jnp.float32,
+        )
+        expected_rescale = np.asarray(
+            [
+                1.0,
+                1.0,
+                np.sqrt(5.0 / 3.0),
+                np.sqrt(7.0 / 3.0),
+                1.0,
+                np.sqrt(5.0 / 3.0),
+                np.sqrt(7.0 / 3.0),
+                1.0,
+                np.sqrt(5.0 / 3.0),
+                np.sqrt(7.0 / 3.0),
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(np.asarray(rescale), expected_rescale, atol=1e-6)
+
+        chan = ChannelLinear(
+            in_channels=2,
+            out_channels=3,
+            precision="float32",
+            seed=7,
+        )
+        chan_out = chan(jnp.ones((4, 2), dtype=jnp.float32))
+        self.assertEqual(chan_out.shape, (4, 3))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(chan_out))))
+
+        focus = FocusLinear(
+            in_channels=2,
+            out_channels=3,
+            n_focus=2,
+            precision="float32",
+            seed=7,
+        )
+        focus_out = focus(jnp.ones((4, 2, 2), dtype=jnp.float32))
+        self.assertEqual(focus_out.shape, (4, 2, 3))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(focus_out))))
+
+        so3 = SO3Linear(
+            lmax=2,
+            in_channels=2,
+            out_channels=3,
+            n_focus=2,
+            precision="float32",
+            mlp_bias=True,
+            seed=7,
+        )
+        so3.weight = jnp.zeros_like(so3.weight[...])
+        so3.bias = jnp.arange(6, dtype=jnp.float32)
+        so3_out = so3(jnp.ones((4, 9, 2, 2), dtype=jnp.float32))
+        self.assertEqual(so3_out.shape, (4, 9, 2, 3))
+        expected_bias = np.arange(6, dtype=np.float32).reshape(2, 3)
+        np.testing.assert_allclose(
+            np.asarray(so3_out[:, 0, :, :]),
+            np.broadcast_to(expected_bias, (4, 2, 3)),
+        )
+        np.testing.assert_allclose(np.asarray(so3_out[:, 1:, :, :]), 0.0)
+
+        restored = SO3Linear.deserialize(so3.serialize())
+        self.assertEqual(restored.expand_index.shape, (9,))
+        np.testing.assert_allclose(
+            np.asarray(restored(jnp.ones((1, 9, 2, 2), dtype=jnp.float32))[:, 0]),
+            np.broadcast_to(expected_bias, (1, 2, 3)),
+        )
 
     def test_model_type_defaults_to_sezm_energy_fitting(self) -> None:
         model = get_model(
