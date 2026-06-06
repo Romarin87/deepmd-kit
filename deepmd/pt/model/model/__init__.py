@@ -369,6 +369,8 @@ def get_sezm_model(model_params: dict) -> BaseModel:
         bridging_r_inner=bridging_r_inner,
         bridging_r_outer=bridging_r_outer,
     )
+    if model_params.get("hessian_mode"):
+        model.enable_hessian()
     model.model_def_script = json.dumps(model_params_old)
     return model
 
