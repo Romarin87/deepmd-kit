@@ -46,6 +46,10 @@ from deepmd.utils.version import (
 from .base_descriptor import (
     BaseDescriptor,
 )
+from .sezm_wignerd import (
+    WignerDCalculator,
+    build_edge_quaternion,
+)
 
 
 SUPPORTED_RADIAL_SO2_MODE = "degree_channel"
@@ -63,6 +67,8 @@ class EdgeFeatureCache(NamedTuple):
     edge_env: Array
     deg: Array
     inv_sqrt_deg: Array
+    D_full: Array | None
+    Dt_full: Array | None
 
 
 class SeZMTypeEmbedding(NativeOP):
@@ -563,6 +569,11 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             trainable=self.trainable,
             seed=child_seed(self.seed, 3),
         )
+        self.wigner_calc = WignerDCalculator(
+            lmax=self.l_schedule[0],
+            eps=self.eps,
+            precision=self.precision,
+        )
 
     def _validate_v1_path(self) -> None:
         if self.lmax != SUPPORTED_LMAX or any(x != SUPPORTED_LMAX for x in self.l_schedule):
@@ -695,6 +706,7 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         atype_ext: Array,
         nlist: Array,
         mapping: Array | None = None,
+        include_wigner: bool = False,
     ) -> EdgeFeatureCache:
         coord = self._reshape_coord(coord_ext)
         xp = array_api_compat.array_namespace(coord, atype_ext, nlist)
@@ -741,6 +753,10 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         inv_sqrt_deg = 1.0 / xp.sqrt(
             xp.reshape(deg + xp.asarray(0.25, dtype=deg.dtype), (nf * nloc, 1, 1))
         )
+        D_full: Array | None = None
+        Dt_full: Array | None = None
+        if include_wigner:
+            D_full, Dt_full = self._build_edge_wigner(edge_vec, edge_len)
         return EdgeFeatureCache(
             src=src,
             dst=dst,
@@ -751,7 +767,21 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             edge_env=edge_env,
             deg=deg,
             inv_sqrt_deg=inv_sqrt_deg,
+            D_full=D_full,
+            Dt_full=Dt_full,
         )
+
+    def _build_edge_wigner(self, edge_vec: Array, edge_len: Array) -> tuple[Array, Array]:
+        if self.random_gamma:
+            raise NotImplementedError(
+                "JAX SeZM random_gamma needs a PRNG key and is not wired yet."
+            )
+        edge_quat = build_edge_quaternion(
+            edge_vec,
+            edge_len=edge_len,
+            eps=self.eps,
+        )
+        return self.wigner_calc(edge_quat)
 
     def call(
         self,
@@ -831,6 +861,7 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
                 "radial_basis": self.radial_basis.serialize(),
                 "edge_envelope": self.edge_envelope.serialize(),
                 "radial_embedding": self.radial_embedding.serialize(),
+                "wigner_calc": self.wigner_calc.serialize(),
             },
         }
 
@@ -859,4 +890,6 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             obj.edge_envelope = C3CutoffEnvelope.deserialize(variables["edge_envelope"])
         if "radial_embedding" in variables:
             obj.radial_embedding = RadialMLP.deserialize(variables["radial_embedding"])
+        if "wigner_calc" in variables:
+            obj.wigner_calc = WignerDCalculator.deserialize(variables["wigner_calc"])
         return obj

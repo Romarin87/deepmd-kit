@@ -15,6 +15,14 @@ from deepmd.dpmodel.descriptor.sezm import (
     RMSNorm as RMSNormDP,
     SeZMTypeEmbedding as SeZMTypeEmbeddingDP,
 )
+from deepmd.dpmodel.descriptor.sezm_wignerd import (
+    WignerDCalculator as WignerDCalculatorDP,
+    build_edge_quaternion,
+    quaternion_multiply,
+    quaternion_normalize,
+    quaternion_to_rotation_matrix,
+    quaternion_z_rotation,
+)
 from deepmd.jax.common import (
     ArrayAPIVariable,
     flax_module,
@@ -107,6 +115,16 @@ class RadialMLP(RadialMLPDP):
         return super().__setattr__(name, value)
 
 
+@flax_module
+class WignerDCalculator(WignerDCalculatorDP):
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"l1_perm", "l1_sign_outer"}:
+            value = to_jax_array(value)
+            if value is not None:
+                value = ArrayAPIVariable(value)
+        return super().__setattr__(name, value)
+
+
 @BaseDescriptor.register("SeZM")
 @BaseDescriptor.register("sezm")
 @BaseDescriptor.register("DPA4")
@@ -132,4 +150,7 @@ class DescrptSeZM(DescrptSeZMDP):
         elif name in {"radial_embedding"}:
             if not isinstance(value, RadialMLP):
                 value = RadialMLP.deserialize(value.serialize())
+        elif name in {"wigner_calc"}:
+            if not isinstance(value, WignerDCalculator):
+                value = WignerDCalculator.deserialize(value.serialize())
         return super().__setattr__(name, value)
