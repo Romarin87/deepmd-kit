@@ -11,6 +11,7 @@ from packaging.version import (
 
 from deepmd.dpmodel.descriptor.sezm_so2 import (
     DynamicRadialDegreeMixer as DynamicRadialDegreeMixerDP,
+    SO2Convolution as SO2ConvolutionDP,
     SO2Linear as SO2LinearDP,
 )
 from deepmd.jax.common import (
@@ -21,6 +22,10 @@ from deepmd.jax.common import (
 from deepmd.jax.env import (
     flax_version,
     nnx,
+)
+from deepmd.jax.descriptor.sezm_so3 import (
+    ChannelLinear,
+    SO3Linear,
 )
 from deepmd.jax.utils.network import (
     ArrayAPIParam,
@@ -66,4 +71,45 @@ class DynamicRadialDegreeMixer(DynamicRadialDegreeMixerDP):
             value = to_jax_array(value)
             if value is not None:
                 value = ArrayAPIVariable(value)
+        return super().__setattr__(name, value)
+
+
+@flax_module
+class SO2Convolution(SO2ConvolutionDP):
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {
+            "coeff_index_m",
+            "degree_index_m",
+            "degree_index_full",
+            "rotate_inv_rescale_full",
+        }:
+            value = to_jax_array(value)
+            if value is not None:
+                value = ArrayAPIVariable(value)
+        elif name in {"so2_linears"}:
+            value = [
+                item
+                if isinstance(item, SO2Linear)
+                else SO2Linear.deserialize(item.serialize())
+                for item in value
+            ]
+            value = _maybe_nnx_list(value)
+        elif name in {"radial_hidden_proj"} and value is not None:
+            value = (
+                value
+                if isinstance(value, ChannelLinear)
+                else ChannelLinear.deserialize(value.serialize())
+            )
+        elif name in {"radial_degree_mixer"} and value is not None:
+            value = (
+                value
+                if isinstance(value, DynamicRadialDegreeMixer)
+                else DynamicRadialDegreeMixer.deserialize(value.serialize())
+            )
+        elif name in {"pre_focus_mix", "post_focus_mix"}:
+            value = (
+                value
+                if isinstance(value, SO3Linear)
+                else SO3Linear.deserialize(value.serialize())
+            )
         return super().__setattr__(name, value)

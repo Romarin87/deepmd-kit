@@ -25,6 +25,9 @@ from deepmd.jax.model.model import (
 from deepmd.dpmodel.descriptor.sezm_lebedev import (
     load_lebedev_rule,
 )
+from deepmd.dpmodel.descriptor.sezm import (
+    EdgeFeatureCache,
+)
 from deepmd.dpmodel.descriptor.sezm_indexing import (
     build_l_major_index,
     build_m_major_index,
@@ -40,6 +43,7 @@ from deepmd.jax.descriptor.sezm_so3 import (
 )
 from deepmd.jax.descriptor.sezm_so2 import (
     DynamicRadialDegreeMixer,
+    SO2Convolution,
     SO2Linear,
 )
 
@@ -386,6 +390,54 @@ class TestSeZMDescriptor(unittest.TestCase):
             np.asarray(rank_mixer(x_rank, radial_rank)),
             np.asarray(expected_rank),
         )
+
+    def test_so2_convolution_minimal_message_path(self) -> None:
+        conv = SO2Convolution(
+            lmax=1,
+            mmax=1,
+            channels=1,
+            n_focus=1,
+            so2_layers=1,
+            n_atten_head=0,
+            radial_so2_mode="none",
+            precision="float32",
+            seed=7,
+        )
+        conv.pre_focus_mix.weight = jnp.ones((2, 1, 1), dtype=jnp.float32)
+        conv.post_focus_mix.weight = jnp.ones((2, 1, 1), dtype=jnp.float32)
+        conv.so2_linears[0].weight_m0 = jnp.zeros((2, 2), dtype=jnp.float32)
+        conv.so2_linears[0].weight_m = [jnp.zeros((1, 2), dtype=jnp.float32)]
+
+        eye = jnp.eye(4, dtype=jnp.float32).reshape(1, 4, 4)
+        edge_cache = EdgeFeatureCache(
+            src=jnp.asarray([1], dtype=jnp.int64),
+            dst=jnp.asarray([0], dtype=jnp.int64),
+            edge_type_feat=jnp.zeros((1, 1), dtype=jnp.float32),
+            edge_vec=jnp.zeros((1, 3), dtype=jnp.float32),
+            edge_len=jnp.ones((1, 1), dtype=jnp.float32),
+            edge_rbf=jnp.ones((1, 1), dtype=jnp.float32),
+            edge_env=jnp.ones((1, 1), dtype=jnp.float32),
+            deg=jnp.ones((2,), dtype=jnp.float32),
+            inv_sqrt_deg=jnp.ones((2, 1, 1), dtype=jnp.float32),
+            D_full=eye,
+            Dt_full=eye,
+        )
+        x = jnp.asarray(
+            [
+                [[0.0], [0.0], [0.0], [0.0]],
+                [[1.0], [2.0], [3.0], [4.0]],
+            ],
+            dtype=jnp.float32,
+        )
+        radial_feat = jnp.ones((1, 2, 1), dtype=jnp.float32)
+        y = conv(x, edge_cache, radial_feat)
+        self.assertEqual(y.shape, (2, 4, 1))
+        np.testing.assert_allclose(np.asarray(y[0]), np.asarray(x[1]), atol=1e-6)
+        np.testing.assert_allclose(np.asarray(y[1]), 0.0, atol=1e-6)
+
+        restored = SO2Convolution.deserialize(conv.serialize())
+        y_restored = restored(x, edge_cache, radial_feat)
+        np.testing.assert_allclose(np.asarray(y_restored), np.asarray(y), atol=1e-6)
 
     def test_model_type_defaults_to_sezm_energy_fitting(self) -> None:
         model = get_model(
