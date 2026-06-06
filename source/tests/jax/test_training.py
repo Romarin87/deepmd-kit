@@ -191,6 +191,54 @@ class TestJAXTraining(unittest.TestCase):
         self.assertTrue(trainer.model_def_script["hessian_mode"])
         self.assertIn("hessian", requirement_keys)
 
+    def test_wsd_learning_rate_is_supported(self) -> None:
+        """JAX trainer accepts the shared WSD learning rate schedule."""
+        config = copy.deepcopy(self.config)
+        config["training"]["numb_steps"] = 10
+        config["learning_rate"] = {
+            "type": "wsd",
+            "start_lr": 1.0,
+            "stop_lr": 0.1,
+            "decay_phase_ratio": 0.2,
+            "decay_type": "linear",
+        }
+        jdata = update_deepmd_input(config, warning=False)
+        jdata = normalize(jdata)
+
+        trainer = DPTrainer(jdata)
+
+        self.assertEqual(trainer.lr.__class__.__name__, "LearningRateWSD")
+        self.assertAlmostEqual(trainer.lr.value(0), 1.0)
+        self.assertAlmostEqual(trainer.lr.value(8), 1.0)
+        self.assertAlmostEqual(trainer.lr.value(9), 0.55)
+        self.assertAlmostEqual(trainer.lr.value(10), 0.1)
+
+    def test_num_epoch_resolves_training_steps(self) -> None:
+        """JAX trainer resolves epoch-based input after data is available."""
+        config = copy.deepcopy(self.config)
+        config["training"].pop("numb_steps")
+        config["training"]["numb_epoch"] = 1.5
+        config["learning_rate"] = {
+            "type": "wsd",
+            "start_lr": 1.0,
+            "stop_lr": 0.1,
+            "decay_phase_ratio": 0.2,
+            "decay_type": "linear",
+        }
+        jdata = update_deepmd_input(config, warning=False)
+        jdata = normalize(jdata)
+
+        trainer = DPTrainer(jdata)
+
+        class DummyTrainData:
+            nbatches = [3, 7]
+            sys_probs = [0.5, 0.5]
+
+        self.assertIsNone(trainer.lr)
+        trainer._resolve_num_steps(DummyTrainData())
+        self.assertEqual(trainer.num_steps, 21)
+        self.assertEqual(trainer.lr.__class__.__name__, "LearningRateWSD")
+
     def test_model_factory_restores_hessian_mode(self) -> None:
         """Checkpoint model definitions keep Hessian output mode."""
         model_params = copy.deepcopy(MODEL_SE_E2_A)
