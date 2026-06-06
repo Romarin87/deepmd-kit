@@ -3,6 +3,7 @@ from typing import (
     Any,
 )
 
+import numpy as np
 from packaging.version import (
     Version,
 )
@@ -44,6 +45,16 @@ from deepmd.jax.utils.network import (
 def _maybe_nnx_list(value: list[Any]) -> Any:
     if Version(flax_version) >= Version("0.12.0"):
         return nnx.List(value)
+    return value
+
+
+def _freeze_static_arrays(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return _freeze_static_arrays(value.tolist())
+    if isinstance(value, tuple) and hasattr(value, "_fields"):
+        return type(value)(*(_freeze_static_arrays(item) for item in value))
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_static_arrays(item) for item in value)
     return value
 
 
@@ -122,6 +133,8 @@ class WignerDCalculator(WignerDCalculatorDP):
             value = to_jax_array(value)
             if value is not None:
                 value = ArrayAPIVariable(value)
+        elif name in {"poly_coeffs", "poly_basis"}:
+            value = _freeze_static_arrays(value)
         return super().__setattr__(name, value)
 
 

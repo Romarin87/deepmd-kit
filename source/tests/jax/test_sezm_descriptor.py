@@ -144,17 +144,55 @@ class TestSeZMDescriptor(unittest.TestCase):
         )
         np.testing.assert_allclose(np.asarray(aligned), np.asarray(expected), atol=2e-6)
 
-        calc = WignerDCalculator(lmax=1, precision="float32")
+        calc = WignerDCalculator(lmax=3, precision="float32")
         D_full, Dt_full = calc(edge_quat)
-        self.assertEqual(D_full.shape, (2, 4, 4))
+        self.assertEqual(D_full.shape, (2, 16, 16))
         ident = jnp.matmul(D_full, Dt_full)
         np.testing.assert_allclose(
             np.asarray(ident),
-            np.asarray(jnp.broadcast_to(jnp.eye(4, dtype=jnp.float32), (2, 4, 4))),
-            atol=3e-6,
+            np.asarray(jnp.broadcast_to(jnp.eye(16, dtype=jnp.float32), (2, 16, 16))),
+            atol=1e-3,
         )
-        with self.assertRaisesRegex(NotImplementedError, "lmax<=1"):
-            WignerDCalculator(lmax=2, precision="float32")(edge_quat)
+
+        edge_quat64 = build_edge_quaternion(edge_vec.astype(jnp.float64), eps=1e-7)
+        D64, Dt64 = WignerDCalculator(lmax=3, precision="float64")(edge_quat64)
+        ident64 = jnp.matmul(D64, Dt64)
+        np.testing.assert_allclose(
+            np.asarray(ident64),
+            np.asarray(jnp.broadcast_to(jnp.eye(16, dtype=jnp.float64), (2, 16, 16))),
+            atol=1e-10,
+        )
+
+        descriptor = DescrptSeZM(
+            ntypes=2,
+            sel=2,
+            rcut=6.0,
+            channels=8,
+            n_radial=4,
+            radial_mlp=[0],
+            random_gamma=False,
+            lmax=3,
+            n_blocks=2,
+            so2_layers=3,
+            precision="float32",
+            seed=42,
+        )
+        coord_ext = jnp.asarray(
+            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]],
+            dtype=jnp.float32,
+        )
+        atype_ext = jnp.asarray([[0, 1]], dtype=jnp.int64)
+        nlist = jnp.asarray([[[1, -1], [0, -1]]], dtype=jnp.int64)
+        mapping = jnp.asarray([[0, 1]], dtype=jnp.int64)
+        cache = descriptor._build_edge_cache(
+            coord_ext,
+            atype_ext,
+            nlist,
+            mapping,
+            include_wigner=True,
+        )
+        self.assertEqual(cache.D_full.shape, (2, 16, 16))
+        self.assertEqual(cache.Dt_full.shape, (2, 16, 16))
 
     def test_model_type_defaults_to_sezm_energy_fitting(self) -> None:
         model = get_model(
