@@ -1572,7 +1572,7 @@ class Trainer:
                             for item in _more_loss
                             if "l2_" not in item
                         }
-                        for item in sorted(rmse_val.keys()):
+                        for item in rmse_val:
                             results[item] = rmse_val[item]
                         return results
 
@@ -2254,7 +2254,7 @@ class Trainer:
     def print_header(
         self, fout: Any, train_results: dict[str, Any], valid_results: dict[str, Any]
     ) -> None:
-        train_keys = sorted(train_results.keys())
+        train_keys = list(train_results.keys())
         print_str = ""
         print_str += "# {:5s}".format("step")
         if not self.multi_task:
@@ -2270,17 +2270,17 @@ class Trainer:
             for model_key in self.model_keys:
                 if valid_results[model_key]:
                     prop_fmt = "   %11s %11s"
-                    for k in sorted(train_results[model_key].keys()):
+                    for k in train_results[model_key]:
                         print_str += prop_fmt % (
                             k + f"_val_{model_key}",
                             k + f"_trn_{model_key}",
                         )
                 else:
                     prop_fmt = "   %11s"
-                    for k in sorted(train_results[model_key].keys()):
+                    for k in train_results[model_key]:
                         print_str += prop_fmt % (k + f"_trn_{model_key}")
         print_str += "   {:8s}\n".format("lr")
-        print_str += "# If there is no available reference data, rmse_*_{val,trn} will print nan\n"
+        print_str += "# If there is no available reference data, metric_*_{val,trn} will print nan\n"
         fout.write(print_str)
         fout.flush()
 
@@ -2292,7 +2292,7 @@ class Trainer:
         train_results: dict,
         valid_results: dict,
     ) -> None:
-        train_keys = sorted(train_results.keys())
+        train_keys = list(train_results.keys())
         print_str = ""
         print_str += f"{step_id:7d}"
         if not self.multi_task:
@@ -2308,14 +2308,14 @@ class Trainer:
             for model_key in self.model_keys:
                 if valid_results[model_key]:
                     prop_fmt = "   %11.2e %11.2e"
-                    for k in sorted(valid_results[model_key].keys()):
+                    for k in valid_results[model_key]:
                         print_str += prop_fmt % (
                             valid_results[model_key][k],
                             train_results[model_key][k],
                         )
                 else:
                     prop_fmt = "   %11.2e"
-                    for k in sorted(train_results[model_key].keys()):
+                    for k in train_results[model_key]:
                         print_str += prop_fmt % (train_results[model_key][k])
         print_str += f"   {cur_lr:8.1e}\n"
         fout.write(print_str)
