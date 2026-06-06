@@ -38,6 +38,9 @@ from .sezm_so3 import (
     SO3Linear,
     _trunc_normal,
 )
+from .sezm_norm import (
+    ScalarRMSNorm,
+)
 from .sezm_indexing import (
     build_m_major_index,
     build_m_major_l_index,
@@ -760,9 +763,26 @@ class SO2Convolution(NativeOP):
         self.so2_attn_res = str(so2_attn_res).lower()
         self.layer_scale = bool(layer_scale)
         self.n_atten_head = int(n_atten_head)
+        if self.n_atten_head < 0:
+            raise ValueError("`n_atten_head` must be non-negative")
         self.atten_f_mix = bool(atten_f_mix)
         self.atten_v_proj = bool(atten_v_proj)
         self.atten_o_proj = bool(atten_o_proj)
+        self.attn_n_focus = (
+            1 if self.atten_f_mix and self.n_atten_head > 0 else self.n_focus
+        )
+        self.attn_focus_dim = (
+            self.hidden_channels
+            if self.atten_f_mix and self.n_atten_head > 0
+            else self.so2_focus_dim
+        )
+        if self.n_atten_head > 0 and self.attn_focus_dim % self.n_atten_head != 0:
+            raise ValueError("`n_atten_head` must divide the attention width")
+        self.head_dim = (
+            None
+            if self.n_atten_head == 0
+            else int(self.attn_focus_dim // self.n_atten_head)
+        )
         self.s2_activation = bool(s2_activation)
         self.lebedev_quadrature = bool(lebedev_quadrature)
         self.activation_function = str(activation_function)
@@ -796,6 +816,7 @@ class SO2Convolution(NativeOP):
         seed_so2_stack = child_seed(seed, 0)
         seed_so3_pre = child_seed(seed, 2)
         seed_so3_post = child_seed(seed, 3)
+        seed_gate = child_seed(seed, 4)
         seed_radial_hidden = child_seed(seed, 6)
         seed_radial_degree = child_seed(seed, 7)
 
@@ -854,6 +875,62 @@ class SO2Convolution(NativeOP):
             if self.radial_so2_mode != "none"
             else None
         )
+        if self.n_atten_head > 0:
+            self.attn_qk_norm = ScalarRMSNorm(
+                channels=self.attn_focus_dim,
+                n_focus=self.attn_n_focus,
+                eps=self.eps,
+                precision=self.precision,
+                trainable=self.trainable,
+            )
+            self.attn_q_proj = FocusLinear(
+                in_channels=self.attn_focus_dim,
+                out_channels=self.attn_focus_dim,
+                n_focus=self.attn_n_focus,
+                precision=self.precision,
+                bias=False,
+                trainable=self.trainable,
+                seed=child_seed(seed_gate, 0),
+            )
+            self.attn_k_proj = FocusLinear(
+                in_channels=self.attn_focus_dim,
+                out_channels=self.attn_focus_dim,
+                n_focus=self.attn_n_focus,
+                precision=self.precision,
+                bias=False,
+                trainable=self.trainable,
+                seed=child_seed(seed_gate, 1),
+            )
+            self.attn_logit_w = np.random.default_rng(child_seed(seed_gate, 2)).normal(
+                0.0,
+                0.01,
+                (self.attn_focus_dim, self.attn_n_focus, self.n_atten_head),
+            ).astype(dtype)
+            self.attn_z_bias_raw = np.full(
+                (self.attn_n_focus, self.n_atten_head),
+                0.5413,
+                dtype=dtype,
+            )
+            self.attn_output_gate_norm = ScalarRMSNorm(
+                channels=self.attn_focus_dim,
+                n_focus=self.attn_n_focus,
+                eps=self.eps,
+                precision=self.precision,
+                trainable=self.trainable,
+            )
+            self.attn_gate_w = np.random.default_rng(child_seed(seed_gate, 3)).normal(
+                0.0,
+                0.01,
+                (self.attn_focus_dim, self.attn_n_focus, self.n_atten_head),
+            ).astype(dtype)
+        else:
+            self.attn_qk_norm = None
+            self.attn_q_proj = None
+            self.attn_k_proj = None
+            self.attn_output_gate_norm = None
+            self.attn_logit_w = None
+            self.attn_z_bias_raw = None
+            self.attn_gate_w = None
         self.pre_focus_mix = SO3Linear(
             lmax=self.lmax,
             in_channels=self.channels,
@@ -882,7 +959,6 @@ class SO2Convolution(NativeOP):
             "so2_norm": self.so2_norm,
             "so2_attn_res": self.so2_attn_res != "none",
             "layer_scale": self.layer_scale,
-            "n_atten_head": self.n_atten_head != 0,
             "atten_f_mix": self.atten_f_mix,
             "atten_v_proj": self.atten_v_proj,
             "atten_o_proj": self.atten_o_proj,
@@ -969,14 +1045,102 @@ class SO2Convolution(NativeOP):
             self.rotate_inv_rescale_full[...],
             (1, self.ebed_dim_full, 1),
         )
-        x_message = x_message * xp.expand_dims(edge_cache.edge_env, axis=-1)
-
-        out = xp.zeros(
-            (n_node, self.ebed_dim_full, self.hidden_channels),
-            dtype=x_message.dtype,
-        )
-        out = _scatter_add_first_axis(out, dst, x_message)
-        out = out * edge_cache.inv_sqrt_deg
+        if self.n_atten_head == 0:
+            x_message = x_message * xp.expand_dims(edge_cache.edge_env, axis=-1)
+            out = xp.zeros(
+                (n_node, self.ebed_dim_full, self.hidden_channels),
+                dtype=x_message.dtype,
+            )
+            out = _scatter_add_first_axis(out, dst, x_message)
+            out = out * edge_cache.inv_sqrt_deg
+        else:
+            head_dim = int(self.head_dim)
+            x_l0_node = xp.reshape(
+                x_wide[:, 0, :],
+                (n_node, self.attn_n_focus, self.attn_focus_dim),
+            )
+            qk_input = self.attn_qk_norm(x_l0_node)
+            q_node = self.attn_q_proj(qk_input)
+            k_node = self.attn_k_proj(qk_input)
+            q_edge = xp.reshape(
+                xp.take(q_node, dst, axis=0),
+                (
+                    n_edge,
+                    self.attn_n_focus,
+                    self.n_atten_head,
+                    head_dim,
+                ),
+            )
+            k_edge = xp.reshape(
+                xp.take(k_node, src, axis=0),
+                (
+                    n_edge,
+                    self.attn_n_focus,
+                    self.n_atten_head,
+                    head_dim,
+                ),
+            )
+            radial_l0 = xp.reshape(
+                rad_feat[:, 0, :],
+                (n_edge, self.attn_n_focus, self.attn_focus_dim),
+            )
+            radial_bias = xp.einsum(
+                "efi,ifo->efo",
+                radial_l0,
+                self.attn_logit_w[...],
+            )
+            attn_logits = xp.sum(q_edge * k_edge, axis=-1) * (
+                float(head_dim) ** -0.5
+            )
+            attn_logits = attn_logits + radial_bias
+            attn_alpha = _segment_envelope_gated_softmax(
+                attn_logits,
+                edge_cache.edge_env,
+                dst,
+                n_node,
+                self.attn_z_bias_raw[...],
+                self.eps,
+            )
+            value_heads = xp.reshape(
+                x_message,
+                (
+                    n_edge,
+                    self.ebed_dim_full,
+                    self.attn_n_focus,
+                    self.n_atten_head,
+                    head_dim,
+                ),
+            )
+            weighted_value = value_heads * xp.reshape(
+                attn_alpha,
+                (n_edge, 1, self.attn_n_focus, self.n_atten_head, 1),
+            )
+            out_heads = xp.zeros(
+                (
+                    n_node,
+                    self.ebed_dim_full,
+                    self.attn_n_focus,
+                    self.n_atten_head,
+                    head_dim,
+                ),
+                dtype=weighted_value.dtype,
+            )
+            out_heads = _scatter_add_first_axis(out_heads, dst, weighted_value)
+            attn_output_gate = xp_sigmoid(
+                xp.einsum(
+                    "nfi,ifo->nfo",
+                    self.attn_output_gate_norm(x_l0_node),
+                    self.attn_gate_w[...],
+                )
+            )
+            out_heads = out_heads * xp.reshape(
+                attn_output_gate,
+                (n_node, 1, self.attn_n_focus, self.n_atten_head, 1),
+            )
+            out = xp.reshape(
+                out_heads,
+                (n_node, self.ebed_dim_full, self.hidden_channels),
+            )
         out = self.post_focus_mix(xp.expand_dims(out, axis=2))
         return xp.squeeze(out, axis=2)
 
@@ -1032,6 +1196,37 @@ class SO2Convolution(NativeOP):
                     if self.radial_degree_mixer is None
                     else self.radial_degree_mixer.serialize()
                 ),
+                "attn_qk_norm": (
+                    None
+                    if self.attn_qk_norm is None
+                    else self.attn_qk_norm.serialize()
+                ),
+                "attn_q_proj": (
+                    None
+                    if self.attn_q_proj is None
+                    else self.attn_q_proj.serialize()
+                ),
+                "attn_k_proj": (
+                    None
+                    if self.attn_k_proj is None
+                    else self.attn_k_proj.serialize()
+                ),
+                "attn_output_gate_norm": (
+                    None
+                    if self.attn_output_gate_norm is None
+                    else self.attn_output_gate_norm.serialize()
+                ),
+                "attn_logit_w": to_numpy_array(
+                    None if self.attn_logit_w is None else self.attn_logit_w[...]
+                ),
+                "attn_z_bias_raw": to_numpy_array(
+                    None
+                    if self.attn_z_bias_raw is None
+                    else self.attn_z_bias_raw[...]
+                ),
+                "attn_gate_w": to_numpy_array(
+                    None if self.attn_gate_w is None else self.attn_gate_w[...]
+                ),
                 "pre_focus_mix": self.pre_focus_mix.serialize(),
                 "post_focus_mix": self.post_focus_mix.serialize(),
             },
@@ -1076,13 +1271,94 @@ class SO2Convolution(NativeOP):
                 variables["radial_degree_mixer"]
             )
         )
+        obj.attn_qk_norm = (
+            None
+            if variables.get("attn_qk_norm") is None
+            else ScalarRMSNorm.deserialize(variables["attn_qk_norm"])
+        )
+        obj.attn_q_proj = (
+            None
+            if variables.get("attn_q_proj") is None
+            else FocusLinear.deserialize(variables["attn_q_proj"])
+        )
+        obj.attn_k_proj = (
+            None
+            if variables.get("attn_k_proj") is None
+            else FocusLinear.deserialize(variables["attn_k_proj"])
+        )
+        obj.attn_output_gate_norm = (
+            None
+            if variables.get("attn_output_gate_norm") is None
+            else ScalarRMSNorm.deserialize(variables["attn_output_gate_norm"])
+        )
+        obj.attn_logit_w = variables.get("attn_logit_w", obj.attn_logit_w)
+        obj.attn_z_bias_raw = variables.get(
+            "attn_z_bias_raw",
+            obj.attn_z_bias_raw,
+        )
+        obj.attn_gate_w = variables.get("attn_gate_w", obj.attn_gate_w)
         obj.pre_focus_mix = SO3Linear.deserialize(variables["pre_focus_mix"])
         obj.post_focus_mix = SO3Linear.deserialize(variables["post_focus_mix"])
         return obj
+
+
+def _segment_envelope_gated_softmax(
+    logits: Array,
+    edge_env: Array,
+    dst: Array,
+    n_nodes: int,
+    z_bias_raw: Array,
+    eps: float,
+) -> Array:
+    xp = array_api_compat.array_namespace(logits, edge_env, dst, z_bias_raw)
+    n_edge, n_focus, n_head = logits.shape
+    n_channel = n_focus * n_head
+    logits_2d = xp.reshape(logits, (n_edge, n_channel))
+    edge_weight_sq = xp.reshape(xp.maximum(edge_env, 0.0), (n_edge,)) ** 2
+    zeta = _softplus(xp.reshape(z_bias_raw, (1, n_channel)))
+    dst = xp.astype(dst, xp.int64)
+    logits_for_max = xp.where(
+        xp.reshape(edge_weight_sq > 0.0, (n_edge, 1)),
+        logits_2d,
+        xp.full(logits_2d.shape, -xp.inf, dtype=logits_2d.dtype),
+    )
+    group_max = xp.full(
+        (n_nodes, n_channel),
+        -xp.inf,
+        dtype=logits_2d.dtype,
+    )
+    group_max = _scatter_max_first_axis(group_max, dst, logits_for_max)
+    edge_max = xp.take(group_max, dst, axis=0)
+    edge_max = xp.where(xp.isfinite(edge_max), edge_max, xp.zeros_like(edge_max))
+    group_max_safe = xp.where(
+        xp.isfinite(group_max),
+        group_max,
+        xp.zeros_like(group_max),
+    )
+    edge_weighted_exp = xp.reshape(edge_weight_sq, (n_edge, 1)) * xp.exp(
+        logits_2d - edge_max
+    )
+    denom_sum = xp.zeros((n_nodes, n_channel), dtype=logits_2d.dtype)
+    denom_sum = _scatter_add_first_axis(denom_sum, dst, edge_weighted_exp)
+    denom = denom_sum + zeta * xp.exp(-group_max_safe)
+    alpha = edge_weighted_exp / (xp.take(denom, dst, axis=0) + float(eps))
+    return xp.reshape(alpha, (n_edge, n_focus, n_head))
+
+
+def _softplus(x: Array) -> Array:
+    xp = array_api_compat.array_namespace(x)
+    return xp.log1p(xp.exp(-xp.abs(x))) + xp.maximum(x, 0.0)
 
 
 def _scatter_add_first_axis(target: Array, index: Array, source: Array) -> Array:
     if hasattr(target, "at"):
         return target.at[index].add(source)
     np.add.at(target, index, source)
+    return target
+
+
+def _scatter_max_first_axis(target: Array, index: Array, source: Array) -> Array:
+    if hasattr(target, "at"):
+        return target.at[index].max(source)
+    np.maximum.at(target, index, source)
     return target

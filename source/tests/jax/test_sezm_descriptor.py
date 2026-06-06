@@ -49,6 +49,7 @@ from deepmd.jax.descriptor.sezm_block import (
 )
 from deepmd.jax.descriptor.sezm_norm import (
     EquivariantRMSNorm,
+    ScalarRMSNorm,
 )
 from deepmd.jax.descriptor.sezm_so2 import (
     DynamicRadialDegreeMixer,
@@ -479,6 +480,22 @@ class TestSeZMDescriptor(unittest.TestCase):
             atol=1e-6,
         )
 
+        scalar_norm = ScalarRMSNorm(
+            channels=2,
+            n_focus=2,
+            precision="float32",
+        )
+        scalar_x = jnp.ones((3, 2, 2), dtype=jnp.float32)
+        scalar_y = scalar_norm(scalar_x)
+        self.assertEqual(scalar_y.shape, scalar_x.shape)
+        self.assertTrue(bool(jnp.all(jnp.isfinite(scalar_y))))
+        restored_scalar_norm = ScalarRMSNorm.deserialize(scalar_norm.serialize())
+        np.testing.assert_allclose(
+            np.asarray(restored_scalar_norm(scalar_x)),
+            np.asarray(scalar_y),
+            atol=1e-6,
+        )
+
         block = SeZMInteractionBlock(
             lmax=1,
             mmax=1,
@@ -647,6 +664,49 @@ class TestSeZMDescriptor(unittest.TestCase):
         self.assertEqual(y.shape, (2, 4, 1))
         np.testing.assert_allclose(np.asarray(y[0]), np.asarray(x[1]), atol=1e-6)
         np.testing.assert_allclose(np.asarray(y[1]), 0.0, atol=1e-6)
+
+        restored = SO2Convolution.deserialize(conv.serialize())
+        y_restored = restored(x, edge_cache, radial_feat)
+        np.testing.assert_allclose(np.asarray(y_restored), np.asarray(y), atol=1e-6)
+
+    def test_so2_convolution_attention_path(self) -> None:
+        conv = SO2Convolution(
+            lmax=1,
+            mmax=1,
+            channels=1,
+            n_focus=2,
+            focus_dim=1,
+            so2_layers=1,
+            n_atten_head=1,
+            radial_so2_mode="none",
+            precision="float32",
+            seed=7,
+        )
+        eye = jnp.eye(4, dtype=jnp.float32).reshape(1, 4, 4)
+        edge_cache = EdgeFeatureCache(
+            src=jnp.asarray([1], dtype=jnp.int64),
+            dst=jnp.asarray([0], dtype=jnp.int64),
+            edge_type_feat=jnp.zeros((1, 1), dtype=jnp.float32),
+            edge_vec=jnp.zeros((1, 3), dtype=jnp.float32),
+            edge_len=jnp.ones((1, 1), dtype=jnp.float32),
+            edge_rbf=jnp.ones((1, 1), dtype=jnp.float32),
+            edge_env=jnp.ones((1, 1), dtype=jnp.float32),
+            deg=jnp.ones((2,), dtype=jnp.float32),
+            inv_sqrt_deg=jnp.ones((2, 1, 1), dtype=jnp.float32),
+            D_full=eye,
+            Dt_full=eye,
+        )
+        x = jnp.asarray(
+            [
+                [[0.0], [0.0], [0.0], [0.0]],
+                [[1.0], [2.0], [3.0], [4.0]],
+            ],
+            dtype=jnp.float32,
+        )
+        radial_feat = jnp.ones((1, 2, 1), dtype=jnp.float32)
+        y = conv(x, edge_cache, radial_feat)
+        self.assertEqual(y.shape, (2, 4, 1))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(y))))
 
         restored = SO2Convolution.deserialize(conv.serialize())
         y_restored = restored(x, edge_cache, radial_feat)

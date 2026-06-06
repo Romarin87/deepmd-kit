@@ -29,6 +29,9 @@ from deepmd.jax.descriptor.sezm_so3 import (
     FocusLinear,
     SO3Linear,
 )
+from deepmd.jax.descriptor.sezm_norm import (
+    ScalarRMSNorm,
+)
 from deepmd.jax.utils.network import (
     ArrayAPIParam,
 )
@@ -104,6 +107,8 @@ class SO2Convolution(SO2ConvolutionDP):
             value = to_jax_array(value)
             if value is not None:
                 value = ArrayAPIVariable(value)
+        elif name in {"attn_logit_w", "attn_z_bias_raw", "attn_gate_w"}:
+            value = _to_jax_parameter(self, value)
         elif name in {"so2_linears"}:
             value = [
                 item
@@ -133,6 +138,18 @@ class SO2Convolution(SO2ConvolutionDP):
                 value
                 if isinstance(value, DynamicRadialDegreeMixer)
                 else DynamicRadialDegreeMixer.deserialize(value.serialize())
+            )
+        elif name in {"attn_qk_norm", "attn_output_gate_norm"} and value is not None:
+            value = (
+                value
+                if isinstance(value, ScalarRMSNorm)
+                else ScalarRMSNorm.deserialize(value.serialize())
+            )
+        elif name in {"attn_q_proj", "attn_k_proj"} and value is not None:
+            value = (
+                value
+                if isinstance(value, FocusLinear)
+                else FocusLinear.deserialize(value.serialize())
             )
         elif name in {"pre_focus_mix", "post_focus_mix"}:
             value = (
