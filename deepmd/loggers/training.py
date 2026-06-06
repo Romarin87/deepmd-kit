@@ -101,8 +101,6 @@ def format_training_message_per_task(
         lr = ""
     else:
         lr = f", lr = {learning_rate:8.2e}"
-    # sort rmse
-    rmse = dict(sorted(rmse.items()))
     msg = (
         f"Batch {batch:7d}: {task_name}"
         f"{', '.join([f'{kk} = {vv:8.2e}' for kk, vv in rmse.items()])}"
