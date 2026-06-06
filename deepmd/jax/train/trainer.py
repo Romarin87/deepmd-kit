@@ -32,7 +32,10 @@ from deepmd.dpmodel.model.transform_output import (
     communicate_extended_output,
 )
 from deepmd.dpmodel.utils.learning_rate import (
-    LearningRateExp,
+    BaseLR,
+)
+from deepmd.dpmodel.utils.training_utils import (
+    compute_total_numb_batch,
 )
 from deepmd.dpmodel.utils.nlist import (
     build_neighbor_list,
@@ -131,21 +134,19 @@ class DPTrainer:
             # from scratch
             self.model = get_model(jdata["model"])
         self.training_param = jdata["training"]
-        self.num_steps = self.training_param["numb_steps"]
-
-        def get_lr_and_coef(lr_param: dict) -> LearningRateExp:
-            lr_type = lr_param.get("type", "exp")
-            if lr_type == "exp":
-                lr = LearningRateExp(
-                    **lr_param,
-                    num_steps=self.num_steps,
-                )
-            else:
-                raise RuntimeError("unknown learning_rate type " + lr_type)
-            return lr
+        self.num_steps = self.training_param.get("numb_steps")
+        self.num_epoch = self.training_param.get("numb_epoch")
 
         learning_rate_param = jdata["learning_rate"]
-        self.lr = get_lr_and_coef(learning_rate_param)
+        self.learning_rate_param = learning_rate_param
+        self.lr = (
+            BaseLR(
+                **self.learning_rate_param,
+                num_steps=self.num_steps,
+            )
+            if self.num_steps is not None
+            else None
+        )
         loss_param = jdata.get("loss", {})
         loss_param["starter_learning_rate"] = learning_rate_param["start_lr"]
         self.has_hessian = _loss_uses_hessian(loss_param)
@@ -203,6 +204,8 @@ class DPTrainer:
         self, train_data: DeepmdDataSystem, valid_data: DeepmdDataSystem | None = None
     ) -> None:
         """Run the training loop with optional validation data."""
+        self._resolve_num_steps(train_data)
+        assert self.lr is not None
         model = self.model
         tx = optax.adam(
             learning_rate=lambda step: self.lr.value(self.start_step + step),
@@ -455,6 +458,34 @@ class DPTrainer:
         self._cleanup_old_checkpoints()
         with open("checkpoint", "w") as fp:
             fp.write(f"{self.save_ckpt}.jax")
+
+    def _resolve_num_steps(self, train_data: DeepmdDataSystem) -> None:
+        """Resolve step-based training length from epoch-based input if needed."""
+        if self.num_steps is not None:
+            return
+        if self.num_epoch is None:
+            raise ValueError(
+                "Either training.numb_steps or training.num_epoch must be set."
+            )
+        if self.num_epoch <= 0:
+            raise ValueError("training.num_epoch must be positive.")
+        total_numb_batch = compute_total_numb_batch(
+            train_data.nbatches,
+            train_data.sys_probs,
+        )
+        if total_numb_batch <= 0:
+            raise ValueError("Total number of training batches must be positive.")
+        self.num_steps = int(np.ceil(self.num_epoch * total_numb_batch))
+        log.info(
+            "Computed numb_steps=%d from num_epoch=%s and total_numb_batch=%d.",
+            self.num_steps,
+            self.num_epoch,
+            total_numb_batch,
+        )
+        self.lr = BaseLR(
+            **self.learning_rate_param,
+            num_steps=self.num_steps,
+        )
 
     def _cleanup_old_checkpoints(self) -> None:
         """Remove old checkpoint directories beyond the retention limit."""
