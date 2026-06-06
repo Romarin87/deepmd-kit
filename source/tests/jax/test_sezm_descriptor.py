@@ -43,6 +43,7 @@ from deepmd.jax.descriptor.sezm_so3 import (
 )
 from deepmd.jax.descriptor.sezm_ffn import (
     EquivariantFFN,
+    SwiGLUS2Activation,
 )
 from deepmd.jax.descriptor.sezm_block import (
     SeZMInteractionBlock,
@@ -456,6 +457,48 @@ class TestSeZMDescriptor(unittest.TestCase):
         restored = EquivariantFFN.deserialize(ffn.serialize())
         np.testing.assert_allclose(np.asarray(restored(x)), expected, atol=1e-6)
 
+    def test_swiglu_s2_activation_and_ffn(self) -> None:
+        activation = SwiGLUS2Activation(
+            lmax=1,
+            channels=1,
+            precision="float32",
+            n_focus=1,
+            layout="ndfc",
+            grid_method="lebedev",
+            seed=7,
+        )
+        x = jnp.ones((1, 4, 1, 2), dtype=jnp.float32)
+        y = activation(x)
+        self.assertEqual(y.shape, (1, 4, 1, 1))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(y))))
+
+        restored_activation = SwiGLUS2Activation.deserialize(activation.serialize())
+        np.testing.assert_allclose(
+            np.asarray(restored_activation(x)),
+            np.asarray(y),
+            atol=1e-6,
+        )
+
+        ffn = EquivariantFFN(
+            lmax=1,
+            channels=1,
+            hidden_channels=1,
+            s2_activation=True,
+            lebedev_quadrature=True,
+            precision="float32",
+            seed=7,
+        )
+        ffn_out = ffn(jnp.ones((2, 4, 1, 1), dtype=jnp.float32))
+        self.assertEqual(ffn_out.shape, (2, 4, 1, 1))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(ffn_out))))
+
+        restored_ffn = EquivariantFFN.deserialize(ffn.serialize())
+        np.testing.assert_allclose(
+            np.asarray(restored_ffn(jnp.ones((2, 4, 1, 1), dtype=jnp.float32))),
+            np.asarray(ffn_out),
+            atol=1e-6,
+        )
+
     def test_equivariant_rms_norm_and_block_baseline(self) -> None:
         norm = EquivariantRMSNorm(
             lmax=1,
@@ -508,7 +551,8 @@ class TestSeZMDescriptor(unittest.TestCase):
             ffn_pre_norm=True,
             ffn_neurons=1,
             ffn_blocks=1,
-            ffn_s2_activation=False,
+            ffn_s2_activation=True,
+            ffn_lebedev_quadrature=True,
             precision="float32",
             seed=7,
         )
