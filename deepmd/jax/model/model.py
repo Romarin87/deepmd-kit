@@ -24,6 +24,9 @@ from deepmd.jax.model.base_model import (
 from deepmd.jax.model.dp_zbl_model import (
     DPZBLModel,
 )
+from deepmd.jax.model.sezm_model import (
+    SeZMModel,
+)
 
 SEZM_MODEL_TYPES = {"SeZM", "sezm", "DPA4", "dpa4"}
 SEZM_FITTING_TYPES = {"dpa4_ener", "sezm_ener"}
@@ -64,7 +67,11 @@ def get_standard_model(data: dict) -> BaseModel:
         **data["fitting_net"],
     )
     model_type = "ener" if fitting_type in SEZM_FITTING_TYPES else fitting_type
-    model = BaseModel.get_class_by_type(model_type)(
+    if descriptor_type in SEZM_MODEL_TYPES:
+        model_cls = SeZMModel
+    else:
+        model_cls = BaseModel.get_class_by_type(model_type)
+    model = model_cls(
         descriptor=descriptor,
         fitting=fitting,
         type_map=data["type_map"],
