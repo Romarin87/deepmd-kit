@@ -2369,6 +2369,23 @@ def whether_hessian(loss_params: dict[str, Any]) -> bool:
     return loss_type == "ener" and loss_params.get("start_pref_h", 0.0) > 0.0
 
 
+def apply_hessian_mode_from_loss(
+    model_params: dict[str, Any],
+    loss_params: dict[str, Any] | None,
+) -> None:
+    """Mark model branches that need Hessian outputs from their loss config."""
+    if loss_params is None:
+        return
+    if "model_dict" not in model_params:
+        if whether_hessian(loss_params):
+            model_params["hessian_mode"] = True
+        return
+    for model_key, sub_model_params in model_params["model_dict"].items():
+        sub_loss = loss_params.get(model_key)
+        if sub_loss is not None and whether_hessian(sub_loss):
+            sub_model_params["hessian_mode"] = True
+
+
 def prepare_model_for_loss(
     model: Any,
     loss_params: dict[str, Any] | None,
@@ -2448,9 +2465,8 @@ def get_model_for_wrapper(
     resuming: bool = False,
     _loss_params: dict[str, Any] | None = None,
 ) -> Any:
+    apply_hessian_mode_from_loss(_model_params, _loss_params)
     if "model_dict" not in _model_params:
-        if _loss_params is not None and whether_hessian(_loss_params):
-            _model_params["hessian_mode"] = True
         _model = get_single_model(
             _model_params,
         )
@@ -2459,8 +2475,6 @@ def get_model_for_wrapper(
         model_keys = list(_model_params["model_dict"])
         do_case_embd, case_embd_index = get_case_embd_config(_model_params)
         for _model_key in model_keys:
-            if _loss_params is not None and whether_hessian(_loss_params[_model_key]):
-                _model_params["model_dict"][_model_key]["hessian_mode"] = True
             _model[_model_key] = get_single_model(
                 _model_params["model_dict"][_model_key],
             )

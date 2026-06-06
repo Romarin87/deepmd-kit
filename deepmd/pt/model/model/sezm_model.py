@@ -365,6 +365,7 @@ from __future__ import (
     annotations,
 )
 
+import copy
 import logging
 import os
 import time
@@ -782,6 +783,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         lora: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
+        self._hessian_enabled = False
+        self.hess_fitting_def = None
         DPModelCommon.__init__(self)
         SeZMModel_.__init__(self, *args, **kwargs)
         self.redu_prec = env.GLOBAL_PT_ENER_FLOAT_PRECISION
@@ -930,6 +933,10 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             # === Step 4. Mask ===
             if "mask" in model_ret:
                 model_predict["mask"] = model_ret["mask"]
+            if self._hessian_enabled:
+                model_predict["hessian"] = model_ret[
+                    "energy_derv_r_derv_r"
+                ].squeeze(-3)
 
         else:
             model_predict = model_ret
@@ -1630,6 +1637,10 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                         "nf nall 1 nine -> nf nall nine",
                         nine=9,
                     )
+            if self._hessian_enabled:
+                model_predict["hessian"] = model_ret[
+                    "energy_derv_r_derv_r"
+                ].squeeze(-3)
         else:
             model_predict = model_ret
         return model_predict
@@ -2177,6 +2188,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
 
     def should_use_compile(self) -> bool:
         """Return whether the current forward should use the compile path."""
+        if self._hessian_enabled:
+            return False
         if self.training:
             return self.use_compile
         return bool(self._env_use_compile_infer)
@@ -2755,6 +2768,29 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             # reinitialised fitting head.
             self.compiled_core_compute_cache.clear()
 
+    def requires_hessian(self, keys: str | list[str]) -> None:
+        """Set which output variable(s) require Hessian output."""
+        if self.hess_fitting_def is None:
+            self.hess_fitting_def = copy.deepcopy(SeZMModel_.atomic_output_def(self))
+        if isinstance(keys, str):
+            keys = [keys]
+        for kk in self.hess_fitting_def.keys():
+            if kk in keys:
+                self.hess_fitting_def[kk].r_hessian = True
+
+    def enable_hessian(self) -> None:
+        """Enable conservative SeZM energy Hessian output."""
+        if self.get_active_mode() != "ener":
+            raise NotImplementedError("SeZM Hessian mode only supports `ener` mode.")
+        if self.use_compile:
+            log.warning("SeZM Hessian mode disables `use_compile` for correctness.")
+            self.use_compile = False
+        self.requires_hessian("energy")
+        self._hessian_enabled = True
+        self._core_compute_pending_compile_t0 = None
+        self._core_compute_pending_compile_key = None
+        self.compiled_core_compute_cache.clear()
+
     # =========================================================================
     # Bridging Helpers
     # =========================================================================
@@ -2790,8 +2826,16 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             output_def["atom_virial"] = out_def_data["energy_derv_c"].squeeze(-2)
         if "mask" in out_def_data:
             output_def["mask"] = out_def_data["mask"]
+        if self._hessian_enabled:
+            output_def["hessian"] = out_def_data["energy_derv_r_derv_r"]
 
         return output_def
+
+    def atomic_output_def(self):  # noqa: ANN201
+        """Get the active SeZM atomic output definition."""
+        if self._hessian_enabled and self.hess_fitting_def is not None:
+            return self.hess_fitting_def
+        return SeZMModel_.atomic_output_def(self)
 
     def get_observed_type_list(self) -> list[str]:
         """

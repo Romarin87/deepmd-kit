@@ -358,6 +358,10 @@ def train(
     # argcheck
     config = update_deepmd_input(config, warning=True, dump="input_v2_compat.json")
     config = normalize(config, multi_task=multi_task)
+    training.apply_hessian_mode_from_loss(
+        config["model"],
+        config["loss_dict"] if multi_task else config["loss"],
+    )
 
     # do neighbor stat
     min_nbor_dist = None
