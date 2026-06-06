@@ -138,6 +138,13 @@ def train(
     jdata = update_deepmd_input(jdata, warning=True, dump="input_v2_compat.json")
 
     jdata = normalize(jdata)
+    loss_param = jdata.get("loss", {})
+    if (
+        loss_param.get("type", "ener") == "ener"
+        and loss_param.get("start_pref_h", 0.0) != 0.0
+        and loss_param.get("limit_pref_h", 0.0) != 0.0
+    ):
+        jdata["model"]["hessian_mode"] = True
     if not skip_neighbor_stat:
         jdata = update_sel(jdata)
 

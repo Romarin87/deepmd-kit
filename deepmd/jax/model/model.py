@@ -35,6 +35,7 @@ def get_standard_model(data: dict) -> BaseModel:
         The data to construct the model.
     """
     data = deepcopy(data)
+    hessian_mode = bool(data.pop("hessian_mode", False))
     if "type_embedding" in data:
         raise ValueError(
             "In the JAX backend, type_embedding is not at the model level, but within the descriptor. See type embedding documentation for details."
@@ -55,13 +56,20 @@ def get_standard_model(data: dict) -> BaseModel:
         mixed_types=descriptor.mixed_types(),
         **data["fitting_net"],
     )
-    return BaseModel.get_class_by_type(fitting_type)(
+    model = BaseModel.get_class_by_type(fitting_type)(
         descriptor=descriptor,
         fitting=fitting,
         type_map=data["type_map"],
         atom_exclude_types=data.get("atom_exclude_types", []),
         pair_exclude_types=data.get("pair_exclude_types", []),
     )
+    if hessian_mode:
+        if not hasattr(model, "enable_hessian"):
+            raise NotImplementedError(
+                f"JAX model with fitting type {fitting_type!r} does not support Hessian output."
+            )
+        model.enable_hessian()
+    return model
 
 
 def get_zbl_model(data: dict) -> DPZBLModel:

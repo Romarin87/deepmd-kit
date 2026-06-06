@@ -594,3 +594,107 @@ class EnergyLoss(Loss):
         if version < 3:
             data.setdefault("intensive_ener_virial", False)
         return cls(**data)
+
+
+class EnergyHessianLoss(EnergyLoss):
+    def __init__(
+        self,
+        start_pref_h: float = 0.0,
+        limit_pref_h: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        r"""Enable the layer to compute loss on Hessian labels.
+
+        Parameters
+        ----------
+        start_pref_h : float
+            The prefactor of Hessian loss at the start of the training.
+        limit_pref_h : float
+            The prefactor of Hessian loss at the end of the training.
+        **kwargs
+            Other keyword arguments.
+        """
+        super().__init__(**kwargs)
+        self.has_h = start_pref_h != 0.0 and limit_pref_h != 0.0
+        self.start_pref_h = start_pref_h
+        self.limit_pref_h = limit_pref_h
+
+    def call(
+        self,
+        learning_rate: float,
+        natoms: int,
+        model_dict: dict[str, Array],
+        label_dict: dict[str, Array],
+        mae: bool = False,
+    ) -> tuple[Array, dict[str, Array]]:
+        """Calculate energy/force/virial and Hessian losses."""
+        loss, more_loss = super().call(
+            learning_rate,
+            natoms,
+            model_dict,
+            label_dict,
+            mae=mae,
+        )
+        xp = array_api_compat.array_namespace(model_dict["energy"])
+        lr_ratio = learning_rate / self.starter_learning_rate
+        pref_h = self.limit_pref_h + (self.start_pref_h - self.limit_pref_h) * lr_ratio
+
+        hessian = model_dict.get("hessian", model_dict.get("energy_derv_r_derv_r"))
+        if self.has_h and hessian is not None and "hessian" in label_dict:
+            find_hessian = label_dict.get("find_hessian", 0.0)
+            diff_h = xp.reshape(label_dict["hessian"], (-1,)) - xp.reshape(
+                hessian, (-1,)
+            )
+            if self.loss_func == "mse":
+                l2_hessian_loss = xp.mean(xp.square(diff_h))
+                loss += pref_h * find_hessian * l2_hessian_loss
+                more_loss["rmse_h"] = self.display_if_exist(
+                    xp.sqrt(l2_hessian_loss),
+                    find_hessian,
+                )
+            elif self.loss_func == "mae":
+                l1_hessian_loss = xp.mean(xp.abs(diff_h))
+                loss += pref_h * find_hessian * l1_hessian_loss
+                more_loss["mae_h"] = self.display_if_exist(
+                    l1_hessian_loss,
+                    find_hessian,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Loss type {self.loss_func} is not implemented for Hessian loss."
+                )
+            if mae:
+                mae_h = xp.mean(xp.abs(diff_h))
+                more_loss["mae_h"] = self.display_if_exist(mae_h, find_hessian)
+
+        more_loss.pop("rmse", None)
+        more_loss["rmse"] = xp.sqrt(loss)
+        return loss, more_loss
+
+    @property
+    def label_requirement(self) -> list[DataRequirementItem]:
+        """Return data label requirements needed for Hessian loss calculation."""
+        label_requirement = super().label_requirement
+        if self.has_h:
+            label_requirement.append(
+                DataRequirementItem(
+                    "hessian",
+                    ndof=1,
+                    atomic=True,
+                    must=False,
+                    high_prec=False,
+                )
+            )
+        return label_requirement
+
+    def serialize(self) -> dict:
+        """Serialize the loss module."""
+        data = super().serialize()
+        data.update(
+            {
+                "@class": "EnergyHessianLoss",
+                "start_pref_h": self.start_pref_h,
+                "limit_pref_h": self.limit_pref_h,
+            }
+        )
+        return data
