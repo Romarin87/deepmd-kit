@@ -2,11 +2,16 @@
 import sys
 import unittest
 
+import numpy as np
+
 from deepmd.jax.descriptor.base_descriptor import (
     BaseDescriptor,
 )
 from deepmd.jax.descriptor.sezm import (
     DescrptSeZM,
+)
+from deepmd.jax.env import (
+    jnp,
 )
 from deepmd.jax.fitting.fitting import (
     SeZMEnergyFittingNet,
@@ -67,10 +72,51 @@ class TestSeZMDescriptor(unittest.TestCase):
         self.assertEqual(descriptor.get_rcut_smth(), 6.0)
         self.assertEqual(descriptor.get_sel(), [416])
         self.assertTrue(descriptor.mixed_types())
+        self.assertEqual(descriptor.radial_mlp, [32])
 
         restored = DescrptSeZM.deserialize(descriptor.serialize())
         self.assertEqual(restored.get_dim_out(), 32)
         self.assertEqual(restored.get_type_map(), ["H", "C", "O"])
+        self.assertEqual(restored.radial_embedding.mlp_layers, [16, 32, 128])
+
+    def test_base_embedding_and_edge_cache(self) -> None:
+        descriptor = DescrptSeZM(
+            ntypes=2,
+            sel=2,
+            rcut=6.0,
+            channels=8,
+            n_radial=4,
+            radial_mlp=[0],
+            n_blocks=2,
+            so2_layers=3,
+            precision="float32",
+            seed=42,
+        )
+        distances = jnp.asarray([[0.5], [6.0]], dtype=jnp.float32)
+        radial = descriptor.radial_basis(distances)
+        self.assertEqual(radial.shape, (2, 4))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(radial))))
+        np.testing.assert_allclose(np.asarray(radial[1]), np.zeros(4), atol=1e-6)
+
+        atype = jnp.asarray([[0, -1]], dtype=jnp.int64)
+        type_feat = descriptor.type_embedding(atype)
+        self.assertEqual(type_feat.shape, (1, 2, 8))
+        np.testing.assert_allclose(np.asarray(type_feat[0, 1]), np.zeros(8), atol=1e-6)
+
+        coord_ext = jnp.asarray(
+            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]],
+            dtype=jnp.float32,
+        )
+        atype_ext = jnp.asarray([[0, 1]], dtype=jnp.int64)
+        nlist = jnp.asarray([[[1, -1], [0, -1]]], dtype=jnp.int64)
+        mapping = jnp.asarray([[0, 1]], dtype=jnp.int64)
+        cache = descriptor._build_edge_cache(coord_ext, atype_ext, nlist, mapping)
+        self.assertEqual(cache.edge_vec.shape, (2, 3))
+        self.assertEqual(cache.edge_rbf.shape, (2, 4))
+        self.assertEqual(cache.edge_type_feat.shape, (2, 8))
+        self.assertEqual(cache.inv_sqrt_deg.shape, (2, 1, 1))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(cache.edge_rbf))))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(cache.inv_sqrt_deg))))
 
     def test_model_type_defaults_to_sezm_energy_fitting(self) -> None:
         model = get_model(
@@ -79,6 +125,7 @@ class TestSeZMDescriptor(unittest.TestCase):
                 "type_map": ["H", "C", "O"],
                 "descriptor": {
                     "type": "SeZM",
+                    "_comment": "ignored config note",
                     "sel": 416,
                     "rcut": 6.0,
                     "channels": 32,
@@ -90,6 +137,7 @@ class TestSeZMDescriptor(unittest.TestCase):
                     "seed": 42,
                 },
                 "fitting_net": {
+                    "_comment": "ignored config note",
                     "neuron": [0],
                     "activation_function": "silu",
                     "precision": "float32",

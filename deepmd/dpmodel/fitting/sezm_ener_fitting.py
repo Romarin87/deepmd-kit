@@ -89,6 +89,7 @@ class SeZMEnergyFittingNet(InvarFitting):
         default_fparam: list | None = None,
         **kwargs: Any,
     ) -> None:
+        kwargs.pop("_comment", None)
         if kwargs:
             raise TypeError(f"Unsupported SeZM energy fitting options: {kwargs}")
         self.seed = seed
