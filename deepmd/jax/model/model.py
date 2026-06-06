@@ -25,6 +25,9 @@ from deepmd.jax.model.dp_zbl_model import (
     DPZBLModel,
 )
 
+SEZM_MODEL_TYPES = {"SeZM", "sezm", "DPA4", "dpa4"}
+SEZM_FITTING_TYPES = {"dpa4_ener", "sezm_ener"}
+
 
 def get_standard_model(data: dict) -> BaseModel:
     """Get a Model from a dictionary.
@@ -43,7 +46,11 @@ def get_standard_model(data: dict) -> BaseModel:
     descriptor_type = data["descriptor"].pop("type")
     data["descriptor"]["type_map"] = data["type_map"]
     data["descriptor"]["ntypes"] = len(data["type_map"])
-    fitting_type = data["fitting_net"].pop("type")
+    data.setdefault("fitting_net", {})
+    default_fitting_type = (
+        "sezm_ener" if descriptor_type in SEZM_MODEL_TYPES else "ener"
+    )
+    fitting_type = data["fitting_net"].pop("type", default_fitting_type)
     data["fitting_net"]["type_map"] = data["type_map"]
     descriptor = BaseDescriptor.get_class_by_type(descriptor_type)(
         **data["descriptor"],
@@ -56,9 +63,7 @@ def get_standard_model(data: dict) -> BaseModel:
         mixed_types=descriptor.mixed_types(),
         **data["fitting_net"],
     )
-    model_type = (
-        "ener" if fitting_type in {"dpa4_ener", "sezm_ener"} else fitting_type
-    )
+    model_type = "ener" if fitting_type in SEZM_FITTING_TYPES else fitting_type
     model = BaseModel.get_class_by_type(model_type)(
         descriptor=descriptor,
         fitting=fitting,
@@ -123,6 +128,14 @@ def get_model(data: dict) -> BaseModel:
         The data to construct the model.
     """
     model_type = data.get("type", "standard")
+    if model_type in SEZM_MODEL_TYPES:
+        data = deepcopy(data)
+        data["type"] = "standard"
+        data.setdefault("descriptor", {})
+        data["descriptor"]["type"] = data["descriptor"].get("type", model_type)
+        data.setdefault("fitting_net", {})
+        data["fitting_net"]["type"] = data["fitting_net"].get("type", "sezm_ener")
+        return get_standard_model(data)
     if model_type == "standard":
         if "spin" in data:
             raise NotImplementedError("Spin model is not implemented yet.")
