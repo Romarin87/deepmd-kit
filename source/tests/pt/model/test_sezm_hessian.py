@@ -144,6 +144,48 @@ class TestSeZMHessian(unittest.TestCase):
         self.assertTrue(finite_grads)
         self.assertTrue(all(finite_grads))
 
+    def test_hessian_mae_loss_reports_mae_h(self):
+        model = get_model(
+            copy.deepcopy(_sezm_model_params(hessian_mode=True))
+        ).to(env.DEVICE)
+        coord, atype, box = _tiny_inputs()
+        label = {
+            "hessian": torch.zeros(
+                1,
+                coord.shape[1] * 3,
+                coord.shape[1] * 3,
+                device=env.DEVICE,
+                dtype=torch.float32,
+            ),
+            "find_hessian": 1.0,
+        }
+        loss_fn = EnergyHessianStdLoss(
+            starter_learning_rate=1.0,
+            start_pref_e=0.0,
+            limit_pref_e=0.0,
+            start_pref_f=0.0,
+            limit_pref_f=0.0,
+            start_pref_v=0.0,
+            limit_pref_v=0.0,
+            start_pref_h=1.0,
+            limit_pref_h=1.0,
+            loss_func="mae",
+        )
+
+        _, loss, more_loss = loss_fn(
+            {"coord": coord, "atype": atype, "box": box},
+            model,
+            label,
+            coord.shape[1],
+            1.0,
+        )
+
+        self.assertIn("mae_h", more_loss)
+        self.assertNotIn("rmse_h", more_loss)
+        self.assertNotIn("l2_hessian_loss", more_loss)
+        self.assertLess(list(more_loss).index("mae_h"), list(more_loss).index("rmse"))
+        self.assertTrue(torch.isfinite(loss))
+
     def test_multitask_hessian_flags_are_branch_local(self):
         branch_h = _sezm_model_params()
         branch_plain = _sezm_model_params()
