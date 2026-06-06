@@ -88,6 +88,20 @@ def _enable_hessian_output(model: BaseModel) -> None:
     model.enable_hessian()
 
 
+def _format_energy_loss_outputs(
+    model_dict: dict[str, jnp.ndarray],
+    label_dict: dict[str, jnp.ndarray],
+) -> dict[str, jnp.ndarray]:
+    model_dict["atom_energy"] = model_dict["energy"]
+    model_dict["energy"] = model_dict["energy_redu"]
+    force = model_dict["energy_derv_r"].squeeze(-2)
+    if "force" in label_dict and force.shape != label_dict["force"].shape:
+        force = jnp.reshape(force, label_dict["force"].shape)
+    model_dict["force"] = force
+    model_dict["virial"] = model_dict["energy_derv_c_redu"].squeeze(-2)
+    return model_dict
+
+
 class DPTrainer:
     """Train JAX DeePMD models on local devices."""
 
@@ -232,10 +246,7 @@ class DPTrainer:
                 mapping,
                 do_atomic_virial=False,
             )
-            model_dict["atom_energy"] = model_dict["energy"]
-            model_dict["energy"] = model_dict["energy_redu"]
-            model_dict["force"] = model_dict["energy_derv_r"].squeeze(-2)
-            model_dict["virial"] = model_dict["energy_derv_c_redu"].squeeze(-2)
+            model_dict = _format_energy_loss_outputs(model_dict, label_dict)
             loss, more_loss = self.loss(
                 learning_rate=lr,
                 natoms=label_dict["type"].shape[1],
@@ -270,10 +281,7 @@ class DPTrainer:
                 mapping,
                 do_atomic_virial=False,
             )
-            model_dict["atom_energy"] = model_dict["energy"]
-            model_dict["energy"] = model_dict["energy_redu"]
-            model_dict["force"] = model_dict["energy_derv_r"].squeeze(-2)
-            model_dict["virial"] = model_dict["energy_derv_c_redu"].squeeze(-2)
+            model_dict = _format_energy_loss_outputs(model_dict, label_dict)
             loss, more_loss = self.loss(
                 learning_rate=lr,
                 natoms=label_dict["type"].shape[1],
