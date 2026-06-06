@@ -11,6 +11,8 @@ from packaging.version import (
 from deepmd.dpmodel.descriptor.sezm import (
     C3CutoffEnvelope as C3CutoffEnvelopeDP,
     DescrptSeZM as DescrptSeZMDP,
+    EnvironmentInitialEmbedding as EnvironmentInitialEmbeddingDP,
+    GeometricInitialEmbedding as GeometricInitialEmbeddingDP,
     RadialBasis as RadialBasisDP,
     RadialMLP as RadialMLPDP,
     RMSNorm as RMSNormDP,
@@ -133,6 +135,38 @@ class RadialMLP(RadialMLPDP):
 
 
 @flax_module
+class GeometricInitialEmbedding(GeometricInitialEmbeddingDP):
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {
+            "non_scalar_row_index",
+            "zonal_m0_col_index_for_row",
+            "radial_slot_index_for_row",
+        }:
+            value = to_jax_array(value)
+            if value is not None:
+                value = ArrayAPIVariable(value)
+        return super().__setattr__(name, value)
+
+
+@flax_module
+class EnvironmentInitialEmbedding(EnvironmentInitialEmbeddingDP):
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {
+            "rbf_proj_layer1",
+            "rbf_proj_layer2",
+            "g_layer1",
+            "g_layer2",
+            "output_proj",
+        }:
+            if not isinstance(value, NativeLayer):
+                value = NativeLayer.deserialize(value.serialize())
+        elif name in {"env_type_embed"}:
+            if not isinstance(value, SeZMTypeEmbedding):
+                value = SeZMTypeEmbedding.deserialize(value.serialize())
+        return super().__setattr__(name, value)
+
+
+@flax_module
 class WignerDCalculator(WignerDCalculatorDP):
     def __setattr__(self, name: str, value: Any) -> None:
         if name in {"l1_perm", "l1_sign_outer"}:
@@ -172,6 +206,22 @@ class DescrptSeZM(DescrptSeZMDP):
         elif name in {"wigner_calc"}:
             if not isinstance(value, WignerDCalculator):
                 value = WignerDCalculator.deserialize(value.serialize())
+        elif name in {"env_seed_embedding"} and value is not None:
+            if not isinstance(value, EnvironmentInitialEmbedding):
+                value = EnvironmentInitialEmbedding.deserialize(value.serialize())
+        elif name in {"film_scale_norm", "film_shift_norm"} and value is not None:
+            if not isinstance(value, RMSNorm):
+                value = RMSNorm.deserialize(value.serialize())
+        elif name in {"film_scale_strength_log", "film_shift_strength_log"}:
+            value = to_jax_array(value)
+            if value is not None:
+                if getattr(self, "trainable", True):
+                    value = ArrayAPIParam(value)
+                else:
+                    value = ArrayAPIVariable(value)
+        elif name in {"gie"} and value is not None:
+            if not isinstance(value, GeometricInitialEmbedding):
+                value = GeometricInitialEmbedding.deserialize(value.serialize())
         elif name in {"blocks"}:
             value = [
                 block
