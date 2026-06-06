@@ -136,6 +136,10 @@ class DPTrainer:
         self.training_param = jdata["training"]
         self.num_steps = self.training_param.get("numb_steps")
         self.num_epoch = self.training_param.get("numb_epoch")
+        if self.num_epoch is None:
+            self.num_epoch = self.training_param.get("num_epoch")
+        if self.num_epoch is None:
+            self.num_epoch = self.training_param.get("num_epochs")
 
         learning_rate_param = jdata["learning_rate"]
         self.learning_rate_param = learning_rate_param

@@ -17,6 +17,9 @@ from .polar_model import (
 from .property_model import (
     PropertyModel,
 )
+from .sezm_model import (
+    SeZMModel,
+)
 
 __all__ = [
     "DOSModel",
@@ -25,4 +28,5 @@ __all__ = [
     "EnergyModel",
     "PolarModel",
     "PropertyModel",
+    "SeZMModel",
 ]

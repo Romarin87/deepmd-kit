@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+from copy import (
+    deepcopy,
+)
 import sys
 import unittest
 
@@ -19,8 +22,17 @@ from deepmd.jax.env import (
 from deepmd.jax.fitting.fitting import (
     SeZMEnergyFittingNet,
 )
+from deepmd.jax.model.base_model import (
+    BaseModel,
+)
 from deepmd.jax.model.model import (
     get_model,
+)
+from deepmd.jax.model.sezm_model import (
+    SeZMModel,
+)
+from deepmd.jax.atomic_model.sezm_atomic_model import (
+    SeZMAtomicModel,
 )
 from deepmd.jax.utils.serialization import (
     pack_zero_size_arrays_for_orbax,
@@ -822,8 +834,37 @@ class TestSeZMDescriptor(unittest.TestCase):
                 },
             }
         )
+        self.assertIsInstance(model, SeZMModel)
+        self.assertIsInstance(model.atomic_model, SeZMAtomicModel)
         self.assertIsInstance(model.atomic_model.descriptor, DescrptSeZM)
         self.assertIsInstance(model.atomic_model.fitting_net, SeZMEnergyFittingNet)
+        serialized = model.serialize()
+        self.assertEqual(serialized["type"], "SeZM")
+        self.assertEqual(serialized["atomic_model"]["type"], "sezm_atomic")
+        restored = BaseModel.deserialize(serialized)
+        self.assertIsInstance(restored, SeZMModel)
+        self.assertIsInstance(restored.atomic_model, SeZMAtomicModel)
+        self.assertIsInstance(restored.atomic_model.descriptor, DescrptSeZM)
+        self.assertIsInstance(restored.atomic_model.fitting_net, SeZMEnergyFittingNet)
+
+        pt_style = deepcopy(serialized)
+        net = pt_style["atomic_model"]["fitting"]["nets"]["networks"][0]
+        hidden_layers = net.pop("hidden_layers")
+        output_layer = net.pop("output_layer")
+        variables = {}
+        for layer_idx, layer in enumerate(hidden_layers):
+            linear_vars = layer["linear"]["@variables"]
+            variables[f"hidden_layers.{layer_idx}.linear.matrix"] = linear_vars["w"]
+            if linear_vars["b"] is not None:
+                variables[f"hidden_layers.{layer_idx}.linear.bias"] = linear_vars["b"]
+        output_vars = output_layer["@variables"]
+        variables["output_layer.matrix"] = output_vars["w"]
+        if output_vars["b"] is not None:
+            variables["output_layer.bias"] = output_vars["b"]
+        net["@variables"] = variables
+        restored_pt_style = BaseModel.deserialize(pt_style)
+        self.assertIsInstance(restored_pt_style, SeZMModel)
+        self.assertIsInstance(restored_pt_style.atomic_model, SeZMAtomicModel)
 
     def test_sezm_model_hessian_lower_smoke(self) -> None:
         model = get_model(

@@ -188,29 +188,32 @@ class TestJAXTraining(unittest.TestCase):
 
     def test_num_epoch_resolves_training_steps(self) -> None:
         """JAX trainer resolves epoch-based input after data is available."""
-        config = copy.deepcopy(self.config)
-        config["training"].pop("numb_steps")
-        config["training"]["numb_epoch"] = 1.5
-        config["learning_rate"] = {
-            "type": "wsd",
-            "start_lr": 1.0,
-            "stop_lr": 0.1,
-            "decay_phase_ratio": 0.2,
-            "decay_type": "linear",
-        }
-        jdata = update_deepmd_input(config, warning=False)
-        jdata = normalize(jdata)
-
-        trainer = DPTrainer(jdata)
 
         class DummyTrainData:
             nbatches = [3, 7]
             sys_probs = [0.5, 0.5]
 
-        self.assertIsNone(trainer.lr)
-        trainer._resolve_num_steps(DummyTrainData())
-        self.assertEqual(trainer.num_steps, 21)
-        self.assertEqual(trainer.lr.__class__.__name__, "LearningRateWSD")
+        for epoch_key in ("numb_epoch", "num_epoch", "num_epochs"):
+            with self.subTest(epoch_key=epoch_key):
+                config = copy.deepcopy(self.config)
+                config["training"].pop("numb_steps")
+                config["training"][epoch_key] = 1.5
+                config["learning_rate"] = {
+                    "type": "wsd",
+                    "start_lr": 1.0,
+                    "stop_lr": 0.1,
+                    "decay_phase_ratio": 0.2,
+                    "decay_type": "linear",
+                }
+                jdata = update_deepmd_input(config, warning=False)
+                jdata = normalize(jdata)
+
+                trainer = DPTrainer(jdata)
+
+                self.assertIsNone(trainer.lr)
+                trainer._resolve_num_steps(DummyTrainData())
+                self.assertEqual(trainer.num_steps, 21)
+                self.assertEqual(trainer.lr.__class__.__name__, "LearningRateWSD")
 
     def test_model_factory_restores_hessian_mode(self) -> None:
         """Checkpoint model definitions keep Hessian output mode."""
