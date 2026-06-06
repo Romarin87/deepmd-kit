@@ -24,6 +24,8 @@ from .neighbor_list import (
 from .network import (
     EmbeddingNet,
     FittingNet,
+    GLUFittingNet,
+    GLULayer,
     NativeLayer,
     NativeNet,
     NetworkCollection,
@@ -64,6 +66,8 @@ __all__ = [
     "EmbeddingNet",
     "EnvMat",
     "FittingNet",
+    "GLUFittingNet",
+    "GLULayer",
     "LmdbDataReader",
     "LmdbTestData",
     "LmdbTestDataNlocView",

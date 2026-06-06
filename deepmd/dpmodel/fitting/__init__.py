@@ -20,6 +20,9 @@ from .polarizability_fitting import (
 from .property_fitting import (
     PropertyFittingNet,
 )
+from .sezm_ener_fitting import (
+    SeZMEnergyFittingNet,
+)
 
 __all__ = [
     "DOSFittingNet",
@@ -28,5 +31,6 @@ __all__ = [
     "InvarFitting",
     "PolarFitting",
     "PropertyFittingNet",
+    "SeZMEnergyFittingNet",
     "make_base_fitting",
 ]
