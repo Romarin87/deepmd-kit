@@ -61,7 +61,7 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
     for the conservative energy path used by DPA4/SeZM.
     """
 
-    LATEST_VERSION = 1
+    LATEST_VERSION = 1.1
 
     def __init__(
         self,
