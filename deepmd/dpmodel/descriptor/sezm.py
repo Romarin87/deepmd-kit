@@ -20,6 +20,7 @@ from deepmd.dpmodel import (
 )
 from deepmd.dpmodel.array_api import (
     Array,
+    xp_add_at,
     xp_bincount,
 )
 from deepmd.dpmodel.common import (
@@ -56,10 +57,13 @@ from .sezm_ffn import (
 )
 from .sezm_indexing import (
     get_so3_dim_of_lmax,
+    map_degree_idx,
 )
 from .sezm_wignerd import (
     WignerDCalculator,
     build_edge_quaternion,
+    quaternion_multiply,
+    quaternion_z_rotation,
 )
 
 
@@ -396,6 +400,273 @@ class RadialMLP(NativeOP):
         return obj
 
 
+class GeometricInitialEmbedding(NativeOP):
+    def __init__(
+        self,
+        *,
+        lmax: int,
+        channels: int,
+        precision: str = DEFAULT_PRECISION,
+    ) -> None:
+        self.lmax = int(lmax)
+        self.channels = int(channels)
+        self.precision = precision
+        self.ebed_dim = get_so3_dim_of_lmax(self.lmax)
+        if self.lmax > 0:
+            packed_degree = map_degree_idx(self.lmax)
+            self.non_scalar_row_index = np.arange(
+                1,
+                self.ebed_dim,
+                dtype=np.int64,
+            )
+            non_scalar_degree = packed_degree[1:]
+            self.zonal_m0_col_index_for_row = (
+                non_scalar_degree * (non_scalar_degree + 1)
+            ).astype(np.int64)
+            self.radial_slot_index_for_row = (non_scalar_degree - 1).astype(np.int64)
+        else:
+            self.non_scalar_row_index = np.empty(0, dtype=np.int64)
+            self.zonal_m0_col_index_for_row = np.empty(0, dtype=np.int64)
+            self.radial_slot_index_for_row = np.empty(0, dtype=np.int64)
+
+    def call(
+        self,
+        *,
+        n_nodes: int,
+        edge_cache: EdgeFeatureCache,
+        radial_feat: Array,
+    ) -> Array:
+        xp = array_api_compat.array_namespace(edge_cache.edge_vec, radial_feat)
+        out = xp.zeros(
+            (n_nodes, self.ebed_dim, self.channels),
+            dtype=edge_cache.edge_vec.dtype,
+        )
+        if self.lmax == 0 or edge_cache.dst.shape[0] == 0:
+            return out
+        if edge_cache.Dt_full is None:
+            raise ValueError("GeometricInitialEmbedding requires Dt_full in edge cache")
+        row_idx = xp.asarray(self.non_scalar_row_index[...], dtype=xp.int64)
+        col_idx = xp.asarray(self.zonal_m0_col_index_for_row[...], dtype=xp.int64)
+        slot_idx = xp.asarray(self.radial_slot_index_for_row[...], dtype=xp.int64)
+        zonal = edge_cache.Dt_full[:, row_idx, col_idx]
+        radial_per_row = xp.take(radial_feat, slot_idx, axis=1)
+        message = zonal[..., None] * radial_per_row
+        non_scalar_out = xp.zeros(
+            (n_nodes, row_idx.shape[0], self.channels),
+            dtype=message.dtype,
+        )
+        non_scalar_out = xp_add_at(non_scalar_out, edge_cache.dst, message)
+        if hasattr(out, "at"):
+            out = out.at[:, row_idx, :].set(non_scalar_out)
+        else:
+            out[:, row_idx, :] = non_scalar_out
+        return out * edge_cache.inv_sqrt_deg
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "@class": "GeometricInitialEmbedding",
+            "@version": 1,
+            "config": {
+                "lmax": self.lmax,
+                "channels": self.channels,
+                "precision": self.precision,
+            },
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> "GeometricInitialEmbedding":
+        data = data.copy()
+        data_cls = data.pop("@class", None)
+        if data_cls != "GeometricInitialEmbedding":
+            raise ValueError(f"Invalid class for GeometricInitialEmbedding: {data_cls}")
+        check_version_compatibility(data.pop("@version", 1), 1, 1)
+        return cls(**data.pop("config"))
+
+
+class EnvironmentInitialEmbedding(NativeOP):
+    def __init__(
+        self,
+        *,
+        ntypes: int,
+        n_radial: int,
+        channels: int,
+        embed_dim: int = 64,
+        axis_dim: int = 8,
+        type_dim: int = 16,
+        hidden_dim: int = 64,
+        mlp_bias: bool = False,
+        activation_function: str = "silu",
+        eps: float = 1e-7,
+        precision: str = DEFAULT_PRECISION,
+        trainable: bool = True,
+        seed: int | list[int] | None = None,
+    ) -> None:
+        self.ntypes = int(ntypes)
+        self.n_radial = int(n_radial)
+        self.channels = int(channels)
+        self.embed_dim = int(embed_dim)
+        self.axis_dim = int(axis_dim)
+        self.type_dim = int(type_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.mlp_bias = bool(mlp_bias)
+        self.activation_function = str(activation_function)
+        self.eps = float(eps)
+        self.precision = precision
+        self.trainable = bool(trainable)
+        if self.axis_dim >= self.embed_dim:
+            raise ValueError("`axis_dim` must be < `embed_dim`")
+        self.rbf_out_dim = max(32, self.embed_dim - 2 * self.type_dim)
+
+        seed_rbf_proj = child_seed(seed, 0)
+        self.rbf_proj_layer1 = NativeLayer(
+            self.n_radial,
+            self.rbf_out_dim,
+            bias=self.mlp_bias,
+            activation_function=self.activation_function,
+            precision=self.precision,
+            trainable=self.trainable,
+            seed=child_seed(seed_rbf_proj, 0),
+        )
+        self.rbf_proj_layer2 = NativeLayer(
+            self.rbf_out_dim,
+            self.rbf_out_dim,
+            bias=self.mlp_bias,
+            activation_function=None,
+            precision=self.precision,
+            trainable=self.trainable,
+            seed=child_seed(seed_rbf_proj, 1),
+        )
+        self.env_type_embed = SeZMTypeEmbedding(
+            ntypes=self.ntypes,
+            embed_dim=self.type_dim,
+            precision=self.precision,
+            seed=child_seed(seed, 1),
+            trainable=self.trainable,
+        )
+        g_in_dim = self.rbf_out_dim + 2 * self.type_dim
+        seed_g_net = child_seed(seed, 2)
+        self.g_layer1 = NativeLayer(
+            g_in_dim,
+            self.hidden_dim,
+            bias=self.mlp_bias,
+            activation_function=self.activation_function,
+            precision=self.precision,
+            trainable=self.trainable,
+            seed=child_seed(seed_g_net, 0),
+        )
+        self.g_layer2 = NativeLayer(
+            self.hidden_dim,
+            self.embed_dim,
+            bias=self.mlp_bias,
+            activation_function=None,
+            precision=self.precision,
+            trainable=self.trainable,
+            seed=child_seed(seed_g_net, 1),
+        )
+        self.output_proj = NativeLayer(
+            self.embed_dim * self.axis_dim,
+            2 * self.channels,
+            bias=False,
+            activation_function=None,
+            precision=self.precision,
+            trainable=self.trainable,
+            seed=child_seed(seed, 3),
+        )
+        self.output_proj.w = np.zeros_like(self.output_proj.w)
+
+    def call(
+        self,
+        *,
+        edge_cache: EdgeFeatureCache,
+        atype_flat: Array,
+        n_nodes: int,
+    ) -> Array:
+        xp = array_api_compat.array_namespace(
+            edge_cache.edge_vec,
+            edge_cache.edge_rbf,
+            atype_flat,
+        )
+        edge_vec = edge_cache.edge_vec
+        edge_rbf = edge_cache.edge_rbf
+        edge_env = edge_cache.edge_env
+
+        r_sq = xp.sum(edge_vec * edge_vec, axis=-1, keepdims=True)
+        inv_r = 1.0 / xp.sqrt(r_sq + self.eps * self.eps)
+        s = edge_env * inv_r
+        r_hat = edge_vec * inv_r
+        r_tilde = xp.concat([s, s * r_hat], axis=-1)
+
+        atype_src = xp.take(atype_flat, edge_cache.src, axis=0)
+        atype_dst = xp.take(atype_flat, edge_cache.dst, axis=0)
+        type_src = self.env_type_embed(atype_src)
+        type_dst = self.env_type_embed(atype_dst)
+        rbf_proj = self.rbf_proj_layer2(self.rbf_proj_layer1(edge_rbf))
+        g_input = xp.concat([rbf_proj, type_src, type_dst], axis=-1)
+        g = self.g_layer2(self.g_layer1(g_input))
+
+        outer = xp.einsum("ei,ej->eij", r_tilde, g)
+        outer_flat = xp.reshape(outer, (outer.shape[0], 4 * self.embed_dim))
+        env_agg = xp.zeros(
+            (n_nodes, 4 * self.embed_dim),
+            dtype=outer_flat.dtype,
+        )
+        env_agg = xp_add_at(env_agg, edge_cache.dst, outer_flat)
+        env_agg = xp.reshape(env_agg, (n_nodes, 4, self.embed_dim))
+        env_agg = env_agg * edge_cache.inv_sqrt_deg
+        env_agg_t = xp.permute_dims(env_agg, (0, 2, 1))
+        env_agg_axis = env_agg[:, :, : self.axis_dim]
+        d_matrix = xp.matmul(env_agg_t, env_agg_axis)
+        d_flat = xp.reshape(d_matrix, (n_nodes, self.embed_dim * self.axis_dim))
+        return self.output_proj(d_flat)
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "@class": "EnvironmentInitialEmbedding",
+            "@version": 1,
+            "config": {
+                "ntypes": self.ntypes,
+                "n_radial": self.n_radial,
+                "channels": self.channels,
+                "embed_dim": self.embed_dim,
+                "axis_dim": self.axis_dim,
+                "type_dim": self.type_dim,
+                "hidden_dim": self.hidden_dim,
+                "mlp_bias": self.mlp_bias,
+                "activation_function": self.activation_function,
+                "eps": self.eps,
+                "precision": self.precision,
+                "trainable": self.trainable,
+                "seed": None,
+            },
+            "@variables": {
+                "rbf_proj_layer1": self.rbf_proj_layer1.serialize(),
+                "rbf_proj_layer2": self.rbf_proj_layer2.serialize(),
+                "env_type_embed": self.env_type_embed.serialize(),
+                "g_layer1": self.g_layer1.serialize(),
+                "g_layer2": self.g_layer2.serialize(),
+                "output_proj": self.output_proj.serialize(),
+            },
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> "EnvironmentInitialEmbedding":
+        data = data.copy()
+        data_cls = data.pop("@class", None)
+        if data_cls != "EnvironmentInitialEmbedding":
+            raise ValueError(f"Invalid class for EnvironmentInitialEmbedding: {data_cls}")
+        check_version_compatibility(data.pop("@version", 1), 1, 1)
+        config = data.pop("config")
+        variables = data.pop("@variables")
+        obj = cls(**config)
+        obj.rbf_proj_layer1 = NativeLayer.deserialize(variables["rbf_proj_layer1"])
+        obj.rbf_proj_layer2 = NativeLayer.deserialize(variables["rbf_proj_layer2"])
+        obj.env_type_embed = SeZMTypeEmbedding.deserialize(variables["env_type_embed"])
+        obj.g_layer1 = NativeLayer.deserialize(variables["g_layer1"])
+        obj.g_layer2 = NativeLayer.deserialize(variables["g_layer2"])
+        obj.output_proj = NativeLayer.deserialize(variables["output_proj"])
+        return obj
+
+
 def _normalize_bool_pair(value: bool | list[bool] | None, default: bool) -> list[bool]:
     if value is None:
         value = default
@@ -492,6 +763,22 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         self.radial_mlp = [self.channels if x == 0 else x for x in radial_mlp]
         self.use_env_seed = bool(use_env_seed)
         self.random_gamma = bool(random_gamma)
+        self.env_seed_embed_dim = min(self.channels, 128)
+        self.env_seed_type_dim = min(32, max(8, self.channels // 4))
+        axis_dim = 4 if self.env_seed_embed_dim < 64 else 8
+        self.env_seed_axis_dim = min(
+            axis_dim,
+            max(1, self.env_seed_embed_dim - 1),
+        )
+        rbf_out_dim = max(
+            32,
+            self.env_seed_embed_dim - 2 * self.env_seed_type_dim,
+        )
+        g_in_dim = rbf_out_dim + 2 * self.env_seed_type_dim
+        self.env_seed_hidden_dim = min(
+            256,
+            max(2 * self.env_seed_embed_dim, g_in_dim),
+        )
         self.lmax = int(lmax)
         self.n_blocks = int(n_blocks)
         self.l_schedule = (
@@ -599,6 +886,59 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             lmax=self.l_schedule[0],
             eps=self.eps,
             precision=self.precision,
+        )
+        if self.use_env_seed:
+            self.env_seed_embedding = EnvironmentInitialEmbedding(
+                ntypes=self.ntypes,
+                n_radial=self.n_radial,
+                channels=self.channels,
+                embed_dim=self.env_seed_embed_dim,
+                axis_dim=self.env_seed_axis_dim,
+                type_dim=self.env_seed_type_dim,
+                hidden_dim=self.env_seed_hidden_dim,
+                mlp_bias=self.mlp_bias,
+                activation_function=self.activation_function,
+                eps=self.eps,
+                precision=self.precision,
+                trainable=self.trainable,
+                seed=child_seed(self.seed, 4),
+            )
+            self.film_scale_norm = RMSNorm(
+                channels=self.channels,
+                eps=self.eps,
+                precision=self.precision,
+                trainable=self.trainable,
+            )
+            self.film_shift_norm = RMSNorm(
+                channels=self.channels,
+                eps=self.eps,
+                precision=self.precision,
+                trainable=self.trainable,
+            )
+            dtype = PRECISION_DICT[self.precision.lower()]
+            self.film_scale_strength_log = np.asarray(
+                [math.log(0.01)],
+                dtype=dtype,
+            )
+            self.film_shift_strength_log = np.asarray(
+                [math.log(0.01)],
+                dtype=dtype,
+            )
+        else:
+            self.env_seed_embedding = None
+            self.film_scale_norm = None
+            self.film_shift_norm = None
+            self.film_scale_strength_log = None
+            self.film_shift_strength_log = None
+        self.use_gie = self.use_env_seed and self.l_schedule[0] > 0
+        self.gie = (
+            GeometricInitialEmbedding(
+                lmax=self.l_schedule[0],
+                channels=self.channels,
+                precision=self.precision,
+            )
+            if self.use_gie
+            else None
         )
         self.block_ffn_neurons = self._resolve_ffn_neurons(
             self.ffn_neurons,
@@ -714,8 +1054,6 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
 
     def _unsupported_forward_features(self) -> list[str]:
         unsupported = {
-            "random_gamma": self.random_gamma,
-            "use_env_seed": self.use_env_seed,
             "atten_f_mix": self.atten_f_mix,
             "atten_v_proj": self.atten_v_proj,
             "atten_o_proj": self.atten_o_proj,
@@ -911,15 +1249,17 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         )
 
     def _build_edge_wigner(self, edge_vec: Array, edge_len: Array) -> tuple[Array, Array]:
-        if self.random_gamma:
-            raise NotImplementedError(
-                "JAX SeZM random_gamma needs a PRNG key and is not wired yet."
-            )
         edge_quat = build_edge_quaternion(
             edge_vec,
             edge_len=edge_len,
             eps=self.eps,
         )
+        if self.random_gamma:
+            xp = array_api_compat.array_namespace(edge_quat)
+            edge_index = xp.arange(edge_quat.shape[0], dtype=edge_quat.dtype)
+            raw = xp.sin(edge_index * 12.9898 + 78.233) * 43758.5453
+            gamma = (raw - xp.floor(raw)) * (2.0 * math.pi)
+            edge_quat = quaternion_multiply(quaternion_z_rotation(gamma), edge_quat)
         return self.wigner_calc(edge_quat)
 
     def call(
@@ -954,11 +1294,30 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             include_wigner=True,
         )
         ebed_dim_0 = get_so3_dim_of_lmax(self.l_schedule[0])
+        x0_out = type_feat
+        radial_feat_for_gie = None
+        if self.use_env_seed and edge_cache.src.shape[0] > 0:
+            atype_flat = xp.reshape(atype_loc, (n_nodes,))
+            film = self.env_seed_embedding(
+                edge_cache=edge_cache,
+                atype_flat=atype_flat,
+                n_nodes=n_nodes,
+            )
+            scale_logits = film[:, : self.channels]
+            shift_logits = film[:, self.channels :]
+            scale_hat = self.film_scale_norm(scale_logits)
+            shift_hat = self.film_shift_norm(shift_logits)
+            scale_strength = xp.exp(self.film_scale_strength_log[...])
+            shift_strength = xp.exp(self.film_shift_strength_log[...])
+            scale = 1.0 + scale_strength * xp.tanh(scale_hat)
+            shift = shift_strength * xp.tanh(shift_hat)
+            x0_out = type_feat * scale + shift
+
         x = xp.zeros(
             (n_nodes, ebed_dim_0, 1, self.channels),
             dtype=type_feat.dtype,
         )
-        x = _set_l0_features(x, type_feat)
+        x = _set_l0_features(x, x0_out)
 
         radial_feat_flat = self.radial_embedding(edge_cache.edge_rbf)
         radial_feat = xp.reshape(
@@ -966,10 +1325,21 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             (edge_cache.edge_rbf.shape[0], self.lmax + 1, self.channels),
         )
         radial_feat = radial_feat * xp.expand_dims(edge_cache.edge_env, axis=-1)
+        radial_feat_for_gie = radial_feat
         radial_feat = radial_feat + xp.expand_dims(edge_cache.edge_type_feat, axis=1)
         radial_feat_per_block = [
             radial_feat[:, : ll + 1, :] for ll in self.l_schedule
         ]
+
+        if self.use_gie and radial_feat_for_gie is not None:
+            x = x + xp.expand_dims(
+                self.gie(
+                    n_nodes=n_nodes,
+                    edge_cache=edge_cache,
+                    radial_feat=radial_feat_for_gie[:, 1:, :],
+                ),
+                axis=2,
+            )
 
         if edge_cache.src.shape[0] > 0:
             for block, block_radial in zip(
@@ -1049,6 +1419,32 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
                 "edge_envelope": self.edge_envelope.serialize(),
                 "radial_embedding": self.radial_embedding.serialize(),
                 "wigner_calc": self.wigner_calc.serialize(),
+                "env_seed_embedding": (
+                    None
+                    if self.env_seed_embedding is None
+                    else self.env_seed_embedding.serialize()
+                ),
+                "film_scale_norm": (
+                    None
+                    if self.film_scale_norm is None
+                    else self.film_scale_norm.serialize()
+                ),
+                "film_shift_norm": (
+                    None
+                    if self.film_shift_norm is None
+                    else self.film_shift_norm.serialize()
+                ),
+                "film_scale_strength_log": to_numpy_array(
+                    None
+                    if self.film_scale_strength_log is None
+                    else self.film_scale_strength_log[...]
+                ),
+                "film_shift_strength_log": to_numpy_array(
+                    None
+                    if self.film_shift_strength_log is None
+                    else self.film_shift_strength_log[...]
+                ),
+                "gie": None if self.gie is None else self.gie.serialize(),
                 "blocks": [block.serialize() for block in self.blocks],
                 "output_ffn": (
                     None if self.output_ffn is None else self.output_ffn.serialize()
@@ -1083,6 +1479,20 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             obj.radial_embedding = RadialMLP.deserialize(variables["radial_embedding"])
         if "wigner_calc" in variables:
             obj.wigner_calc = WignerDCalculator.deserialize(variables["wigner_calc"])
+        if "env_seed_embedding" in variables and variables["env_seed_embedding"] is not None:
+            obj.env_seed_embedding = EnvironmentInitialEmbedding.deserialize(
+                variables["env_seed_embedding"]
+            )
+        if "film_scale_norm" in variables and variables["film_scale_norm"] is not None:
+            obj.film_scale_norm = RMSNorm.deserialize(variables["film_scale_norm"])
+        if "film_shift_norm" in variables and variables["film_shift_norm"] is not None:
+            obj.film_shift_norm = RMSNorm.deserialize(variables["film_shift_norm"])
+        if "film_scale_strength_log" in variables:
+            obj.film_scale_strength_log = variables["film_scale_strength_log"]
+        if "film_shift_strength_log" in variables:
+            obj.film_shift_strength_log = variables["film_shift_strength_log"]
+        if "gie" in variables and variables["gie"] is not None:
+            obj.gie = GeometricInitialEmbedding.deserialize(variables["gie"])
         if "blocks" in variables:
             obj.blocks = [
                 SeZMInteractionBlock.deserialize(block) for block in variables["blocks"]
