@@ -1141,6 +1141,15 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
     def get_stat_mean_and_stddev(self) -> tuple[Array, Array]:
         return self.mean, self.stddev
 
+    def compute_input_stats(
+        self,
+        merged: Any,
+        path: Any | None = None,
+    ) -> None:
+        # SeZM uses internal equivariant normalization; descriptor mean/stddev
+        # are kept only for interface compatibility and checkpoint schema.
+        return None
+
     @classmethod
     def update_sel(
         cls,
