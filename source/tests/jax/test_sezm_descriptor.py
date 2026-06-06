@@ -36,6 +36,9 @@ from deepmd.dpmodel.descriptor.sezm_indexing import (
     get_so3_dim_of_lmax,
     map_degree_idx,
 )
+from deepmd.dpmodel.model.transform_output import (
+    communicate_extended_output,
+)
 from deepmd.jax.descriptor.sezm_so3 import (
     ChannelLinear,
     FocusLinear,
@@ -801,6 +804,63 @@ class TestSeZMDescriptor(unittest.TestCase):
         )
         self.assertIsInstance(model.atomic_model.descriptor, DescrptSeZM)
         self.assertIsInstance(model.atomic_model.fitting_net, SeZMEnergyFittingNet)
+
+    def test_sezm_model_hessian_lower_smoke(self) -> None:
+        model = get_model(
+            {
+                "type": "SeZM",
+                "type_map": ["H", "O"],
+                "descriptor": {
+                    "type": "SeZM",
+                    "sel": 2,
+                    "rcut": 6.0,
+                    "channels": 2,
+                    "n_radial": 2,
+                    "radial_mlp": [0],
+                    "use_env_seed": True,
+                    "random_gamma": True,
+                    "lmax": 3,
+                    "mmax": 1,
+                    "n_blocks": 1,
+                    "so2_layers": 1,
+                    "radial_so2_mode": "degree_channel",
+                    "radial_so2_rank": 1,
+                    "n_focus": 1,
+                    "n_atten_head": 0,
+                    "ffn_neurons": 1,
+                    "ffn_blocks": 1,
+                    "sandwich_norm": [False, False, False, False],
+                    "s2_activation": [False, False],
+                    "lebedev_quadrature": [False, False],
+                    "precision": "float32",
+                    "seed": 42,
+                },
+                "fitting_net": {
+                    "neuron": [0],
+                    "activation_function": "silu",
+                    "precision": "float32",
+                    "seed": 42,
+                },
+            }
+        )
+        model.enable_hessian()
+        coord = jnp.asarray(
+            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]],
+            dtype=jnp.float32,
+        )
+        atype = jnp.asarray([[0, 1]], dtype=jnp.int64)
+        nlist = jnp.asarray([[[1, -1], [0, -1]]], dtype=jnp.int64)
+        mapping = jnp.asarray([[0, 1]], dtype=jnp.int64)
+        lower = model.call_common_lower(coord, atype, nlist, mapping)
+        model_dict = communicate_extended_output(
+            lower,
+            model.model_output_def(),
+            mapping,
+            do_atomic_virial=False,
+        )
+        hessian = model_dict["energy_derv_r_derv_r"]
+        self.assertEqual(hessian.shape, (1, 1, 6, 6))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(hessian))))
 
     def test_unsupported_paths_are_explicit(self) -> None:
         with self.assertRaisesRegex(NotImplementedError, "grid_mlp"):
