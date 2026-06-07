@@ -66,6 +66,287 @@ def _freeze_static_arrays(value: Any) -> Any:
     return value
 
 
+def _pt_value(value: Any) -> Any:
+    arr = np.asarray(value)
+    if arr.ndim > 1 and arr.shape[0] == 1:
+        return np.squeeze(arr, axis=0)
+    return value
+
+
+def _set_native_layer_from_pt(layer: Any, variables: dict[str, Any], prefix: str) -> None:
+    if f"{prefix}.matrix" in variables:
+        layer.w = variables[f"{prefix}.matrix"]
+    if f"{prefix}.bias" in variables:
+        layer.b = variables[f"{prefix}.bias"]
+    if f"{prefix}.idt" in variables:
+        layer.idt = variables[f"{prefix}.idt"]
+
+
+def _set_channel_linear_from_pt(
+    layer: Any, variables: dict[str, Any], prefix: str
+) -> None:
+    if f"{prefix}.weight" in variables:
+        layer.weight = variables[f"{prefix}.weight"]
+    if f"{prefix}.bias" in variables:
+        layer.bias = variables[f"{prefix}.bias"]
+
+
+def _apply_pt_radial_embedding_state(
+    radial_embedding: Any, variables: dict[str, Any]
+) -> None:
+    layer_idx = 0
+    norm_idx = 0
+    for key in sorted(variables):
+        if not key.startswith("radial_embedding.net."):
+            continue
+        parts = key.split(".")
+        if len(parts) < 4:
+            continue
+        module_idx = parts[2]
+        if parts[3] == "matrix":
+            _set_native_layer_from_pt(
+                radial_embedding.layers[layer_idx],
+                variables,
+                f"radial_embedding.net.{module_idx}",
+            )
+            layer_idx += 1
+        elif parts[3] == "adam_scale":
+            radial_embedding.norms[norm_idx].scale = _pt_value(variables[key])
+            norm_idx += 1
+
+
+def _apply_pt_env_seed_state(
+    env_seed_embedding: Any, variables: dict[str, Any]
+) -> None:
+    prefix = "env_seed_embedding."
+    if f"{prefix}env_type_embed.adam_type_embedding" in variables:
+        env_seed_embedding.env_type_embed.embedding = variables[
+            f"{prefix}env_type_embed.adam_type_embedding"
+        ]
+    for name in (
+        "rbf_proj_layer1",
+        "rbf_proj_layer2",
+        "g_layer1",
+        "g_layer2",
+        "output_proj",
+    ):
+        _set_native_layer_from_pt(
+            getattr(env_seed_embedding, name),
+            variables,
+            f"{prefix}{name}",
+        )
+
+
+def _apply_pt_so3_linear_state(
+    layer: Any, variables: dict[str, Any], prefix: str
+) -> None:
+    if f"{prefix}.weight" in variables:
+        layer.weight = variables[f"{prefix}.weight"]
+    if f"{prefix}.bias" in variables:
+        layer.bias = variables[f"{prefix}.bias"]
+    if f"{prefix}.expand_index" in variables:
+        layer.expand_index = variables[f"{prefix}.expand_index"]
+
+
+def _apply_pt_gated_activation_state(
+    act: Any, variables: dict[str, Any], prefix: str
+) -> None:
+    if f"{prefix}.expand_index" in variables:
+        act.expand_index = variables[f"{prefix}.expand_index"]
+    if hasattr(act, "gate_linear") and act.gate_linear is not None:
+        _set_channel_linear_from_pt(act.gate_linear, variables, f"{prefix}.gate_linear")
+
+
+def _apply_pt_ffn_state(ffn: Any, variables: dict[str, Any], prefix: str) -> None:
+    _apply_pt_so3_linear_state(ffn.so3_linear_1, variables, f"{prefix}.so3_linear_1")
+    _apply_pt_so3_linear_state(ffn.so3_linear_2, variables, f"{prefix}.so3_linear_2")
+    if f"{prefix}.act.scalar_gate.weight" in variables and hasattr(
+        ffn.act, "scalar_gate"
+    ):
+        _set_channel_linear_from_pt(
+            ffn.act.scalar_gate,
+            variables,
+            f"{prefix}.act.scalar_gate",
+        )
+    if hasattr(ffn.act, "projector") and ffn.act.projector is not None:
+        if f"{prefix}.act.projector.to_grid_mat" in variables:
+            ffn.act.projector.to_grid_mat = variables[
+                f"{prefix}.act.projector.to_grid_mat"
+            ]
+        if f"{prefix}.act.projector.from_grid_mat" in variables:
+            ffn.act.projector.from_grid_mat = variables[
+                f"{prefix}.act.projector.from_grid_mat"
+            ]
+    if hasattr(ffn.act, "gate_linear"):
+        _apply_pt_gated_activation_state(ffn.act, variables, f"{prefix}.act")
+
+
+def _apply_pt_equivariant_norm_state(
+    norm: Any | None, variables: dict[str, Any], prefix: str
+) -> None:
+    if norm is None:
+        return
+    for name in ("adam_scale", "bias", "expand_index", "balance_weight"):
+        key = f"{prefix}.{name}"
+        if key in variables:
+            setattr(norm, name, variables[key])
+
+
+def _apply_pt_scalar_norm_state(
+    norm: Any | None, variables: dict[str, Any], prefix: str
+) -> None:
+    if norm is None:
+        return
+    if f"{prefix}.adam_scale" in variables:
+        norm.adam_scale = variables[f"{prefix}.adam_scale"]
+
+
+def _apply_pt_so2_linear_state(
+    layer: Any, variables: dict[str, Any], prefix: str
+) -> None:
+    if f"{prefix}.weight_m0" in variables:
+        layer.weight_m0 = variables[f"{prefix}.weight_m0"]
+    if f"{prefix}.bias0" in variables:
+        layer.bias0 = variables[f"{prefix}.bias0"]
+    for name in ("m0_idx", "pos_indices", "neg_indices"):
+        key = f"{prefix}.{name}"
+        if key in variables:
+            setattr(layer, name, variables[key])
+    weights = []
+    for idx in range(layer.mmax):
+        key = f"{prefix}.weight_m.{idx}"
+        if key in variables:
+            weights.append(variables[key])
+    if weights:
+        layer.weight_m = weights
+
+
+def _apply_pt_radial_degree_mixer_state(
+    mixer: Any | None, variables: dict[str, Any], prefix: str
+) -> None:
+    if mixer is None:
+        return
+    for name in (
+        "weight",
+        "channel_basis",
+        "kernel_compact_index",
+        "kernel_dense_index",
+    ):
+        key = f"{prefix}.{name}"
+        if key in variables:
+            setattr(mixer, name, variables[key])
+
+
+def _apply_pt_so2_conv_state(
+    conv: Any, variables: dict[str, Any], prefix: str
+) -> None:
+    for name in ("coeff_index_m", "degree_index_m", "rotate_inv_rescale_full"):
+        key = f"{prefix}.{name}"
+        if key in variables:
+            setattr(conv, name, variables[key])
+    for idx, layer in enumerate(conv.so2_linears):
+        _apply_pt_so2_linear_state(layer, variables, f"{prefix}.so2_linears.{idx}")
+    for idx, act in enumerate(conv.non_linearities):
+        if act is not None:
+            _apply_pt_gated_activation_state(
+                act,
+                variables,
+                f"{prefix}.non_linearities.{idx}",
+            )
+    if conv.radial_hidden_proj is not None:
+        _set_channel_linear_from_pt(
+            conv.radial_hidden_proj,
+            variables,
+            f"{prefix}.radial_hidden_proj",
+        )
+    _apply_pt_radial_degree_mixer_state(
+        conv.radial_degree_mixer,
+        variables,
+        f"{prefix}.radial_degree_mixer",
+    )
+    _apply_pt_scalar_norm_state(conv.attn_qk_norm, variables, f"{prefix}.attn_qk_norm")
+    _apply_pt_scalar_norm_state(
+        conv.attn_output_gate_norm,
+        variables,
+        f"{prefix}.attn_output_gate_norm",
+    )
+    if conv.attn_q_proj is not None:
+        _set_channel_linear_from_pt(conv.attn_q_proj, variables, f"{prefix}.attn_q_proj")
+    if conv.attn_k_proj is not None:
+        _set_channel_linear_from_pt(conv.attn_k_proj, variables, f"{prefix}.attn_k_proj")
+    if f"{prefix}.adamw_attn_logit_w" in variables:
+        conv.attn_logit_w = variables[f"{prefix}.adamw_attn_logit_w"]
+    if f"{prefix}.adamw_attn_z_bias_raw" in variables:
+        conv.attn_z_bias_raw = variables[f"{prefix}.adamw_attn_z_bias_raw"]
+    if f"{prefix}.adamw_attn_gate_w" in variables:
+        conv.attn_gate_w = variables[f"{prefix}.adamw_attn_gate_w"]
+    _apply_pt_so3_linear_state(conv.pre_focus_mix, variables, f"{prefix}.pre_focus_mix")
+    _apply_pt_so3_linear_state(
+        conv.post_focus_mix,
+        variables,
+        f"{prefix}.post_focus_mix",
+    )
+
+
+def _apply_pt_block_state(block: Any, variables: dict[str, Any], prefix: str) -> None:
+    _apply_pt_equivariant_norm_state(
+        block.pre_so2_norm,
+        variables,
+        f"{prefix}.pre_so2_norm",
+    )
+    _apply_pt_equivariant_norm_state(
+        block.post_so2_norm,
+        variables,
+        f"{prefix}.post_so2_norm",
+    )
+    _apply_pt_so2_conv_state(block.so2_conv, variables, f"{prefix}.so2_conv")
+    for idx, norm in enumerate(block.pre_ffn_norms):
+        _apply_pt_equivariant_norm_state(
+            norm,
+            variables,
+            f"{prefix}.pre_ffn_norms.{idx}",
+        )
+    for idx, norm in enumerate(block.post_ffn_norms):
+        _apply_pt_equivariant_norm_state(
+            norm,
+            variables,
+            f"{prefix}.post_ffn_norms.{idx}",
+        )
+    for idx, ffn in enumerate(block.ffns):
+        _apply_pt_ffn_state(ffn, variables, f"{prefix}.ffns.{idx}")
+
+
+def _apply_pt_flat_descriptor_state(obj: Any, variables: dict[str, Any]) -> None:
+    if "type_embedding.adam_type_embedding" in variables:
+        obj.type_embedding.embedding = variables["type_embedding.adam_type_embedding"]
+    if "radial_basis.adam_freqs" in variables:
+        obj.radial_basis.freqs = variables["radial_basis.adam_freqs"]
+    _apply_pt_radial_embedding_state(obj.radial_embedding, variables)
+    if obj.env_seed_embedding is not None:
+        _apply_pt_env_seed_state(obj.env_seed_embedding, variables)
+    if obj.film_scale_norm is not None and "film_scale_norm.adam_scale" in variables:
+        obj.film_scale_norm.scale = _pt_value(variables["film_scale_norm.adam_scale"])
+    if obj.film_shift_norm is not None and "film_shift_norm.adam_scale" in variables:
+        obj.film_shift_norm.scale = _pt_value(variables["film_shift_norm.adam_scale"])
+    if "film_scale_strength_log" in variables:
+        obj.film_scale_strength_log = variables["film_scale_strength_log"]
+    if "film_shift_strength_log" in variables:
+        obj.film_shift_strength_log = variables["film_shift_strength_log"]
+    if obj.gie is not None:
+        for name in (
+            "non_scalar_row_index",
+            "zonal_m0_col_index_for_row",
+            "radial_slot_index_for_row",
+        ):
+            key = f"gie.{name}"
+            if key in variables:
+                setattr(obj.gie, name, variables[key])
+    if obj.output_ffn is not None:
+        _apply_pt_ffn_state(obj.output_ffn, variables, "output_ffn")
+    for idx, block in enumerate(obj.blocks):
+        _apply_pt_block_state(block, variables, f"blocks.{idx}")
+
+
 @flax_module
 class SeZMTypeEmbedding(SeZMTypeEmbeddingDP):
     def __setattr__(self, name: str, value: Any) -> None:
@@ -234,3 +515,11 @@ class DescrptSeZM(DescrptSeZMDP):
             if not isinstance(value, EquivariantFFN):
                 value = EquivariantFFN.deserialize(value.serialize())
         return super().__setattr__(name, value)
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> "DescrptSeZM":
+        obj = super().deserialize(data)
+        variables = data.get("@variables", {})
+        if "type_embedding.adam_type_embedding" in variables:
+            _apply_pt_flat_descriptor_state(obj, variables)
+        return obj

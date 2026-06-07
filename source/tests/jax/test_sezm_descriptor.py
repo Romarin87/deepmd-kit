@@ -866,6 +866,146 @@ class TestSeZMDescriptor(unittest.TestCase):
         self.assertIsInstance(restored_pt_style, SeZMModel)
         self.assertIsInstance(restored_pt_style.atomic_model, SeZMAtomicModel)
 
+    def test_deserializes_pytorch_flat_descriptor_state(self) -> None:
+        model = get_model(
+            {
+                "type": "SeZM",
+                "type_map": ["H", "C", "O"],
+                "descriptor": {
+                    "type": "SeZM",
+                    "sel": 416,
+                    "rcut": 6.0,
+                    "channels": 32,
+                    "n_blocks": 2,
+                    "so2_layers": 3,
+                    "n_focus": 2,
+                    "ffn_blocks": 2,
+                    "precision": "float32",
+                    "seed": 42,
+                },
+                "fitting_net": {
+                    "neuron": [0],
+                    "activation_function": "silu",
+                    "precision": "float32",
+                    "seed": 42,
+                },
+            }
+        )
+        pt_style = deepcopy(model.serialize())
+        variables = pt_style["atomic_model"]["descriptor"]["@variables"]
+
+        def shifted(value, amount=0.25):
+            return np.asarray(value) + amount
+
+        flat = {}
+        type_vars = variables["type_embedding"]["@variables"]
+        flat["type_embedding.adam_type_embedding"] = shifted(type_vars["embedding"])
+        radial_basis_vars = variables["radial_basis"]["@variables"]
+        flat["radial_basis.adam_freqs"] = shifted(radial_basis_vars["freqs"])
+        radial_embedding_vars = variables["radial_embedding"]
+        flat["radial_embedding.net.0.matrix"] = shifted(
+            radial_embedding_vars["layers"][0]["@variables"]["w"]
+        )
+        flat["radial_embedding.net.1.adam_scale"] = shifted(
+            radial_embedding_vars["norms"][0]["@variables"]["scale"]
+        )
+        env_vars = variables["env_seed_embedding"]["@variables"]
+        flat["env_seed_embedding.env_type_embed.adam_type_embedding"] = shifted(
+            env_vars["env_type_embed"]["@variables"]["embedding"]
+        )
+        flat["env_seed_embedding.rbf_proj_layer1.matrix"] = shifted(
+            env_vars["rbf_proj_layer1"]["@variables"]["w"]
+        )
+
+        block_vars = variables["blocks"][0]["@variables"]
+        so2_vars = block_vars["so2_conv"]["@variables"]
+        flat["blocks.0.so2_conv.so2_linears.0.weight_m0"] = shifted(
+            so2_vars["so2_linears"][0]["@variables"]["weight_m0"]
+        )
+        flat["blocks.0.so2_conv.non_linearities.0.gate_linear.weight"] = shifted(
+            so2_vars["non_linearities"][0]["@variables"]["gate_linear"][
+                "@variables"
+            ]["weight"]
+        )
+        flat["blocks.0.so2_conv.radial_degree_mixer.weight"] = shifted(
+            so2_vars["radial_degree_mixer"]["@variables"]["weight"]
+        )
+        ffn_vars = block_vars["ffns"][0]["@variables"]
+        flat["blocks.0.ffns.0.so3_linear_1.weight"] = shifted(
+            ffn_vars["so3_linear_1"]["@variables"]["weight"]
+        )
+        flat["blocks.0.ffns.0.act.scalar_gate.weight"] = shifted(
+            ffn_vars["act"]["@variables"]["scalar_gate"]["@variables"]["weight"]
+        )
+        flat["blocks.0.ffns.0.act.projector.to_grid_mat"] = shifted(
+            ffn_vars["act"]["@variables"]["projector"]["@variables"]["to_grid_mat"]
+        )
+        output_vars = variables["output_ffn"]["@variables"]
+        flat["output_ffn.so3_linear_1.weight"] = shifted(
+            output_vars["so3_linear_1"]["@variables"]["weight"]
+        )
+        variables.update(flat)
+
+        restored = BaseModel.deserialize(pt_style)
+        descriptor = restored.atomic_model.descriptor
+
+        np.testing.assert_allclose(
+            np.asarray(descriptor.type_embedding.embedding),
+            flat["type_embedding.adam_type_embedding"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(descriptor.radial_basis.freqs),
+            flat["radial_basis.adam_freqs"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(descriptor.radial_embedding.layers[0].w),
+            flat["radial_embedding.net.0.matrix"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(descriptor.radial_embedding.norms[0].scale),
+            flat["radial_embedding.net.1.adam_scale"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(descriptor.env_seed_embedding.env_type_embed.embedding),
+            flat["env_seed_embedding.env_type_embed.adam_type_embedding"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(descriptor.env_seed_embedding.rbf_proj_layer1.w),
+            flat["env_seed_embedding.rbf_proj_layer1.matrix"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(descriptor.blocks[0].so2_conv.so2_linears[0].weight_m0),
+            flat["blocks.0.so2_conv.so2_linears.0.weight_m0"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(
+                descriptor.blocks[0]
+                .so2_conv.non_linearities[0]
+                .gate_linear.weight
+            ),
+            flat["blocks.0.so2_conv.non_linearities.0.gate_linear.weight"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(descriptor.blocks[0].so2_conv.radial_degree_mixer.weight),
+            flat["blocks.0.so2_conv.radial_degree_mixer.weight"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(descriptor.blocks[0].ffns[0].so3_linear_1.weight),
+            flat["blocks.0.ffns.0.so3_linear_1.weight"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(descriptor.blocks[0].ffns[0].act.scalar_gate.weight),
+            flat["blocks.0.ffns.0.act.scalar_gate.weight"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(descriptor.blocks[0].ffns[0].act.projector.to_grid_mat),
+            flat["blocks.0.ffns.0.act.projector.to_grid_mat"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(descriptor.output_ffn.so3_linear_1.weight),
+            flat["output_ffn.so3_linear_1.weight"],
+        )
+
     def test_sezm_model_hessian_lower_smoke(self) -> None:
         model = get_model(
             {
