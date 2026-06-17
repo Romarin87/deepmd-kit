@@ -18,4 +18,7 @@ from deepmd.jax.descriptor.base_descriptor import (
 @BaseDescriptor.register("dpa4")
 @flax_module
 class DescrptDPA4(DescrptDPA4DP):
-    pass
+    _jax_skip_auto_convert_attrs = {
+        "wigner_calc",
+        "gie_zonal_wigner_calc",
+    }
