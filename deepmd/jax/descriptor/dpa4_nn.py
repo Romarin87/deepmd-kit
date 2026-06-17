@@ -4,12 +4,18 @@ from typing import (
     ClassVar,
 )
 
+from deepmd.dpmodel.descriptor.dpa4_nn.activation import SwiGLU as SwiGLUDP
 from deepmd.dpmodel.descriptor.dpa4_nn.radial import RadialMLP as RadialMLPDP
 from deepmd.dpmodel.descriptor.dpa4_nn.so2 import SO2Linear as SO2LinearDP
 from deepmd.jax.common import (
     flax_module,
     register_dpmodel_mapping,
 )
+
+
+@flax_module
+class SwiGLU(SwiGLUDP):
+    pass
 
 
 @flax_module
@@ -35,6 +41,11 @@ class SO2Linear(SO2LinearDP):
         super().__init__(*args, **kwargs)
         self.weight_m = list(self.weight_m)
 
+
+register_dpmodel_mapping(
+    SwiGLUDP,
+    lambda v: SwiGLU(),
+)
 
 register_dpmodel_mapping(
     RadialMLPDP,
