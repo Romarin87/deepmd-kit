@@ -641,9 +641,11 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         )
 
         # === Statistics buffers (interface compatibility, unused in call) ===
+        # Orbax cannot checkpoint zero-size JAX arrays, so the dpmodel/JAX
+        # placeholder uses one element while the PT-only SeZM buffer remains empty.
         model_np_prec = PRECISION_DICT[self.precision]
-        self.mean = np.zeros((0,), dtype=model_np_prec)
-        self.stddev = np.ones((0,), dtype=model_np_prec)
+        self.mean = np.zeros((1,), dtype=model_np_prec)
+        self.stddev = np.ones((1,), dtype=model_np_prec)
 
     # =========================================================================
     # Construction helpers (mirroring pt)
