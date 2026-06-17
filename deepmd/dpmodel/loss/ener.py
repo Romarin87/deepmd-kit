@@ -594,3 +594,113 @@ class EnergyLoss(Loss):
         if version < 3:
             data.setdefault("intensive_ener_virial", False)
         return cls(**data)
+
+
+class EnergyHessianLoss(EnergyLoss):
+    r"""Energy loss with an additional conservative Hessian term."""
+
+    def __init__(
+        self,
+        starter_learning_rate: float,
+        start_pref_h: float = 0.0,
+        limit_pref_h: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(starter_learning_rate=starter_learning_rate, **kwargs)
+        self.start_pref_h = start_pref_h
+        self.limit_pref_h = limit_pref_h
+        self.has_h = self.start_pref_h != 0.0 or self.limit_pref_h != 0.0
+
+    def call(
+        self,
+        learning_rate: float,
+        natoms: int,
+        model_dict: dict[str, Array],
+        label_dict: dict[str, Array],
+        mae: bool = False,
+    ) -> tuple[Array, dict[str, Array]]:
+        """Calculate energy/force/virial plus Hessian loss."""
+        loss, more_loss = super().call(
+            learning_rate=learning_rate,
+            natoms=natoms,
+            model_dict=model_dict,
+            label_dict=label_dict,
+            mae=mae,
+        )
+        if self.has_h and "hessian" in model_dict and "hessian" in label_dict:
+            hessian = model_dict["hessian"]
+            hessian_hat = label_dict["hessian"]
+            find_hessian = label_dict.get("find_hessian", 0.0)
+            xp = array_api_compat.array_namespace(hessian, hessian_hat)
+            lr_ratio = learning_rate / self.starter_learning_rate
+            pref_h = find_hessian * (
+                self.limit_pref_h + (self.start_pref_h - self.limit_pref_h) * lr_ratio
+            )
+            hessian_reshape = xp.reshape(hessian, (-1,))
+            hessian_hat_reshape = xp.reshape(hessian_hat, (-1,))
+            diff_h = hessian_hat_reshape - hessian_reshape
+            if self.loss_func == "mse":
+                l2_hessian_loss = xp.mean(xp.square(diff_h))
+                loss += pref_h * l2_hessian_loss
+                more_loss["rmse_h"] = self.display_if_exist(
+                    xp.sqrt(l2_hessian_loss), find_hessian
+                )
+            elif self.loss_func == "mae":
+                l1_hessian_loss = xp.mean(xp.abs(diff_h))
+                loss += pref_h * l1_hessian_loss
+                more_loss["mae_h"] = self.display_if_exist(
+                    l1_hessian_loss, find_hessian
+                )
+            else:
+                raise NotImplementedError(
+                    f"Loss type {self.loss_func} is not implemented for hessian loss."
+                )
+            if mae:
+                mae_h = xp.mean(xp.abs(diff_h))
+                more_loss["mae_h"] = self.display_if_exist(mae_h, find_hessian)
+
+        more_loss.pop("rmse", None)
+        xp = array_api_compat.array_namespace(loss)
+        more_loss["rmse"] = xp.sqrt(loss)
+        self.l2_l = loss
+        self.l2_more = more_loss
+        return loss, more_loss
+
+    @property
+    def label_requirement(self) -> list[DataRequirementItem]:
+        """Return data label requirements needed for this loss calculation."""
+        label_requirement = super().label_requirement
+        if self.has_h:
+            label_requirement.append(
+                DataRequirementItem(
+                    "hessian",
+                    ndof=1,
+                    atomic=False,
+                    must=False,
+                    high_prec=False,
+                )
+            )
+        return label_requirement
+
+    def serialize(self) -> dict:
+        """Serialize the loss module."""
+        data = super().serialize()
+        data.update(
+            {
+                "@class": "EnergyHessianLoss",
+                "start_pref_h": self.start_pref_h,
+                "limit_pref_h": self.limit_pref_h,
+            }
+        )
+        return data
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "Loss":
+        """Deserialize the loss module."""
+        data = data.copy()
+        version = data.pop("@version")
+        check_version_compatibility(version, 4, 1)
+        data.pop("@class")
+        if version < 3:
+            data.setdefault("intensive_ener_virial", False)
+        return cls(**data)

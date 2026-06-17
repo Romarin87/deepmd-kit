@@ -22,13 +22,17 @@ from packaging.version import (
 )
 
 from deepmd.dpmodel.loss.ener import (
+    EnergyHessianLoss,
     EnergyLoss,
 )
 from deepmd.dpmodel.model.transform_output import (
     communicate_extended_output,
 )
 from deepmd.dpmodel.utils.learning_rate import (
-    LearningRateExp,
+    BaseLR,
+)
+from deepmd.dpmodel.utils.training_utils import (
+    compute_total_numb_batch,
 )
 from deepmd.dpmodel.utils.nlist import (
     build_neighbor_list,
@@ -48,6 +52,9 @@ from deepmd.jax.model.base_model import (
 from deepmd.jax.model.model import (
     get_model,
 )
+from deepmd.jax.optimizer import (
+    hybrid_muon,
+)
 from deepmd.jax.utils.serialization import (
     serialize_from_file,
 )
@@ -66,6 +73,12 @@ from deepmd.utils.model_stat import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def whether_hessian(loss_params: dict) -> bool:
+    """Return whether the loss configuration requests Hessian training."""
+    loss_type = loss_params.get("type", "ener")
+    return loss_type == "ener" and loss_params.get("start_pref_h", 0.0) > 0.0
 
 
 class DPTrainer:
@@ -96,27 +109,31 @@ class DPTrainer:
             # from scratch
             self.model = get_model(jdata["model"])
         self.training_param = jdata["training"]
-        self.num_steps = self.training_param["numb_steps"]
-
-        def get_lr_and_coef(lr_param: dict) -> LearningRateExp:
-            lr_type = lr_param.get("type", "exp")
-            if lr_type == "exp":
-                lr = LearningRateExp(
-                    **lr_param,
-                    num_steps=self.num_steps,
-                )
-            else:
-                raise RuntimeError("unknown learning_rate type " + lr_type)
-            return lr
+        self.num_steps = self.training_param.get("numb_steps")
+        self.num_epoch = self.training_param.get("numb_epoch")
+        if self.num_epoch is None:
+            self.num_epoch = self.training_param.get("num_epoch")
+        if self.num_epoch is None:
+            self.num_epoch = self.training_param.get("num_epochs")
 
         learning_rate_param = jdata["learning_rate"]
-        self.lr = get_lr_and_coef(learning_rate_param)
+        self.learning_rate_param = learning_rate_param
+        self.lr = None
+        self.optimizer_param = dict(jdata.get("optimizer", {}))
+        self.opt_type = self.optimizer_param.pop("type", "Adam")
+        self.gradient_max_norm = self.training_param.get("gradient_max_norm")
         loss_param = jdata.get("loss", {})
         loss_param["starter_learning_rate"] = learning_rate_param["start_lr"]
 
         loss_type = loss_param.get("type", "ener")
         if loss_type == "ener":
-            self.loss = EnergyLoss.get_loss(loss_param)
+            self.has_hessian = whether_hessian(loss_param)
+            if self.has_hessian:
+                self.model.enable_hessian()
+                self.model_def_script["hessian_mode"] = True
+                self.loss = EnergyHessianLoss.get_loss(loss_param)
+            else:
+                self.loss = EnergyLoss.get_loss(loss_param)
         else:
             raise RuntimeError("unknown loss type " + loss_type)
 
@@ -154,6 +171,73 @@ class DPTrainer:
         self.ckpt_meta = None
         self.model_type = None
 
+    def _build_optimizer_tx(self) -> optax.GradientTransformation:
+        """Build the configured optax optimizer transformation."""
+        assert self.lr is not None
+        opt_type = str(self.opt_type)
+        lr_schedule = lambda step: self.lr.value(self.start_step + step)
+        weight_decay = float(self.optimizer_param.get("weight_decay", 0.0))
+        b1 = float(self.optimizer_param.get("adam_beta1", 0.9))
+        b2 = float(self.optimizer_param.get("adam_beta2", 0.999))
+        eps = float(self.optimizer_param.get("eps", 1e-8))
+        if opt_type == "Adam":
+            tx = optax.adam(learning_rate=lr_schedule, b1=b1, b2=b2, eps=eps)
+        elif opt_type == "AdamW":
+            tx = optax.adamw(
+                learning_rate=lr_schedule,
+                b1=b1,
+                b2=b2,
+                eps=eps,
+                weight_decay=weight_decay,
+            )
+        elif opt_type == "HybridMuon":
+            tx = hybrid_muon(
+                learning_rate=lr_schedule,
+                weight_decay=weight_decay,
+                momentum=float(self.optimizer_param.get("momentum", 0.95)),
+                adam_betas=(
+                    float(self.optimizer_param.get("adam_beta1", 0.9)),
+                    float(self.optimizer_param.get("adam_beta2", 0.95)),
+                ),
+                adam_eps=float(self.optimizer_param.get("adam_eps", 1e-20)),
+                lr_adjust=float(self.optimizer_param.get("lr_adjust", 0.0)),
+                lr_adjust_coeff=float(
+                    self.optimizer_param.get("lr_adjust_coeff", 0.18)
+                ),
+                muon_mode=str(self.optimizer_param.get("muon_mode", "slice")),
+                enable_gram=bool(self.optimizer_param.get("enable_gram", True)),
+                flash_muon=bool(self.optimizer_param.get("flash_muon", True)),
+                magma_muon=bool(self.optimizer_param.get("magma_muon", True)),
+            )
+        else:
+            raise RuntimeError(f"unknown optimizer type {opt_type}")
+        if self.gradient_max_norm is not None:
+            tx = optax.chain(optax.clip_by_global_norm(float(self.gradient_max_norm)), tx)
+        return tx
+
+    def _ensure_training_length(self, train_data: DeepmdDataSystem) -> None:
+        """Resolve step-based training length and construct the LR schedule."""
+        if self.num_steps is None:
+            if self.num_epoch is None:
+                raise ValueError("Either training.numb_steps or training.num_epochs must be set.")
+            if self.num_epoch <= 0:
+                raise ValueError("training.num_epochs must be positive.")
+            total_numb_batch = compute_total_numb_batch(
+                train_data.nbatches,
+                train_data.sys_probs,
+            )
+            self.num_steps = int(np.ceil(float(self.num_epoch) * total_numb_batch))
+            log.info(
+                "Computed numb_steps=%d from num_epochs=%s and total_numb_batch=%d.",
+                self.num_steps,
+                self.num_epoch,
+                total_numb_batch,
+            )
+        self.lr = BaseLR(
+            **self.learning_rate_param,
+            num_steps=int(self.num_steps),
+        )
+
     @property
     def data_requirements(self) -> list[DataRequirementItem]:
         """Labels required by the configured loss."""
@@ -163,10 +247,9 @@ class DPTrainer:
         self, train_data: DeepmdDataSystem, valid_data: DeepmdDataSystem | None = None
     ) -> None:
         """Run the training loop with optional validation data."""
+        self._ensure_training_length(train_data)
         model = self.model
-        tx = optax.adam(
-            learning_rate=lambda step: self.lr.value(self.start_step + step),
-        )
+        tx = self._build_optimizer_tx()
         optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
         # data stat
@@ -211,6 +294,8 @@ class DPTrainer:
             model_dict["energy"] = model_dict["energy_redu"]
             model_dict["force"] = model_dict["energy_derv_r"].squeeze(-2)
             model_dict["virial"] = model_dict["energy_derv_c_redu"].squeeze(-2)
+            if self.has_hessian and model_dict.get("energy_derv_r_derv_r") is not None:
+                model_dict["hessian"] = model_dict["energy_derv_r_derv_r"].squeeze(-3)
             loss, more_loss = self.loss(
                 learning_rate=lr,
                 natoms=label_dict["type"].shape[1],
@@ -249,6 +334,8 @@ class DPTrainer:
             model_dict["energy"] = model_dict["energy_redu"]
             model_dict["force"] = model_dict["energy_derv_r"].squeeze(-2)
             model_dict["virial"] = model_dict["energy_derv_c_redu"].squeeze(-2)
+            if self.has_hessian and model_dict.get("energy_derv_r_derv_r") is not None:
+                model_dict["hessian"] = model_dict["energy_derv_r_derv_r"].squeeze(-3)
             loss, more_loss = self.loss(
                 learning_rate=lr,
                 natoms=label_dict["type"].shape[1],

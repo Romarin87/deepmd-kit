@@ -3,6 +3,9 @@ import deepmd.jax.utils.exclude_mask as _jax_exclude_mask  # noqa: F401
 import deepmd.jax.utils.network as _jax_network  # noqa: F401
 from deepmd.dpmodel.fitting.dipole_fitting import DipoleFitting as DipoleFittingNetDP
 from deepmd.dpmodel.fitting.dos_fitting import DOSFittingNet as DOSFittingNetDP
+from deepmd.dpmodel.fitting.dpa4_ener import (
+    SeZMEnergyFittingNet as SeZMEnergyFittingNetDP,
+)
 from deepmd.dpmodel.fitting.ener_fitting import EnergyFittingNet as EnergyFittingNetDP
 from deepmd.dpmodel.fitting.polarizability_fitting import (
     PolarFitting as PolarFittingNetDP,
@@ -21,6 +24,13 @@ from deepmd.jax.fitting.base_fitting import (
 @BaseFitting.register("ener")
 @flax_module
 class EnergyFittingNet(EnergyFittingNetDP):
+    pass
+
+
+@BaseFitting.register("dpa4_ener")
+@BaseFitting.register("sezm_ener")
+@flax_module
+class SeZMEnergyFittingNet(SeZMEnergyFittingNetDP):
     pass
 
 

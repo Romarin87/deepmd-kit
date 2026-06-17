@@ -25,6 +25,9 @@ from deepmd.jax.model.dp_zbl_model import (
     DPZBLModel,
 )
 
+DPA4_MODEL_TYPES = {"SeZM", "sezm", "DPA4", "dpa4"}
+DPA4_FITTING_TYPES = {"dpa4_ener", "sezm_ener"}
+
 
 def get_standard_model(data: dict) -> BaseModel:
     """Get a Model from a dictionary.
@@ -35,6 +38,7 @@ def get_standard_model(data: dict) -> BaseModel:
         The data to construct the model.
     """
     data = deepcopy(data)
+    hessian_mode = bool(data.pop("hessian_mode", False))
     if "type_embedding" in data:
         raise ValueError(
             "In the JAX backend, type_embedding is not at the model level, but within the descriptor. See type embedding documentation for details."
@@ -42,7 +46,11 @@ def get_standard_model(data: dict) -> BaseModel:
     descriptor_type = data["descriptor"].pop("type")
     data["descriptor"]["type_map"] = data["type_map"]
     data["descriptor"]["ntypes"] = len(data["type_map"])
-    fitting_type = data["fitting_net"].pop("type")
+    data.setdefault("fitting_net", {})
+    default_fitting_type = (
+        "sezm_ener" if descriptor_type in DPA4_MODEL_TYPES else "ener"
+    )
+    fitting_type = data["fitting_net"].pop("type", default_fitting_type)
     data["fitting_net"]["type_map"] = data["type_map"]
     descriptor = BaseDescriptor.get_class_by_type(descriptor_type)(
         **data["descriptor"],
@@ -55,13 +63,17 @@ def get_standard_model(data: dict) -> BaseModel:
         mixed_types=descriptor.mixed_types(),
         **data["fitting_net"],
     )
-    return BaseModel.get_class_by_type(fitting_type)(
+    model_type = "ener" if fitting_type in DPA4_FITTING_TYPES else fitting_type
+    model = BaseModel.get_class_by_type(model_type)(
         descriptor=descriptor,
         fitting=fitting,
         type_map=data["type_map"],
         atom_exclude_types=data.get("atom_exclude_types", []),
         pair_exclude_types=data.get("pair_exclude_types", []),
     )
+    if hessian_mode:
+        model.enable_hessian()
+    return model
 
 
 def get_zbl_model(data: dict) -> DPZBLModel:
@@ -112,6 +124,14 @@ def get_model(data: dict) -> BaseModel:
         The data to construct the model.
     """
     model_type = data.get("type", "standard")
+    if model_type in DPA4_MODEL_TYPES:
+        data = deepcopy(data)
+        data["type"] = "standard"
+        data.setdefault("descriptor", {})
+        data["descriptor"]["type"] = data["descriptor"].get("type", model_type)
+        data.setdefault("fitting_net", {})
+        data["fitting_net"]["type"] = data["fitting_net"].get("type", "sezm_ener")
+        return get_standard_model(data)
     if model_type == "standard":
         if "spin" in data:
             raise NotImplementedError("Spin model is not implemented yet.")

@@ -145,6 +145,13 @@ def train(
 
     jdata = normalize(jdata)
     min_nbor_dist = None
+    loss_param = jdata.get("loss", {})
+    if (
+        loss_param.get("type", "ener") == "ener"
+        and loss_param.get("start_pref_h", 0.0) != 0.0
+        and loss_param.get("limit_pref_h", 0.0) != 0.0
+    ):
+        jdata["model"]["hessian_mode"] = True
     if not skip_neighbor_stat:
         jdata, min_nbor_dist = update_sel(jdata)
 
