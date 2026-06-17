@@ -41,6 +41,7 @@ PRECISION_DICT = dict.fromkeys(VALID_PRECISION)
 
 doc_only_tf_supported = "(Supported Backend: TensorFlow) "
 doc_only_pt_supported = "(Supported Backend: PyTorch) "
+doc_pt_jax_supported = "(Supported Backend: PyTorch/JAX) "
 doc_only_pt_expt_supported = "(Supported Backend: PyTorch Exportable) "
 doc_only_pd_supported = "(Supported Backend: Paddle) "
 # descriptors
@@ -3779,7 +3780,7 @@ def optimizer_adamuon() -> list[Argument]:
 
 @opt_args_plugin.register(
     "HybridMuon",
-    doc=doc_only_pt_supported
+    doc=doc_pt_jax_supported
     + "HybridMuon optimizer (DeePMD-kit custom implementation). "
     + "This is a Hybrid optimizer that automatically combines Muon and Adam. "
     + "For matrix params: Muon update with Newton-Schulz based on selected muon_mode. "
@@ -3798,7 +3799,7 @@ def optimizer_hybrid_muon() -> list[Argument]:
             optional=True,
             default=0.95,
             alias=["muon_momentum"],
-            doc=doc_only_pt_supported
+            doc=doc_pt_jax_supported
             + "Momentum coefficient for HybridMuon optimizer (>=2D params). "
             "Used in Nesterov momentum update: m_t = beta*m_{t-1} + (1-beta)*g_t.",
         ),
@@ -3807,7 +3808,7 @@ def optimizer_hybrid_muon() -> list[Argument]:
             float,
             optional=True,
             default=0.9,
-            doc=doc_only_pt_supported
+            doc=doc_pt_jax_supported
             + "Adam beta1 coefficient for 1D parameters (biases, norms).",
         ),
         Argument(
@@ -3815,7 +3816,7 @@ def optimizer_hybrid_muon() -> list[Argument]:
             float,
             optional=True,
             default=0.95,
-            doc=doc_only_pt_supported
+            doc=doc_pt_jax_supported
             + "Adam beta2 coefficient for 1D parameters (biases, norms).",
         ),
         Argument(
@@ -3823,7 +3824,7 @@ def optimizer_hybrid_muon() -> list[Argument]:
             float,
             optional=True,
             default=0.001,
-            doc=doc_only_pt_supported
+            doc=doc_pt_jax_supported
             + "Weight decay coefficient. Applied to Muon-routed parameters and "
             + "the AdamW-style decay path for matrix parameters.",
         ),
@@ -3832,7 +3833,7 @@ def optimizer_hybrid_muon() -> list[Argument]:
             float,
             optional=True,
             default=0.0,
-            doc=doc_only_pt_supported
+            doc=doc_pt_jax_supported
             + "Learning rate adjustment mode for HybridMuon scaling and Adam learning rate. "
             "If lr_adjust <= 0: use match-RMS scaling (scale = coeff*sqrt(max(m,n))), Adam uses lr directly. "
             "If lr_adjust > 0: use rectangular correction (scale = sqrt(max(1, m/n))), Adam uses lr/lr_adjust. "
@@ -3843,7 +3844,7 @@ def optimizer_hybrid_muon() -> list[Argument]:
             float,
             optional=True,
             default=0.18,
-            doc=doc_only_pt_supported
+            doc=doc_pt_jax_supported
             + "Coefficient for match-RMS scaling. Only effective when lr_adjust <= 0. "
             + "Default 0.18 follows DeepSeek-V4's calibration so Muon update RMS "
             + "matches AdamW's typical RMS; Moonlight's original recipe uses 0.2.",
@@ -3853,7 +3854,7 @@ def optimizer_hybrid_muon() -> list[Argument]:
             str,
             optional=True,
             default="slice",
-            doc=doc_only_pt_supported
+            doc=doc_pt_jax_supported
             + "Muon routing mode. "
             + "'2d': only effective-rank-2 params are eligible for Muon; effective rank >2 goes to AdamW-style decoupled decay path. "
             + "'flat': effective-rank >=2 params are flattened to matrix-view (prod(shape[:-1]), shape[-1]) for Muon. "
@@ -3865,7 +3866,7 @@ def optimizer_hybrid_muon() -> list[Argument]:
             bool,
             optional=True,
             default=True,
-            doc=doc_only_pt_supported
+            doc=doc_pt_jax_supported
             + "Enable the compiled Gram Newton-Schulz path for rectangular Muon matrices. "
             + "Square matrices keep using the current standard Newton-Schulz path.",
         ),
@@ -3874,17 +3875,18 @@ def optimizer_hybrid_muon() -> list[Argument]:
             bool,
             optional=True,
             default=True,
-            doc=doc_only_pt_supported
+            doc=doc_pt_jax_supported
             + "Enable triton-accelerated Newton-Schulz orthogonalization. "
-            "Requires triton and CUDA. Falls back to PyTorch implementation "
-            "when triton is unavailable or running on CPU. Ignored when enable_gram is true.",
+            "PyTorch uses Triton, while JAX uses Pallas/Triton. Falls back to "
+            "the ordinary backend matmul path when unavailable or running on CPU. "
+            "Ignored when enable_gram is true.",
         ),
         Argument(
             "magma_muon",
             bool,
             optional=True,
             default=True,
-            doc=doc_only_pt_supported
+            doc=doc_pt_jax_supported
             + "Enable Magma-lite damping on the Muon route only. "
             "When enabled, HybridMuon computes momentum-gradient alignment "
             "per Muon block, applies EMA smoothing, and rescales Muon updates "
@@ -3907,7 +3909,8 @@ def optimizer_variant_type_args() -> Variant:
 def optimizer_args(fold_subdoc: bool = False) -> Argument:
     doc_optimizer = (
         "The definition of optimizer. Supported optimizer types depend on backend: "
-        "TensorFlow/Paddle: Adam; PyTorch: Adam, AdamW, LKF, AdaMuon, HybridMuon."
+        "TensorFlow/Paddle: Adam; PyTorch: Adam, AdamW, LKF, AdaMuon, HybridMuon; "
+        "JAX: Adam, AdamW, HybridMuon."
     )
     return Argument(
         "optimizer",
@@ -4872,7 +4875,17 @@ def training_args(
         "50% more communication (3x model size) due to parameter all-gather in "
         "both forward and backward passes. "
         "Default is 0. Requires distributed launch via torchrun. "
-        "Currently supports single-task training; does not support LKF or change_bias_after_training."
+        "Currently supports single-task training; does not support LKF or change_bias_after_training. "
+        "The JAX local trainer accepts this key for input compatibility and "
+        "treats nonzero values as zero because optimizer-state sharding is not "
+        "implemented for the local JAX training path."
+    )
+    doc_jax_parallel_mode = (
+        "JAX local training parallel mode. `auto` selects batch-axis data "
+        "parallelism for DPA4/SeZM and Hessian training, and atom-axis sharding "
+        "for other models. `data` shards the batch axis only, keeping atom and "
+        "Hessian axes replicated on each device. `natoms` shards the atom axis "
+        "and is experimental for gather/scatter-heavy JAX models."
     )
 
     arg_training_data = training_data_args()
@@ -4938,14 +4951,14 @@ def training_args(
             bool,
             optional=True,
             default=False,
-            doc=doc_only_pt_supported + doc_enable_ema,
+            doc=doc_enable_ema,
         ),
         Argument(
             "ema_decay",
             float,
             optional=True,
             default=0.999,
-            doc=doc_only_pt_supported + doc_ema_decay,
+            doc=doc_ema_decay,
             extra_check=lambda x: 0.0 <= x < 1.0,
             extra_check_errmsg="must be greater than or equal to 0 and less than 1",
         ),
@@ -4954,7 +4967,7 @@ def training_args(
             int,
             optional=True,
             default=3,
-            doc=doc_only_pt_supported + doc_ema_ckpt_keep,
+            doc=doc_ema_ckpt_keep,
             extra_check=lambda x: x > 0,
             extra_check_errmsg="must be greater than 0",
         ),
@@ -5030,7 +5043,14 @@ def training_args(
             int,
             optional=True,
             default=0,
-            doc=doc_only_pt_supported + doc_zero_stage,
+            doc=doc_zero_stage,
+        ),
+        Argument(
+            "jax_parallel_mode",
+            str,
+            optional=True,
+            default="auto",
+            doc=doc_jax_parallel_mode,
         ),
         Argument(
             "enable_compile",

@@ -9,7 +9,7 @@ from typing import (
 )
 
 import math
-
+import os
 import array_api_compat
 import numpy as np
 
@@ -28,6 +28,9 @@ from deepmd.dpmodel.common import (
 from deepmd.dpmodel.utils.network import (
     NativeLayer,
     get_activation_fn,
+)
+from deepmd.dpmodel.utils.safe_gradient import (
+    safe_for_sqrt,
 )
 from deepmd.dpmodel.utils.seed import (
     child_seed,
@@ -83,6 +86,70 @@ class EdgeFeatureCache(NamedTuple):
     inv_sqrt_deg: Array
     D_full: Array | None
     Dt_full: Array | None
+
+
+def _static_nonzero(valid: Array, size: int) -> Array:
+    xp = array_api_compat.array_namespace(valid)
+    try:
+        return xp.nonzero(valid, size=size, fill_value=0)[0]
+    except TypeError:
+        indices = xp.nonzero(valid)[0]
+        if indices.shape[0] >= size:
+            return indices[:size]
+        pad = xp.zeros(
+            (size - indices.shape[0],),
+            dtype=indices.dtype,
+            device=array_api_compat.device(indices),
+        )
+        return xp.concatenate([indices, pad], axis=0)
+
+
+def _maybe_apply_jax_sharding(array: Array | None, spec: tuple[Any, ...]) -> Array | None:
+    if array is None:
+        return None
+    if os.environ.get("DP_JAX_SEZM_EXPLICIT_SHARDING", "0") not in {
+        "1",
+        "true",
+        "True",
+    }:
+        return array
+    xp = array_api_compat.array_namespace(array)
+    if not array_api_compat.is_jax_namespace(xp):
+        return array
+    from deepmd.jax.env import (
+        jax,
+    )
+    from jax.sharding import (
+        PartitionSpec as P,
+    )
+
+    try:
+        return jax.lax.with_sharding_constraint(array, P(*spec))
+    except RuntimeError as exc:
+        if "non-empty mesh" not in str(exc):
+            raise
+        return array
+
+
+def _edge_sum_to_nodes(n_nodes: int, dst: Array, values: Array) -> Array:
+    xp = array_api_compat.array_namespace(dst, values)
+    if array_api_compat.is_jax_namespace(xp):
+        node_idx = xp.arange(
+            n_nodes,
+            dtype=dst.dtype,
+            device=array_api_compat.device(dst),
+        )
+        weights = xp.astype(dst[:, None] == node_idx[None, :], values.dtype)
+        values_flat = xp.reshape(values, (values.shape[0], -1))
+        out_flat = xp.matmul(xp.permute_dims(weights, (1, 0)), values_flat)
+        return xp.reshape(out_flat, (n_nodes, *values.shape[1:]))
+
+    out = xp.zeros(
+        (n_nodes, *values.shape[1:]),
+        dtype=values.dtype,
+        device=array_api_compat.device(values),
+    )
+    return xp_add_at(out, dst, values)
 
 
 class SeZMTypeEmbedding(NativeOP):
@@ -300,7 +367,9 @@ class RMSNorm(NativeOP):
     def call(self, x: Array) -> Array:
         scale = self.scale[...]
         xp = array_api_compat.array_namespace(x, scale)
-        inv_rms = 1.0 / xp.sqrt(xp.mean(x * x, axis=-1, keepdims=True) + self.eps)
+        inv_rms = 1.0 / safe_for_sqrt(
+            xp.mean(x * x, axis=-1, keepdims=True) + self.eps
+        )
         return x * inv_rms * scale
 
     def serialize(self) -> dict[str, Any]:
@@ -440,6 +509,7 @@ class GeometricInitialEmbedding(NativeOP):
             (n_nodes, self.ebed_dim, self.channels),
             dtype=edge_cache.edge_vec.dtype,
         )
+        out = _maybe_apply_jax_sharding(out, ("natoms", None, None))
         if self.lmax == 0 or edge_cache.dst.shape[0] == 0:
             return out
         if edge_cache.Dt_full is None:
@@ -450,16 +520,25 @@ class GeometricInitialEmbedding(NativeOP):
         zonal = edge_cache.Dt_full[:, row_idx, col_idx]
         radial_per_row = xp.take(radial_feat, slot_idx, axis=1)
         message = zonal[..., None] * radial_per_row
-        non_scalar_out = xp.zeros(
-            (n_nodes, row_idx.shape[0], self.channels),
-            dtype=message.dtype,
+        message = _maybe_apply_jax_sharding(message, ("natoms", None, None))
+        non_scalar_out = _edge_sum_to_nodes(n_nodes, edge_cache.dst, message)
+        non_scalar_out = _maybe_apply_jax_sharding(
+            non_scalar_out, ("natoms", None, None)
         )
-        non_scalar_out = xp_add_at(non_scalar_out, edge_cache.dst, message)
-        if hasattr(out, "at"):
+        if array_api_compat.is_jax_namespace(xp):
+            embed_idx = xp.arange(
+                self.ebed_dim,
+                dtype=row_idx.dtype,
+                device=array_api_compat.device(row_idx),
+            )
+            row_mask = xp.astype(row_idx[:, None] == embed_idx[None, :], out.dtype)
+            out = xp.einsum("nrc,re->nec", non_scalar_out, row_mask)
+        elif hasattr(out, "at"):
             out = out.at[:, row_idx, :].set(non_scalar_out)
         else:
             out[:, row_idx, :] = non_scalar_out
-        return out * edge_cache.inv_sqrt_deg
+        out = out * edge_cache.inv_sqrt_deg
+        return _maybe_apply_jax_sharding(out, ("natoms", None, None))
 
     def serialize(self) -> dict[str, Any]:
         return {
@@ -590,7 +669,7 @@ class EnvironmentInitialEmbedding(NativeOP):
         edge_env = edge_cache.edge_env
 
         r_sq = xp.sum(edge_vec * edge_vec, axis=-1, keepdims=True)
-        inv_r = 1.0 / xp.sqrt(r_sq + self.eps * self.eps)
+        inv_r = 1.0 / safe_for_sqrt(r_sq + self.eps * self.eps)
         s = edge_env * inv_r
         r_hat = edge_vec * inv_r
         r_tilde = xp.concat([s, s * r_hat], axis=-1)
@@ -601,22 +680,25 @@ class EnvironmentInitialEmbedding(NativeOP):
         type_dst = self.env_type_embed(atype_dst)
         rbf_proj = self.rbf_proj_layer2(self.rbf_proj_layer1(edge_rbf))
         g_input = xp.concat([rbf_proj, type_src, type_dst], axis=-1)
+        g_input = _maybe_apply_jax_sharding(g_input, ("natoms", None))
         g = self.g_layer2(self.g_layer1(g_input))
+        g = _maybe_apply_jax_sharding(g, ("natoms", None))
 
         outer = xp.einsum("ei,ej->eij", r_tilde, g)
+        outer = _maybe_apply_jax_sharding(outer, ("natoms", None, None))
         outer_flat = xp.reshape(outer, (outer.shape[0], 4 * self.embed_dim))
-        env_agg = xp.zeros(
-            (n_nodes, 4 * self.embed_dim),
-            dtype=outer_flat.dtype,
-        )
-        env_agg = xp_add_at(env_agg, edge_cache.dst, outer_flat)
+        outer_flat = _maybe_apply_jax_sharding(outer_flat, ("natoms", None))
+        env_agg = _edge_sum_to_nodes(n_nodes, edge_cache.dst, outer_flat)
+        env_agg = _maybe_apply_jax_sharding(env_agg, ("natoms", None))
         env_agg = xp.reshape(env_agg, (n_nodes, 4, self.embed_dim))
+        env_agg = _maybe_apply_jax_sharding(env_agg, ("natoms", None, None))
         env_agg = env_agg * edge_cache.inv_sqrt_deg
         env_agg_t = xp.permute_dims(env_agg, (0, 2, 1))
         env_agg_axis = env_agg[:, :, : self.axis_dim]
         d_matrix = xp.matmul(env_agg_t, env_agg_axis)
         d_flat = xp.reshape(d_matrix, (n_nodes, self.embed_dim * self.axis_dim))
-        return self.output_proj(d_flat)
+        d_flat = _maybe_apply_jax_sharding(d_flat, ("natoms", None))
+        return _maybe_apply_jax_sharding(self.output_proj(d_flat), ("natoms", None))
 
     def serialize(self) -> dict[str, Any]:
         return {
@@ -1198,48 +1280,93 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
                 "atoms are present."
             )
         slot_count = nf * nloc * nnei
-        slot_idx = xp.arange(slot_count, dtype=xp.int64)
-        frame_idx = slot_idx // (nloc * nnei)
-        rem_idx = slot_idx - frame_idx * nloc * nnei
-        loc_idx = rem_idx // nnei
+        slot_idx_full = xp.arange(slot_count, dtype=xp.int64)
+        slot_idx_full = _maybe_apply_jax_sharding(slot_idx_full, ("natoms",))
+        frame_idx_full = slot_idx_full // (nloc * nnei)
+        rem_idx_full = slot_idx_full - frame_idx_full * nloc * nnei
+        loc_idx_full = rem_idx_full // nnei
         neighbor_ext_raw = xp.reshape(nlist, (-1,))
+        neighbor_ext_raw = _maybe_apply_jax_sharding(neighbor_ext_raw, ("natoms",))
         valid = neighbor_ext_raw >= 0
-        valid_f = xp.astype(xp.reshape(valid, (-1, 1)), coord.dtype)
-        neighbor_ext = xp.where(valid, neighbor_ext_raw, xp.zeros_like(neighbor_ext_raw))
+        valid = _maybe_apply_jax_sharding(valid, ("natoms",))
+        # Keep this expression export-friendly for JAX symbolic dimensions.
+        # Training uses concrete shapes and can bound the static edge buffer by
+        # nloc * min(nnei, nall).  Symbolic export falls back to the original
+        # neighbor-list width because Python comparisons against nall may be
+        # inconclusive.
+        try:
+            max_neighbors_per_center = min(int(nnei), int(nall))
+        except TypeError:
+            max_neighbors_per_center = nnei
+        max_edges = nf * nloc * max_neighbors_per_center + 2
+        edge_slot_idx = _static_nonzero(valid, max_edges)
+        edge_slot_idx = _maybe_apply_jax_sharding(edge_slot_idx, ("natoms",))
+        edge_pos = xp.arange(max_edges, dtype=xp.int64)
+        edge_pos = _maybe_apply_jax_sharding(edge_pos, ("natoms",))
+        valid_count = xp.sum(xp.astype(valid, xp.int64))
+        edge_valid = edge_pos < valid_count
+        edge_valid = _maybe_apply_jax_sharding(edge_valid, ("natoms",))
+        frame_idx = xp.take(frame_idx_full, edge_slot_idx, axis=0)
+        frame_idx = _maybe_apply_jax_sharding(frame_idx, ("natoms",))
+        loc_idx = xp.take(loc_idx_full, edge_slot_idx, axis=0)
+        loc_idx = _maybe_apply_jax_sharding(loc_idx, ("natoms",))
+        neighbor_ext_raw = xp.take(neighbor_ext_raw, edge_slot_idx, axis=0)
+        neighbor_ext_raw = _maybe_apply_jax_sharding(neighbor_ext_raw, ("natoms",))
+        edge_valid = xp.logical_and(edge_valid, neighbor_ext_raw >= 0)
+        valid_f = xp.astype(xp.reshape(edge_valid, (-1, 1)), coord.dtype)
+        valid_f = _maybe_apply_jax_sharding(valid_f, ("natoms", None))
+        neighbor_ext = xp.where(
+            edge_valid, neighbor_ext_raw, xp.zeros_like(neighbor_ext_raw)
+        )
+        neighbor_ext = _maybe_apply_jax_sharding(neighbor_ext, ("natoms",))
         dst = frame_idx * nloc + loc_idx
+        dst = _maybe_apply_jax_sharding(dst, ("natoms",))
         if mapping is not None:
             mapped = xp.take(
                 xp.reshape(mapping, (-1,)),
                 frame_idx * mapping.shape[1] + neighbor_ext,
                 axis=0,
             )
+            mapped = _maybe_apply_jax_sharding(mapped, ("natoms",))
             src = frame_idx * nloc + mapped
         else:
             src = frame_idx * nloc + neighbor_ext
+        src = _maybe_apply_jax_sharding(src, ("natoms",))
 
         coord_flat = xp.reshape(coord, (nf * nall, 3))
+        coord_flat = _maybe_apply_jax_sharding(coord_flat, ("natoms", None))
         center_idx = frame_idx * nall + loc_idx
         neighbor_idx = frame_idx * nall + neighbor_ext
         edge_vec = xp.take(coord_flat, neighbor_idx, axis=0) - xp.take(
             coord_flat, center_idx, axis=0
         )
-        edge_len = xp.sqrt(
+        edge_vec = _maybe_apply_jax_sharding(edge_vec, ("natoms", None))
+        edge_len = safe_for_sqrt(
             xp.sum(edge_vec * edge_vec, axis=-1, keepdims=True) + self.eps * self.eps
         )
+        edge_len = _maybe_apply_jax_sharding(edge_len, ("natoms", None))
         edge_rbf = self.radial_basis(edge_len) * valid_f
+        edge_rbf = _maybe_apply_jax_sharding(edge_rbf, ("natoms", None))
         edge_env = self.edge_envelope(edge_len) * valid_f
+        edge_env = _maybe_apply_jax_sharding(edge_env, ("natoms", None))
 
         atype_local = atype_ext[:, :nloc]
         type_embedding = xp.reshape(self.type_embedding(atype_local), (nf * nloc, -1))
+        type_embedding = _maybe_apply_jax_sharding(type_embedding, ("natoms", None))
         edge_type_feat = (
             xp.take(type_embedding, src, axis=0) + xp.take(type_embedding, dst, axis=0)
         ) * valid_f
+        edge_type_feat = _maybe_apply_jax_sharding(edge_type_feat, ("natoms", None))
 
         edge_weight = xp.reshape(edge_env * edge_env, (-1,))
-        deg = xp.zeros((nf * nloc,), dtype=edge_weight.dtype)
-        deg = xp_add_at(deg, dst, edge_weight)
-        inv_sqrt_deg = 1.0 / xp.sqrt(
+        edge_weight = _maybe_apply_jax_sharding(edge_weight, ("natoms",))
+        deg = _edge_sum_to_nodes(nf * nloc, dst, edge_weight)
+        deg = _maybe_apply_jax_sharding(deg, ("natoms",))
+        inv_sqrt_deg = 1.0 / safe_for_sqrt(
             xp.reshape(deg + xp.asarray(0.25, dtype=deg.dtype), (nf * nloc, 1, 1))
+        )
+        inv_sqrt_deg = _maybe_apply_jax_sharding(
+            inv_sqrt_deg, ("natoms", None, None)
         )
         D_full: Array | None = None
         Dt_full: Array | None = None
@@ -1277,7 +1404,11 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             edge_quat = quaternion_multiply(quaternion_z_rotation(gamma), edge_quat)
         D_full, Dt_full = self.wigner_calc(edge_quat)
         xp = array_api_compat.array_namespace(D_full, Dt_full, edge_vec)
-        return xp.astype(D_full, edge_vec.dtype), xp.astype(Dt_full, edge_vec.dtype)
+        D_full = xp.astype(D_full, edge_vec.dtype)
+        Dt_full = xp.astype(Dt_full, edge_vec.dtype)
+        D_full = _maybe_apply_jax_sharding(D_full, ("natoms", None, None))
+        Dt_full = _maybe_apply_jax_sharding(Dt_full, ("natoms", None, None))
+        return D_full, Dt_full
 
     def call(
         self,
@@ -1302,6 +1433,7 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
         n_nodes = nf * nloc
         atype_loc = atype_ext[:, :nloc]
         type_feat = xp.reshape(self.type_embedding(atype_loc), (n_nodes, self.channels))
+        type_feat = _maybe_apply_jax_sharding(type_feat, ("natoms", None))
 
         edge_cache = self._build_edge_cache(
             coord,
@@ -1336,23 +1468,32 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
             scale = one + scale_strength * xp.tanh(scale_hat)
             shift = shift_strength * xp.tanh(shift_hat)
             x0_out = type_feat * scale + shift
+            x0_out = _maybe_apply_jax_sharding(x0_out, ("natoms", None))
 
         x = xp.zeros(
             (n_nodes, ebed_dim_0, 1, self.channels),
             dtype=type_feat.dtype,
         )
+        x = _maybe_apply_jax_sharding(x, ("natoms", None, None, None))
         x = _set_l0_features(x, x0_out)
+        x = _maybe_apply_jax_sharding(x, ("natoms", None, None, None))
 
         radial_feat_flat = self.radial_embedding(edge_cache.edge_rbf)
+        radial_feat_flat = _maybe_apply_jax_sharding(radial_feat_flat, ("natoms", None))
         radial_feat = xp.reshape(
             radial_feat_flat,
             (edge_cache.edge_rbf.shape[0], self.lmax + 1, self.channels),
         )
+        radial_feat = _maybe_apply_jax_sharding(radial_feat, ("natoms", None, None))
         radial_feat = radial_feat * xp.expand_dims(edge_cache.edge_env, axis=-1)
         radial_feat_for_gie = radial_feat
         radial_feat = radial_feat + xp.expand_dims(edge_cache.edge_type_feat, axis=1)
+        radial_feat = _maybe_apply_jax_sharding(radial_feat, ("natoms", None, None))
         radial_feat_per_block = [
-            radial_feat[:, : ll + 1, :] for ll in self.l_schedule
+            _maybe_apply_jax_sharding(
+                radial_feat[:, : ll + 1, :], ("natoms", None, None)
+            )
+            for ll in self.l_schedule
         ]
 
         if self.use_gie and radial_feat_for_gie is not None:
@@ -1364,6 +1505,7 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
                 ),
                 axis=2,
             )
+            x = _maybe_apply_jax_sharding(x, ("natoms", None, None, None))
 
         if edge_cache.src.shape[0] > 0:
             for block, block_radial in zip(
@@ -1372,10 +1514,14 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
                 strict=True,
             ):
                 x, _, _, _ = block(x, edge_cache, block_radial)
+                x = _maybe_apply_jax_sharding(x, ("natoms", None, None, None))
 
         x_scalar = xp.reshape(x[:, 0:1, :, :], (n_nodes, 1, 1, self.channels))
+        x_scalar = _maybe_apply_jax_sharding(x_scalar, ("natoms", None, None, None))
         x_scalar = x_scalar + self.output_ffn(x_scalar)
+        x_scalar = _maybe_apply_jax_sharding(x_scalar, ("natoms", None, None, None))
         descriptor = xp.reshape(x_scalar, (nf, nloc, self.channels))
+        descriptor = _maybe_apply_jax_sharding(descriptor, (None, "natoms", None))
         empty = xp.zeros((0,), dtype=descriptor.dtype)
         return descriptor, empty, empty, empty, empty
 
@@ -1529,6 +1675,23 @@ class DescrptSeZM(NativeOP, BaseDescriptor):
 def _set_l0_features(x: Array, values: Array) -> Array:
     xp = array_api_compat.array_namespace(x, values)
     values = xp.astype(values, x.dtype)
+    if array_api_compat.is_jax_namespace(xp):
+        ebed_idx = xp.arange(
+            x.shape[1],
+            dtype=xp.int64,
+            device=array_api_compat.device(x),
+        )
+        m_idx = xp.arange(
+            x.shape[2],
+            dtype=xp.int64,
+            device=array_api_compat.device(x),
+        )
+        slot_mask = xp.astype(
+            (ebed_idx[None, :, None, None] == 0)
+            & (m_idx[None, None, :, None] == 0),
+            x.dtype,
+        )
+        return x * (1.0 - slot_mask) + values[:, None, None, :] * slot_mask
     if hasattr(x, "at"):
         return x.at[:, 0, 0, :].set(values)
     x[:, 0, 0, :] = values

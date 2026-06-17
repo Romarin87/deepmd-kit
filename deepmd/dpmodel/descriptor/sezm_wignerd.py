@@ -23,6 +23,9 @@ from deepmd.dpmodel.array_api import (
 from deepmd.dpmodel.common import (
     to_numpy_array,
 )
+from deepmd.dpmodel.utils.safe_gradient import (
+    safe_for_sqrt,
+)
 from deepmd.utils.version import (
     check_version_compatibility,
 )
@@ -77,7 +80,7 @@ def _xp_asarray(xp: Any, value: Any, dtype: Any | None = None) -> Array:
 
 def _safe_norm_nd(x: Array, eps: float = 1e-7) -> Array:
     xp = array_api_compat.array_namespace(x)
-    return xp.sqrt(xp.sum(x * x, axis=-1, keepdims=True) + eps * eps)
+    return safe_for_sqrt(xp.sum(x * x, axis=-1, keepdims=True) + eps * eps)
 
 
 def quaternion_normalize(q: Array, eps: float = 1e-7) -> Array:
@@ -201,7 +204,7 @@ def build_edge_quaternion(
     if edge_len is None:
         edge_len = _safe_norm_nd(edge_vec, eps)
     else:
-        edge_len = xp.sqrt(edge_len * edge_len + eps * eps)
+        edge_len = safe_for_sqrt(edge_len * edge_len + eps * eps)
     edge_unit = edge_vec / edge_len
     q_pos = _build_edge_quaternion_chart_pos_z(edge_unit, eps)
     q_neg = _build_edge_quaternion_chart_neg_z(edge_unit, eps)
@@ -661,6 +664,18 @@ class WignerDCalculator(NativeOP):
         values: Array,
     ) -> Array:
         xp = array_api_compat.array_namespace(flat_indices, values)
+        if array_api_compat.is_jax_namespace(xp):
+            dense_idx = xp.arange(
+                size * size,
+                dtype=flat_indices.dtype,
+                device=array_api_compat.device(flat_indices),
+            )
+            mask = xp.astype(
+                flat_indices[:, None] == dense_idx[None, :],
+                values.dtype,
+            )
+            out_flat = xp.matmul(values, mask)
+            return xp.reshape(out_flat, (n_batch, size, size))
         batch_offsets = xp.arange(n_batch, dtype=xp.int64)[:, None] * (size * size)
         indices = xp.reshape(batch_offsets + flat_indices[None, :], (-1,))
         flat_values = xp.reshape(values, (-1,))
@@ -695,8 +710,8 @@ class WignerDCalculator(NativeOP):
         rb_sq = rb_re * rb_re + rb_im * rb_im
         ra_small = ra_sq <= eps_sq
         rb_small = rb_sq <= eps_sq
-        ra = xp.sqrt(xp.maximum(ra_sq, eps_sq))
-        rb = xp.sqrt(xp.maximum(rb_sq, eps_sq))
+        ra = safe_for_sqrt(xp.maximum(ra_sq, eps_sq))
+        rb = safe_for_sqrt(xp.maximum(rb_sq, eps_sq))
         general_mask = xp.logical_not(xp.logical_or(ra_small, rb_small))
         use_case1 = xp.logical_and(ra >= rb, general_mask)
         use_case2 = xp.logical_and(ra < rb, general_mask)

@@ -169,13 +169,13 @@ class TestSeZMDescriptor(unittest.TestCase):
         nlist = jnp.asarray([[[1, -1], [0, -1]]], dtype=jnp.int64)
         mapping = jnp.asarray([[0, 1]], dtype=jnp.int64)
         cache = descriptor._build_edge_cache(coord_ext, atype_ext, nlist, mapping)
-        self.assertEqual(cache.edge_vec.shape, (4, 3))
-        self.assertEqual(cache.edge_rbf.shape, (4, 4))
-        self.assertEqual(cache.edge_type_feat.shape, (4, 8))
+        self.assertEqual(cache.edge_vec.shape, (6, 3))
+        self.assertEqual(cache.edge_rbf.shape, (6, 4))
+        self.assertEqual(cache.edge_type_feat.shape, (6, 8))
         self.assertEqual(cache.inv_sqrt_deg.shape, (2, 1, 1))
         self.assertTrue(bool(jnp.all(jnp.isfinite(cache.edge_rbf))))
         self.assertTrue(bool(jnp.all(jnp.isfinite(cache.inv_sqrt_deg))))
-        invalid = jnp.asarray([1, 3], dtype=jnp.int64)
+        invalid = jnp.asarray([2, 3, 4, 5], dtype=jnp.int64)
         np.testing.assert_allclose(
             np.asarray(jnp.take(cache.edge_env, invalid, axis=0)),
             0.0,
@@ -188,6 +188,44 @@ class TestSeZMDescriptor(unittest.TestCase):
         )
         np.testing.assert_allclose(
             np.asarray(jnp.take(cache.edge_type_feat, invalid, axis=0)),
+            0.0,
+            atol=1e-6,
+        )
+
+    def test_edge_cache_compacts_padded_neighbor_slots(self) -> None:
+        descriptor = DescrptSeZM(
+            ntypes=2,
+            sel=16,
+            rcut=6.0,
+            channels=8,
+            n_radial=4,
+            radial_mlp=[0],
+            n_blocks=2,
+            so2_layers=3,
+            precision="float32",
+            seed=42,
+        )
+        coord_ext = jnp.asarray(
+            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]],
+            dtype=jnp.float32,
+        )
+        atype_ext = jnp.asarray([[0, 1, 0]], dtype=jnp.int64)
+        nlist = jnp.asarray(
+            [
+                [
+                    [1, 2, *([-1] * 14)],
+                    [0, 2, *([-1] * 14)],
+                    [0, 1, *([-1] * 14)],
+                ]
+            ],
+            dtype=jnp.int64,
+        )
+        mapping = jnp.asarray([[0, 1, 2]], dtype=jnp.int64)
+        cache = descriptor._build_edge_cache(coord_ext, atype_ext, nlist, mapping)
+        self.assertEqual(cache.edge_vec.shape, (11, 3))
+        self.assertLess(cache.edge_vec.shape[0], nlist.size)
+        np.testing.assert_allclose(
+            np.asarray(cache.edge_env[6:]),
             0.0,
             atol=1e-6,
         )
@@ -259,8 +297,8 @@ class TestSeZMDescriptor(unittest.TestCase):
             mapping,
             include_wigner=True,
         )
-        self.assertEqual(cache.D_full.shape, (4, 16, 16))
-        self.assertEqual(cache.Dt_full.shape, (4, 16, 16))
+        self.assertEqual(cache.D_full.shape, (6, 16, 16))
+        self.assertEqual(cache.Dt_full.shape, (6, 16, 16))
 
     def test_so3_indexing_and_linear_layers(self) -> None:
         self.assertEqual(get_so3_dim_of_lmax(3), 16)

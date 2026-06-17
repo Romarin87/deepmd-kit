@@ -151,6 +151,40 @@ def is_sezm_checkpoint(ckpt_path: str) -> bool:
     return str(params.get("type", "")).lower() in ("sezm", "dpa4")
 
 
+def save_sezm_hessian_checkpoint(
+    ckpt_path: str,
+    out_path: str,
+    *,
+    head: str | None = None,
+) -> None:
+    """Save a SeZM/DPA4 checkpoint with Hessian mode enabled.
+
+    DPA4 Hessian is evaluated through eager autograd at inference time. Trying
+    to AOT-compile the full second-derivative graph makes ``freeze --hessian``
+    impractically large, so Hessian freeze keeps the checkpoint format and only
+    flips the model definition flag consumed by the PyTorch inference loader.
+    """
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict, params = _extract_state_and_params(raw)
+    if "model_dict" in params and head is not None:
+        state_dict, params = _select_model_head(state_dict, params, head)
+        params = deepcopy(params)
+        params["hessian_mode"] = True
+    else:
+        state_dict = dict(state_dict)
+        params = deepcopy(params)
+        if "model_dict" in params:
+            for branch_params in params["model_dict"].values():
+                if str(branch_params.get("type", "")).lower() in ("sezm", "dpa4"):
+                    branch_params["hessian_mode"] = True
+        else:
+            params["hessian_mode"] = True
+
+    state_dict["_extra_state"] = deepcopy(state_dict.get("_extra_state", {}))
+    state_dict["_extra_state"]["model_params"] = params
+    torch.save({"model": state_dict}, out_path)
+
+
 def _select_model_head(
     state_dict: dict[str, Any],
     params: dict[str, Any],

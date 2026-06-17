@@ -21,6 +21,9 @@ from deepmd.dpmodel.array_api import (
 from deepmd.dpmodel.common import (
     to_numpy_array,
 )
+from deepmd.dpmodel.utils.safe_gradient import (
+    safe_for_sqrt,
+)
 from deepmd.utils.version import (
     check_version_compatibility,
 )
@@ -81,7 +84,7 @@ class EquivariantRMSNorm(NativeOP):
                 xt * xt,
                 balance_weight[1:],
             )
-        inv_rms = 1.0 / xp.sqrt(mean_variance + self.eps)
+        inv_rms = 1.0 / safe_for_sqrt(mean_variance + self.eps)
         inv_rms = xp.expand_dims(xp.expand_dims(inv_rms, axis=1), axis=-1)
         x0 = x0 * inv_rms
         if xt.shape[1] > 0:
@@ -157,7 +160,9 @@ class ScalarRMSNorm(NativeOP):
 
     def call(self, x: Array) -> Array:
         xp = array_api_compat.array_namespace(x, self.adam_scale)
-        inv_rms = 1.0 / xp.sqrt(xp.mean(x * x, axis=-1, keepdims=True) + self.eps)
+        inv_rms = 1.0 / safe_for_sqrt(
+            xp.mean(x * x, axis=-1, keepdims=True) + self.eps
+        )
         x = x * inv_rms
         if x.ndim == 2:
             return x * self.adam_scale[0]

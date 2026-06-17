@@ -228,11 +228,23 @@ class SO2Linear(NativeOP):
                 self.bias0[...],
                 (self.n_focus, self.out_channels),
             )
-            out = (
-                out.at[:, :, 0, :].add(bias0[None, :, :])
-                if hasattr(out, "at")
-                else _add_l0_bias_numpy(out, bias0)
-            )
+            if array_api_compat.is_jax_namespace(xp):
+                degree_idx = xp.arange(
+                    out.shape[2],
+                    dtype=xp.int64,
+                    device=array_api_compat.device(out),
+                )
+                degree_mask = xp.astype(
+                    degree_idx[None, None, :, None] == 0,
+                    out.dtype,
+                )
+                out = out + degree_mask * bias0[None, :, None, :]
+            else:
+                out = (
+                    out.at[:, :, 0, :].add(bias0[None, :, :])
+                    if hasattr(out, "at")
+                    else _add_l0_bias_numpy(out, bias0)
+                )
         return out
 
     def serialize(self) -> dict[str, Any]:
@@ -294,6 +306,28 @@ def _set_so2_block(
     col1: int,
     value: Array,
 ) -> Array:
+    xp = array_api_compat.array_namespace(weight, value)
+    if array_api_compat.is_jax_namespace(xp):
+        row_idx = xp.arange(
+            weight.shape[0],
+            dtype=xp.int64,
+            device=array_api_compat.device(weight),
+        )
+        col_idx = xp.arange(
+            weight.shape[2],
+            dtype=xp.int64,
+            device=array_api_compat.device(weight),
+        )
+        block_rows = xp.arange(row0, row1, dtype=xp.int64, device=array_api_compat.device(weight))
+        block_cols = xp.arange(col0, col1, dtype=xp.int64, device=array_api_compat.device(weight))
+        row_mask = xp.astype(row_idx[:, None] == block_rows[None, :], weight.dtype)
+        col_mask = xp.astype(block_cols[:, None] == col_idx[None, :], weight.dtype)
+        update = xp.einsum("ri,ifj,jc->rfc", row_mask, value, col_mask)
+        full_mask = xp.sum(row_mask, axis=1)[:, None, None] * xp.sum(
+            col_mask,
+            axis=0,
+        )[None, None, :]
+        return weight * (1.0 - full_mask) + update
     if hasattr(weight, "at"):
         return weight.at[row0:row1, :, col0:col1].set(value)
     weight[row0:row1, :, col0:col1] = value
@@ -557,6 +591,20 @@ class DynamicRadialDegreeMixer(NativeOP):
 
 
 def _set_flat_columns(target: Array, index: Array, source: Array) -> Array:
+    xp = array_api_compat.array_namespace(target, index, source)
+    if array_api_compat.is_jax_namespace(xp):
+        col_idx = xp.arange(
+            target.shape[1],
+            dtype=index.dtype,
+            device=array_api_compat.device(index),
+        )
+        mask = xp.astype(index[:, None] == col_idx[None, :], target.dtype)
+        col_mask = xp.sum(mask, axis=0)
+        if target.ndim == 2:
+            update = xp.matmul(source, mask)
+            return target * (1.0 - col_mask[None, :]) + update
+        update = xp.einsum("rkc,kj->rjc", source, mask)
+        return target * (1.0 - col_mask[None, :, None]) + update
     if hasattr(target, "at"):
         if target.ndim == 2:
             return target.at[:, index].set(source)
@@ -1317,21 +1365,24 @@ def _segment_envelope_gated_softmax(
     edge_weight_sq = xp.reshape(xp.maximum(edge_env, 0.0), (n_edge,)) ** 2
     zeta = _softplus(xp.reshape(z_bias_raw, (1, n_channel)))
     dst = xp.astype(dst, xp.int64)
+    neg_large = xp.asarray(-1.0e30, dtype=logits_2d.dtype)
     logits_for_max = xp.where(
         xp.reshape(edge_weight_sq > 0.0, (n_edge, 1)),
         logits_2d,
-        xp.full(logits_2d.shape, -xp.inf, dtype=logits_2d.dtype),
+        xp.full(logits_2d.shape, neg_large, dtype=logits_2d.dtype),
     )
     group_max = xp.full(
         (n_nodes, n_channel),
-        -xp.inf,
+        neg_large,
         dtype=logits_2d.dtype,
     )
     group_max = _scatter_max_first_axis(group_max, dst, logits_for_max)
     edge_max = xp.take(group_max, dst, axis=0)
-    edge_max = xp.where(xp.isfinite(edge_max), edge_max, xp.zeros_like(edge_max))
+    edge_has_value = edge_max > neg_large * 0.5
+    edge_max = xp.where(edge_has_value, edge_max, xp.zeros_like(edge_max))
+    group_has_value = group_max > neg_large * 0.5
     group_max_safe = xp.where(
-        xp.isfinite(group_max),
+        group_has_value,
         group_max,
         xp.zeros_like(group_max),
     )
@@ -1351,6 +1402,18 @@ def _softplus(x: Array) -> Array:
 
 
 def _scatter_add_first_axis(target: Array, index: Array, source: Array) -> Array:
+    xp = array_api_compat.array_namespace(target, index, source)
+    if array_api_compat.is_jax_namespace(xp):
+        node_idx = xp.arange(
+            target.shape[0],
+            dtype=index.dtype,
+            device=array_api_compat.device(index),
+        )
+        weights = xp.astype(index[:, None] == node_idx[None, :], source.dtype)
+        source_flat = xp.reshape(source, (source.shape[0], -1))
+        update_flat = xp.matmul(xp.permute_dims(weights, (1, 0)), source_flat)
+        update = xp.reshape(update_flat, target.shape)
+        return target + update
     if hasattr(target, "at"):
         return target.at[index].add(source)
     np.add.at(target, index, source)
@@ -1358,6 +1421,18 @@ def _scatter_add_first_axis(target: Array, index: Array, source: Array) -> Array
 
 
 def _scatter_max_first_axis(target: Array, index: Array, source: Array) -> Array:
+    xp = array_api_compat.array_namespace(target, index, source)
+    if array_api_compat.is_jax_namespace(xp):
+        node_idx = xp.arange(
+            target.shape[0],
+            dtype=index.dtype,
+            device=array_api_compat.device(index),
+        )
+        mask = index[:, None] == node_idx[None, :]
+        source_flat = xp.reshape(source, (source.shape[0], -1))
+        target_flat = xp.reshape(target, (target.shape[0], -1))
+        masked = xp.where(mask[:, :, None], source_flat[:, None, :], target_flat)
+        return xp.reshape(xp.max(masked, axis=0), target.shape)
     if hasattr(target, "at"):
         return target.at[index].max(source)
     np.maximum.at(target, index, source)

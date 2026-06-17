@@ -228,32 +228,37 @@ class SO3Linear(NativeOP):
         self.ebed_dim = get_so3_dim_of_lmax(self.lmax)
         dtype = PRECISION_DICT[self.precision.lower()]
         num_l = self.lmax + 1
-        self.weight = np.empty(
+        weight = np.empty(
             (num_l, self.in_channels, self.n_focus * self.out_channels),
             dtype=dtype,
         )
         if init_std is not None:
             rng = np.random.default_rng(seed)
             if init_std == 0.0:
-                self.weight.fill(0.0)
+                weight.fill(0.0)
             else:
-                self.weight = rng.normal(
+                weight = rng.normal(
                     0.0,
                     init_std,
-                    self.weight.shape,
+                    weight.shape,
                 ).astype(dtype)
         else:
-            for l_idx in range(num_l):
-                rng = np.random.default_rng(child_seed(seed, 1000 + l_idx))
-                std = 1.0 / np.sqrt(
-                    float(self.in_channels + self.n_focus * self.out_channels)
-                )
-                self.weight[l_idx] = _trunc_normal(
-                    rng,
-                    self.weight[l_idx].shape,
-                    std=std,
-                    dtype=dtype,
-                )
+            std = 1.0 / np.sqrt(
+                float(self.in_channels + self.n_focus * self.out_channels)
+            )
+            weight = np.stack(
+                [
+                    _trunc_normal(
+                        np.random.default_rng(child_seed(seed, 1000 + l_idx)),
+                        weight[l_idx].shape,
+                        std=std,
+                        dtype=dtype,
+                    )
+                    for l_idx in range(num_l)
+                ],
+                axis=0,
+            )
+        self.weight = weight
         self.bias = (
             np.zeros(self.n_focus * self.out_channels, dtype=dtype)
             if self.mlp_bias
@@ -277,9 +282,22 @@ class SO3Linear(NativeOP):
         out = xp.einsum("ndfi,difo->ndfo", x, weight_expanded)
         if self.mlp_bias:
             bias = xp.reshape(self.bias[...], (self.n_focus, self.out_channels))
-            zeros = xp.zeros_like(out)
-            zeros = zeros.at[:, 0, :, :].add(bias[None, :, :]) if hasattr(zeros, "at") else _add_l0_bias_numpy(zeros, bias)
-            out = out + zeros
+            if array_api_compat.is_jax_namespace(xp):
+                degree_idx = xp.arange(
+                    out.shape[1],
+                    dtype=xp.int64,
+                    device=array_api_compat.device(out),
+                )
+                degree_mask = xp.astype(degree_idx[None, :, None, None] == 0, out.dtype)
+                out = out + degree_mask * bias[None, None, :, :]
+            else:
+                zeros = xp.zeros_like(out)
+                zeros = (
+                    zeros.at[:, 0, :, :].add(bias[None, :, :])
+                    if hasattr(zeros, "at")
+                    else _add_l0_bias_numpy(zeros, bias)
+                )
+                out = out + zeros
         return out
 
     def serialize(self) -> dict[str, Any]:

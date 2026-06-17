@@ -457,15 +457,26 @@ def freeze(
     model: str,
     output: str = "frozen_model.pth",
     head: str | None = None,
+    hessian: bool = False,
 ) -> None:
     # DPA4 / SeZM checkpoints are routed to the AOTInductor .pt2 exporter
     from deepmd.pt.entrypoints.freeze_pt2 import (
         freeze_sezm_to_pt2,
         is_sezm_checkpoint,
+        save_sezm_hessian_checkpoint,
     )
 
     output_path = Path(output)
     if is_sezm_checkpoint(model):
+        if hessian:
+            out_pt = str(output_path.with_suffix(".pt"))
+            save_sezm_hessian_checkpoint(model, out_pt, head=head)
+            log.info(
+                "Detected DPA4 / SeZM checkpoint '%s'; saved Hessian checkpoint to %s",
+                model,
+                out_pt,
+            )
+            return
         out_pt2 = str(output_path.with_suffix(".pt2"))
         freeze_sezm_to_pt2(model, out_pt2, head=head)
         log.info(
@@ -474,6 +485,13 @@ def freeze(
             out_pt2,
         )
         return
+
+    if hessian:
+        raise NotImplementedError(
+            "`dp --pt freeze --hessian` is currently supported for DPA4/SeZM "
+            "checkpoints. Non-SeZM TorchScript freeze drops hessian_mode due to "
+            "JIT limitations."
+        )
 
     # TorchScript frozen models use the .pth suffix by convention.
     output = str(output_path.with_suffix(".pth"))
@@ -671,7 +689,12 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
         # Output suffix is decided inside freeze(): SeZM checkpoints
         # produce ``.pt2`` (AOTInductor), every other backend produces
         # the legacy ``.pth`` (TorchScript).
-        freeze(model=FLAGS.model, output=FLAGS.output, head=FLAGS.head)
+        freeze(
+            model=FLAGS.model,
+            output=FLAGS.output,
+            head=FLAGS.head,
+            hessian=FLAGS.hessian,
+        )
     elif FLAGS.command == "change-bias":
         change_bias(
             input_file=FLAGS.INPUT,

@@ -159,7 +159,16 @@ def load_dp_model(filename: str) -> dict:
     if filename_extension in {".dp", ".hlo"}:
         with h5py.File(filename, "r") as f:
             model_dict = json.loads(f.attrs["json"])
-            model_dict = traverse_model_dict(model_dict, lambda x: f[x][()].copy())
+
+            def load_variable(path: str) -> Any:
+                value = f[path][()]
+                if isinstance(value, bytes):
+                    return np.void(value)
+                if hasattr(value, "copy"):
+                    return value.copy()
+                return value
+
+            model_dict = traverse_model_dict(model_dict, load_variable)
     elif filename_extension in {".yaml", ".yml"}:
 
         def convert_numpy_ndarray(x: Any) -> Any:

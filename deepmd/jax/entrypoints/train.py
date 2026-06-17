@@ -7,6 +7,9 @@ Can handle local training.
 import json
 import logging
 import time
+from copy import (
+    deepcopy,
+)
 from typing import (
     Any,
 )
@@ -18,8 +21,14 @@ from deepmd.jax.env import (
     jax,
     jax_export,
 )
+from deepmd.jax.model.base_model import (
+    BaseModel,
+)
 from deepmd.jax.train.trainer import (
     DPTrainer,
+)
+from deepmd.dpmodel.utils.update_sel import (
+    UpdateSel,
 )
 from deepmd.utils import random as dp_random
 from deepmd.utils.argcheck import (
@@ -139,11 +148,9 @@ def train(
 
     jdata = normalize(jdata)
     loss_param = jdata.get("loss", {})
-    if (
-        loss_param.get("type", "ener") == "ener"
-        and loss_param.get("start_pref_h", 0.0) != 0.0
-        and loss_param.get("limit_pref_h", 0.0) != 0.0
-    ):
+    if loss_param.get("type", "ener") == "ener" and loss_param.get(
+        "start_pref_h", 0.0
+    ) > 0.0:
         jdata["model"]["hessian_mode"] = True
     if not skip_neighbor_stat:
         jdata = update_sel(jdata)
@@ -203,8 +210,39 @@ def train(
 def update_sel(jdata: dict) -> dict:
     """Update descriptor selections from neighbor statistics when available."""
     log.info(
-        "Skip neighbor statistics update for JAX training; "
-        "BaseModel.update_sel currently needs more memory than expected."
+        "Calculate neighbor statistics... (add --skip-neighbor-stat to skip this step)"
     )
-    # TODO: Restore BaseModel.update_sel once the JAX data path avoids OOM.
-    return jdata.copy()
+    jdata_cpy = deepcopy(jdata)
+    type_map = jdata["model"].get("type_map")
+    train_data = get_data(
+        jdata["training"]["training_data"],
+        0,
+        type_map,
+        None,
+    )
+    jdata_cpy["model"], _ = BaseModel.update_sel(
+        train_data,
+        type_map,
+        jdata["model"],
+    )
+    descriptor = jdata_cpy["model"].get("descriptor", {})
+    descriptor_type = descriptor.get("type")
+    if descriptor_type in {"SeZM", "sezm", "DPA4", "dpa4"}:
+        _, stat_sel = UpdateSel().get_nbor_stat(
+            train_data,
+            type_map,
+            descriptor["rcut"],
+            mixed_type=True,
+        )
+        old_sel = descriptor.get("sel")
+        if isinstance(old_sel, int) and stat_sel:
+            new_sel = min(old_sel, int(stat_sel[0]))
+            if new_sel != old_sel:
+                log.info(
+                    "JAX SeZM neighbor selection is reduced from %d to %d "
+                    "using training-data neighbor statistics.",
+                    old_sel,
+                    new_sel,
+                )
+                descriptor["sel"] = new_sel
+    return jdata_cpy

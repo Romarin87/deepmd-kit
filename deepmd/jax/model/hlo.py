@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import json
 from typing import (
     Any,
 )
@@ -10,6 +11,10 @@ from deepmd.dpmodel.output_def import (
     FittingOutputDef,
     ModelOutputDef,
     OutputVariableDef,
+)
+from deepmd.dpmodel.utils import (
+    build_neighbor_list,
+    extend_coord_with_ghosts,
 )
 from deepmd.jax.env import (
     jax_export,
@@ -29,6 +34,21 @@ OUTPUT_DEFS = {
         reducible=True,
         r_differentiable=True,
         c_differentiable=True,
+    ),
+    "energy_ef": OutputVariableDef(
+        "energy",
+        shape=[1],
+        reducible=True,
+        r_differentiable=True,
+        c_differentiable=False,
+    ),
+    "energy_hessian": OutputVariableDef(
+        "energy",
+        shape=[1],
+        reducible=True,
+        r_differentiable=True,
+        c_differentiable=True,
+        r_hessian=True,
     ),
     "mask": OutputVariableDef(
         "mask",
@@ -58,9 +78,13 @@ class HLO(BaseModel):
         mixed_types: bool,
         min_nbor_dist: float | None,
         sel: list[int],
+        stablehlo_hessian_block: bytearray | None = None,
+        stablehlo_ef: bytearray | None = None,
+        stablehlo_ef_no_ghost: bytearray | None = None,
         # new in v3.1.1
         has_default_fparam: bool = False,
         default_fparam: list[float] | None = None,
+        hessian_chunk_size: int = 0,
     ) -> None:
         self._call_lower = jax_export.deserialize(stablehlo).call
         self._call_lower_atomic_virial = jax_export.deserialize(
@@ -70,6 +94,21 @@ class HLO(BaseModel):
         self._call_lower_atomic_virial_no_ghost = jax_export.deserialize(
             stablehlo_atomic_virial_no_ghost
         ).call
+        self._call_lower_ef = (
+            jax_export.deserialize(stablehlo_ef).call
+            if stablehlo_ef is not None
+            else None
+        )
+        self._call_lower_ef_no_ghost = (
+            jax_export.deserialize(stablehlo_ef_no_ghost).call
+            if stablehlo_ef_no_ghost is not None
+            else None
+        )
+        self._call_hessian_block = (
+            jax_export.deserialize(stablehlo_hessian_block).call
+            if stablehlo_hessian_block is not None
+            else None
+        )
         self.stablehlo = stablehlo
         self.type_map = type_map
         self.rcut = rcut
@@ -84,6 +123,7 @@ class HLO(BaseModel):
         self.model_def_script = model_def_script
         self._has_default_fparam = has_default_fparam
         self.default_fparam = default_fparam
+        self.hessian_chunk_size = hessian_chunk_size
 
     def __call__(
         self,
@@ -170,8 +210,60 @@ class HLO(BaseModel):
         )
 
     def model_output_def(self) -> ModelOutputDef:
+        model_def_script = json.loads(self.model_def_script)
+        hessian_mode = (
+            model_def_script.get("hessian_mode", False)
+            and self.hessian_chunk_size <= 0
+        )
         return ModelOutputDef(
-            FittingOutputDef([OUTPUT_DEFS[tt] for tt in self.model_output_type()])
+            FittingOutputDef(
+                [
+                    OUTPUT_DEFS[
+                        tt if not (hessian_mode and tt == "energy") else f"{tt}_hessian"
+                    ]
+                    for tt in self.model_output_type()
+                ]
+            )
+        )
+
+    def model_output_def_ef(self) -> ModelOutputDef:
+        return ModelOutputDef(
+            FittingOutputDef(
+                [
+                    OUTPUT_DEFS[f"{tt}_ef" if tt == "energy" else tt]
+                    for tt in self.model_output_type()
+                ]
+            )
+        )
+
+    def has_ef_only(self) -> bool:
+        return (
+            self._call_lower_ef is not None
+            and self._call_lower_ef_no_ghost is not None
+        )
+
+    def call_ef(
+        self,
+        coord: jnp.ndarray,
+        atype: jnp.ndarray,
+        box: jnp.ndarray | None = None,
+        fparam: jnp.ndarray | None = None,
+        aparam: jnp.ndarray | None = None,
+    ) -> dict[str, jnp.ndarray]:
+        if not self.has_ef_only():
+            raise RuntimeError("This HLO model does not contain an E/F-only output.")
+        return model_call_from_call_lower(
+            call_lower=self.call_lower_ef,
+            rcut=self.get_rcut(),
+            sel=self.get_sel(),
+            mixed_types=self.mixed_types(),
+            model_output_def=self.model_output_def_ef(),
+            coord=coord,
+            atype=atype,
+            box=box,
+            fparam=fparam,
+            aparam=aparam,
+            do_atomic_virial=False,
         )
 
     def call_lower(
@@ -203,6 +295,84 @@ class HLO(BaseModel):
             fparam,
             aparam,
         )
+
+    def call_lower_ef(
+        self,
+        extended_coord: jnp.ndarray,
+        extended_atype: jnp.ndarray,
+        nlist: jnp.ndarray,
+        mapping: jnp.ndarray | None = None,
+        fparam: jnp.ndarray | None = None,
+        aparam: jnp.ndarray | None = None,
+        do_atomic_virial: bool = False,
+        charge_spin: jnp.ndarray | None = None,
+    ) -> dict[str, jnp.ndarray]:
+        del do_atomic_virial, charge_spin
+        if not self.has_ef_only():
+            raise RuntimeError("This HLO model does not contain an E/F-only output.")
+        if extended_coord.shape[1] > nlist.shape[1]:
+            call_lower = self._call_lower_ef
+        else:
+            call_lower = self._call_lower_ef_no_ghost
+        assert call_lower is not None
+        return call_lower(
+            extended_coord,
+            extended_atype,
+            nlist,
+            mapping,
+            fparam,
+            aparam,
+        )
+
+    def call_hessian_block(
+        self,
+        coord: jnp.ndarray,
+        atype: jnp.ndarray,
+        box: jnp.ndarray | None = None,
+        fparam: jnp.ndarray | None = None,
+        aparam: jnp.ndarray | None = None,
+        block_index: jnp.ndarray | int = 0,
+    ) -> dict[str, jnp.ndarray]:
+        if self.hessian_chunk_size <= 0:
+            raise RuntimeError("This HLO model does not contain Hessian block output.")
+        if self._call_hessian_block is None:
+            raise RuntimeError("This HLO model does not contain Hessian block output.")
+        nframes, nloc = atype.shape[:2]
+        coord = coord.reshape(nframes, nloc, 3)
+        extended_coord, extended_atype, mapping = extend_coord_with_ghosts(
+            coord,
+            atype,
+            box,
+            self.get_rcut(),
+        )
+        nlist = build_neighbor_list(
+            extended_coord,
+            extended_atype,
+            nloc,
+            self.get_rcut(),
+            self.get_sel(),
+            distinguish_types=False,
+        )
+        extended_coord = extended_coord.reshape(nframes, -1, 3)
+        if extended_coord.shape[1] == nloc:
+            dummy_coord = jnp.zeros((nframes, 1, 3), dtype=extended_coord.dtype)
+            dummy_atype = -jnp.ones((nframes, 1), dtype=extended_atype.dtype)
+            dummy_mapping = jnp.zeros((nframes, 1), dtype=mapping.dtype)
+            extended_coord = jnp.concatenate([extended_coord, dummy_coord], axis=1)
+            extended_atype = jnp.concatenate([extended_atype, dummy_atype], axis=1)
+            mapping = jnp.concatenate([mapping, dummy_mapping], axis=1)
+        return self._call_hessian_block(
+            extended_coord,
+            extended_atype,
+            nlist,
+            mapping,
+            fparam,
+            aparam,
+            jnp.asarray(block_index, dtype=jnp.int32),
+        )
+
+    def get_hessian_chunk_size(self) -> int:
+        return self.hessian_chunk_size
 
     def get_type_map(self) -> list[str]:
         """Get the type map."""

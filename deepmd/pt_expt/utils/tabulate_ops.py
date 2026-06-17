@@ -29,9 +29,22 @@ import torch
 _registered: set[str] = set()
 
 
+def _op_exists(op_name: str) -> bool:
+    """Return whether a custom op is known to the torch dispatcher."""
+    try:
+        torch._C._dispatch_has_kernel_for_dispatch_key(op_name, "Meta")
+    except RuntimeError as e:
+        if "does not exist" in str(e):
+            return False
+        raise
+    return True
+
+
 def _try_register_fake(op_name: str, fn: Callable[..., Any]) -> None:
     """Register a fake implementation, silently skipping if already registered."""
     if op_name in _registered:
+        return
+    if not _op_exists(op_name):
         return
     try:
         torch.library.register_fake(op_name)(fn)
@@ -40,6 +53,11 @@ def _try_register_fake(op_name: str, fn: Callable[..., Any]) -> None:
         if "already has" in str(e) or "already registered" in str(e):
             # Op already has an implementation (e.g. C++ library loaded).
             _registered.add(op_name)
+        elif "does not exist" in str(e):
+            # Import paths such as `dp --pt test` may not load the optional
+            # tabulate op library. Leave the op unregistered so a later
+            # ensure_fake_registered() call can retry after the library loads.
+            return
         else:
             raise
 
@@ -59,7 +77,7 @@ def ensure_fake_registered() -> None:
         return
 
     # --- tabulate_fusion_se_a ---
-    if hasattr(torch.ops.deepmd, "tabulate_fusion_se_a"):
+    if _op_exists("deepmd::tabulate_fusion_se_a"):
 
         def _fake_se_a(
             table: torch.Tensor,
@@ -73,7 +91,7 @@ def ensure_fake_registered() -> None:
         _try_register_fake("deepmd::tabulate_fusion_se_a", _fake_se_a)
 
     # --- tabulate_fusion_se_r ---
-    if hasattr(torch.ops.deepmd, "tabulate_fusion_se_r"):
+    if _op_exists("deepmd::tabulate_fusion_se_r"):
 
         def _fake_se_r(
             table: torch.Tensor,
@@ -86,7 +104,7 @@ def ensure_fake_registered() -> None:
         _try_register_fake("deepmd::tabulate_fusion_se_r", _fake_se_r)
 
     # --- tabulate_fusion_se_t ---
-    if hasattr(torch.ops.deepmd, "tabulate_fusion_se_t"):
+    if _op_exists("deepmd::tabulate_fusion_se_t"):
 
         def _fake_se_t(
             table: torch.Tensor,
@@ -100,7 +118,7 @@ def ensure_fake_registered() -> None:
         _try_register_fake("deepmd::tabulate_fusion_se_t", _fake_se_t)
 
     # --- tabulate_fusion_se_t_tebd ---
-    if hasattr(torch.ops.deepmd, "tabulate_fusion_se_t_tebd"):
+    if _op_exists("deepmd::tabulate_fusion_se_t_tebd"):
 
         def _fake_se_t_tebd(
             table: torch.Tensor,
@@ -116,7 +134,7 @@ def ensure_fake_registered() -> None:
         _try_register_fake("deepmd::tabulate_fusion_se_t_tebd", _fake_se_t_tebd)
 
     # --- tabulate_fusion_se_atten ---
-    if hasattr(torch.ops.deepmd, "tabulate_fusion_se_atten"):
+    if _op_exists("deepmd::tabulate_fusion_se_atten"):
 
         def _fake_se_atten(
             table: torch.Tensor,

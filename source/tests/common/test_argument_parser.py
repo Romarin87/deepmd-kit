@@ -304,6 +304,7 @@ class TestParserOutput(unittest.TestCase):
             "--checkpoint-folder": {"type": str, "value": "FOLDER"},
             "--output": {"type": str, "value": "FROZEN.PB"},
             "--node-names": {"type": (str, type(None)), "value": "NODES"},
+            "--hessian": {"type": bool},
         }
 
         self.run_test(command="freeze", mapping=ARGS)

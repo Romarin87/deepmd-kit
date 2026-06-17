@@ -7,6 +7,9 @@ import numpy as np
 from packaging.version import (
     Version,
 )
+from jax.sharding import (
+    PartitionSpec as P,
+)
 
 from deepmd.dpmodel.descriptor.sezm import (
     C3CutoffEnvelope as C3CutoffEnvelopeDP,
@@ -42,6 +45,7 @@ from deepmd.jax.descriptor.sezm_ffn import (
 )
 from deepmd.jax.env import (
     flax_version,
+    jax,
     nnx,
 )
 from deepmd.jax.utils.network import (
@@ -70,6 +74,20 @@ def _pt_value(value: Any) -> Any:
     arr = np.asarray(value)
     if arr.ndim > 1 and arr.shape[0] == 1:
         return np.squeeze(arr, axis=0)
+    return value
+
+
+def _maybe_with_sharding_constraint(value: Any, spec: P) -> Any:
+    if value is None:
+        return None
+    try:
+        return jax.lax.with_sharding_constraint(value, spec)
+    except (RuntimeError, ValueError) as exc:
+        msg = str(exc)
+        if "non-empty mesh" not in msg and (
+            "Resource axis" not in msg or "not found in mesh" not in msg
+        ):
+            raise
     return value
 
 
@@ -515,6 +533,35 @@ class DescrptSeZM(DescrptSeZMDP):
             if not isinstance(value, EquivariantFFN):
                 value = EquivariantFFN.deserialize(value.serialize())
         return super().__setattr__(name, value)
+
+    def call(
+        self,
+        coord_ext: Any,
+        atype_ext: Any,
+        nlist: Any,
+        mapping: Any | None = None,
+        fparam: Any | None = None,
+        comm_dict: dict | None = None,
+        charge_spin: Any | None = None,
+    ) -> tuple[Any, Any, Any, Any, Any]:
+        if len(coord_ext.shape) == 3:
+            coord_ext = _maybe_with_sharding_constraint(
+                coord_ext, P(None, "natoms", None)
+            )
+        elif len(coord_ext.shape) == 2:
+            coord_ext = _maybe_with_sharding_constraint(coord_ext, P(None, "natoms"))
+        atype_ext = _maybe_with_sharding_constraint(atype_ext, P(None, "natoms"))
+        nlist = _maybe_with_sharding_constraint(nlist, P(None, "natoms", None))
+        mapping = _maybe_with_sharding_constraint(mapping, P(None, "natoms"))
+        return super().call(
+            coord_ext,
+            atype_ext,
+            nlist,
+            mapping=mapping,
+            fparam=fparam,
+            comm_dict=comm_dict,
+            charge_spin=charge_spin,
+        )
 
     @classmethod
     def deserialize(cls, data: dict[str, Any]) -> "DescrptSeZM":

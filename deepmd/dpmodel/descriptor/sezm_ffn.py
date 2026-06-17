@@ -294,6 +294,22 @@ class SwiGLUS2Activation(NativeOP):
         return xp.reshape(x, (n_batch, n_focus, coeff_dim, self.channels))
 
     def _merge_scalar_outputs(self, outputs: Array, scalar_outputs: Array) -> Array:
+        xp = array_api_compat.array_namespace(outputs, scalar_outputs)
+        if array_api_compat.is_jax_namespace(xp):
+            coeff_axis = 1 if self.layout == "ndfc" else 2
+            coeff_idx = xp.arange(
+                outputs.shape[coeff_axis],
+                dtype=xp.int64,
+                device=array_api_compat.device(outputs),
+            )
+            coeff_mask = xp.astype(coeff_idx == 0, outputs.dtype)
+            if self.layout == "ndfc":
+                return outputs + scalar_outputs[:, None, :, :] * coeff_mask[
+                    None, :, None, None
+                ]
+            return outputs + scalar_outputs[:, :, None, :] * coeff_mask[
+                None, None, :, None
+            ]
         if self.layout == "ndfc":
             if hasattr(outputs, "at"):
                 return outputs.at[:, 0, :, :].add(scalar_outputs)
