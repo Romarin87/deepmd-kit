@@ -35,6 +35,10 @@ from .make_model import (
 DPEnergyModel_ = make_model(DPEnergyAtomicModel, T_Bases=(NativeOP, BaseModel))
 
 
+@BaseModel.register("SeZM")
+@BaseModel.register("sezm")
+@BaseModel.register("DPA4")
+@BaseModel.register("dpa4")
 @BaseModel.register("ener")
 class EnergyModel(DPModelCommon, DPEnergyModel_):
     r"""Energy model that predicts total energy and derived quantities.
