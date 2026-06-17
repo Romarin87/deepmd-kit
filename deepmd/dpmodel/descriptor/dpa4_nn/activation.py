@@ -163,8 +163,10 @@ class GatedActivation(NativeOP):
             ).astype(prec)
         else:
             # pt uses nn.Identity() here (parameter-free, no state-dict keys);
-            # the dpmodel equivalent is no gate module at all.
-            expand_index = np.zeros((0,), dtype=np.int64)
+            # the dpmodel equivalent is no gate module at all.  Use one
+            # placeholder element in runtime state because Orbax cannot
+            # checkpoint zero-size JAX arrays; call() returns before using it.
+            expand_index = np.zeros((1,), dtype=np.int64)
             self.gate_linear = None
         self.expand_index = expand_index
 
@@ -238,7 +240,12 @@ class GatedActivation(NativeOP):
 
     def serialize(self) -> dict[str, Any]:
         """Serialize the GatedActivation to a dict (pt-compatible format)."""
-        variables = {"expand_index": to_numpy_array(self.expand_index)}
+        expand_index = (
+            np.zeros((0,), dtype=np.int64)
+            if self.lmax == 0
+            else to_numpy_array(self.expand_index)
+        )
+        variables = {"expand_index": expand_index}
         if self.gate_linear is not None:
             variables["gate_linear.weight"] = to_numpy_array(self.gate_linear.weight)
             if self.mlp_bias:
@@ -287,7 +294,10 @@ class GatedActivation(NativeOP):
         )
         prec = PRECISION_DICT[obj.precision.lower()]
         expand_index = np.asarray(variables["expand_index"], dtype=np.int64)
-        if not np.array_equal(expand_index, to_numpy_array(obj.expand_index)):
+        expected_expand_index = to_numpy_array(obj.expand_index)
+        if obj.lmax == 0 and expand_index.size in (0, expected_expand_index.size):
+            pass
+        elif not np.array_equal(expand_index, expected_expand_index):
             raise ValueError("expand_index does not match the lmax/mmax tables")
         if obj.gate_linear is not None:
             weight = np.asarray(variables["gate_linear.weight"], dtype=prec)
