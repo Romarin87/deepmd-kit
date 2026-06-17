@@ -66,10 +66,10 @@ class SeZMNetworkCollection(SeZMNetworkCollectionDP):
         "sezm_fitting_network": GLUFittingNet,
     }
 
-    def __setattr__(self, name: str, value) -> None:  # noqa: ANN001
-        if name in self._jax_skip_auto_convert_attrs and isinstance(value, list):
-            value = nnx.List(value)
-        return super().__setattr__(name, value)
+    def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002,ANN003
+        super().__init__(*args, **kwargs)
+        self._networks = nnx.List(list(self._networks))
+        self.networks = self._networks
 
 
 @BaseFitting.register("ener")
