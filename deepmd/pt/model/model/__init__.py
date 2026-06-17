@@ -463,7 +463,7 @@ def get_model(model_params: dict) -> Any:
             return get_standard_model(model_params)
     elif model_type == "linear_ener":
         return get_linear_model(model_params)
-    elif model_type in ("SeZM", "sezm", "dpa4"):
+    elif model_type in ("SeZM", "sezm", "DPA4", "dpa4"):
         if "spin" in model_params:
             return get_sezm_spin_model(model_params)
         return get_sezm_model(model_params)
