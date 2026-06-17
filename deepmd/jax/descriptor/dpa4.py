@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import deepmd.jax.descriptor.dpa4_nn as _jax_dpa4_nn  # noqa: F401
 import deepmd.jax.utils.exclude_mask as _jax_exclude_mask  # noqa: F401
 import deepmd.jax.utils.network as _jax_network  # noqa: F401
 from deepmd.dpmodel.descriptor.dpa4 import (
