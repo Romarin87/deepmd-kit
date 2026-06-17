@@ -675,7 +675,7 @@ class EnergyHessianLoss(EnergyLoss):
                 DataRequirementItem(
                     "hessian",
                     ndof=1,
-                    atomic=False,
+                    atomic=True,
                     must=False,
                     high_prec=False,
                 )
