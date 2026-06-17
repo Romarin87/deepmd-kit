@@ -716,19 +716,37 @@ class EnergyHessianStdLoss(EnergyStdLoss):
             ) - model_pred["hessian"].reshape(
                 -1,
             )
-            l2_hessian_loss = torch.mean(torch.square(diff_h))
-            if not self.inference:
-                more_loss["l2_hessian_loss"] = self.display_if_exist(
-                    l2_hessian_loss.detach(), find_hessian
+            if self.loss_func == "mse":
+                l2_hessian_loss = torch.mean(torch.square(diff_h))
+                if not self.inference:
+                    more_loss["l2_hessian_loss"] = self.display_if_exist(
+                        l2_hessian_loss.detach(), find_hessian
+                    )
+                loss += pref_h * l2_hessian_loss
+                rmse_h = l2_hessian_loss.sqrt()
+                more_loss["rmse_h"] = self.display_if_exist(
+                    rmse_h.detach(), find_hessian
                 )
-            loss += pref_h * l2_hessian_loss
-            rmse_h = l2_hessian_loss.sqrt()
-            more_loss["rmse_h"] = self.display_if_exist(rmse_h.detach(), find_hessian)
+            elif self.loss_func == "mae":
+                l1_hessian_loss = F.l1_loss(
+                    model_pred["hessian"].reshape(-1),
+                    label["hessian"].reshape(-1),
+                    reduction="mean",
+                )
+                loss += pref_h * l1_hessian_loss
+                more_loss["mae_h"] = self.display_if_exist(
+                    l1_hessian_loss.detach(), find_hessian
+                )
+            else:
+                raise NotImplementedError(
+                    f"Loss type {self.loss_func} is not implemented for hessian loss."
+                )
             if mae:
                 mae_h = torch.mean(torch.abs(diff_h))
                 more_loss["mae_h"] = self.display_if_exist(mae_h.detach(), find_hessian)
 
         if not self.inference:
+            more_loss.pop("rmse", None)
             more_loss["rmse"] = torch.sqrt(loss.detach())
         return model_pred, loss, more_loss
 
