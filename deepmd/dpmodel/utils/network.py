@@ -39,13 +39,22 @@ from deepmd.utils.version import (
 )
 
 
+def _array_api_value(x):  # noqa: ANN001, ANN202
+    value = getattr(x, "value", None)
+    if value is not None and array_api_compat.is_array_api_obj(value):
+        return value
+    return x
+
+
 def sigmoid_t(x):  # noqa: ANN001, ANN201
     """Sigmoid."""
+    x = _array_api_value(x)
     return xp_sigmoid(x)
 
 
 def softplus_t(x):  # noqa: ANN001, ANN201
     """Numerically stable softplus."""
+    x = _array_api_value(x)
     xp = array_api_compat.array_namespace(x)
     positive = x > 0
     exp_neg_abs = xp.exp(xp.where(positive, -x, x))
