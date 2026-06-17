@@ -27,6 +27,9 @@ from deepmd.jax.common import (
     flax_module,
     register_dpmodel_mapping,
 )
+from deepmd.jax.env import (
+    nnx,
+)
 from deepmd.jax.fitting.base_fitting import (
     BaseFitting,
 )
@@ -37,7 +40,7 @@ from deepmd.jax.utils.network import (
 
 @flax_module
 class GLUFittingNet(GLUFittingNetDP):
-    _jax_data_list_attrs: ClassVar[set[str]] = {"hidden_layers"}
+    _jax_skip_auto_convert_attrs: ClassVar[set[str]] = {"hidden_layers"}
 
     def __setattr__(self, name: str, value) -> None:  # noqa: ANN001
         if name == "hidden_layers":
@@ -47,6 +50,7 @@ class GLUFittingNet(GLUFittingNetDP):
                 else NativeLayer.deserialize(item.serialize())
                 for item in value
             ]
+            value = nnx.List(value)
         elif name == "output_layer" and value is not None and not isinstance(
             value, NativeLayer
         ):
