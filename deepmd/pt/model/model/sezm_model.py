@@ -487,6 +487,7 @@ from deepmd.pt.model.model.model import (
 from deepmd.pt.model.model.transform_output import (
     communicate_extended_output,
     edge_energy_deriv,
+    take_hessian,
 )
 from deepmd.pt.utils import (
     env,
@@ -1216,6 +1217,12 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             it.
         """
         del comm_dict
+        if self._hessian_enabled:
+            # Hessian must differentiate through the coordinate -> edge-vector
+            # map so both Hessian axes can be scattered from extended atoms back
+            # to local atoms.  The regular force-optimized path below keeps
+            # edge_vec as the leaf when Hessian is not requested.
+            extended_coord = extended_coord.detach().requires_grad_(True)
         nlist = self.format_nlist(
             extended_coord, extended_atype, nlist, extra_nlist_sort=extra_nlist_sort
         )
@@ -1231,12 +1238,13 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 mapping=mapping,
             )
         )
-        # Edge displacements are the autograd leaf for the force / virial
-        # backward.  The coordinate gather that produced ``edge_vec`` stays a
-        # pure forward op, so the differentiated region is the function
-        # ``(edge_vec, theta) -> E``; this keeps the make_fx symbolic trace and
-        # second-order lowering clean (see doc/outisli/dpa4.md §12.4).
-        edge_vec = edge_vec.detach().requires_grad_(True)
+        if not self._hessian_enabled:
+            # Edge displacements are the autograd leaf for the force / virial
+            # backward.  The coordinate gather that produced ``edge_vec`` stays
+            # a pure forward op, so the differentiated region is the function
+            # ``(edge_vec, theta) -> E``; this keeps the make_fx symbolic trace
+            # and second-order lowering clean (see doc/outisli/dpa4.md §12.4).
+            edge_vec = edge_vec.detach().requires_grad_(True)
 
         # === Step 2. Descriptor forward ===
         with nvtx_range("SeZM/descriptor"):
@@ -1322,7 +1330,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             create_graph=self.training,
             extended_coord_corr=extended_coord_corr,
         )
-        return {
+        ret = {
             "energy": energy_atom,
             "energy_redu": energy_redu,
             "energy_derv_r": energy_derv_r,
@@ -1330,6 +1338,16 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             "energy_derv_c_redu": energy_derv_c_redu,
             "mask": fit_ret["mask"],
         }
+        if self._hessian_enabled:
+            energy_def = self.atomic_output_def()["energy"]
+            if energy_def.r_hessian:
+                ret["energy_derv_r_derv_r"] = take_hessian(
+                    energy_redu,
+                    energy_def,
+                    extended_coord,
+                    create_graph=self.training,
+                )
+        return ret
 
     def core_compute_dens(
         self,
