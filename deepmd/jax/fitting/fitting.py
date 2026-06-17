@@ -60,9 +60,16 @@ class GLUFittingNet(GLUFittingNetDP):
 
 @flax_module
 class SeZMNetworkCollection(SeZMNetworkCollectionDP):
+    _jax_skip_auto_convert_attrs: ClassVar[set[str]] = {"_networks", "networks"}
+
     NETWORK_TYPE_MAP = {
         "sezm_fitting_network": GLUFittingNet,
     }
+
+    def __setattr__(self, name: str, value) -> None:  # noqa: ANN001
+        if name in self._jax_skip_auto_convert_attrs and isinstance(value, list):
+            value = nnx.List(value)
+        return super().__setattr__(name, value)
 
 
 @BaseFitting.register("ener")
