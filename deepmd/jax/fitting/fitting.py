@@ -1,4 +1,8 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+from typing import (
+    ClassVar,
+)
+
 import deepmd.jax.utils.exclude_mask as _jax_exclude_mask  # noqa: F401
 import deepmd.jax.utils.network as _jax_network  # noqa: F401
 from deepmd.dpmodel.fitting.dipole_fitting import DipoleFitting as DipoleFittingNetDP
@@ -33,6 +37,8 @@ from deepmd.jax.utils.network import (
 
 @flax_module
 class GLUFittingNet(GLUFittingNetDP):
+    _jax_data_list_attrs: ClassVar[set[str]] = {"hidden_layers"}
+
     def __setattr__(self, name: str, value) -> None:  # noqa: ANN001
         if name == "hidden_layers":
             value = [
