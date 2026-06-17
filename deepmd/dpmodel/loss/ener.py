@@ -320,7 +320,7 @@ class EnergyLoss(Loss):
                             delta=self._huber_delta_force,
                         )
                     else:
-                        force_diff_3 = xp.reshape(force_hat - force, (-1, 3))
+                        force_diff_3 = xp.reshape(diff_f, (-1, 3))
                         force_diff_norm = xp.reshape(
                             xp.linalg.vector_norm(force_diff_3, axis=1), (-1, 1)
                         )
@@ -337,7 +337,7 @@ class EnergyLoss(Loss):
                 if not self.f_use_norm:
                     l1_force_loss = xp.mean(xp.abs(diff_f))
                 else:
-                    force_diff_3 = xp.reshape(force_hat - force, (-1, 3))
+                    force_diff_3 = xp.reshape(diff_f, (-1, 3))
                     l1_force_loss = xp.mean(xp.linalg.vector_norm(force_diff_3, axis=1))
                 loss += pref_f * l1_force_loss
                 more_loss["mae_f"] = self.display_if_exist(l1_force_loss, find_force)
