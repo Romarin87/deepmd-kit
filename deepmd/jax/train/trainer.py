@@ -11,6 +11,7 @@ from pathlib import (
     Path,
 )
 from typing import (
+    Any,
     TextIO,
 )
 
@@ -43,6 +44,7 @@ from deepmd.dpmodel.utils.region import (
 )
 from deepmd.jax.env import (
     flax_version,
+    jax,
     jnp,
     nnx,
 )
@@ -78,7 +80,141 @@ log = logging.getLogger(__name__)
 def whether_hessian(loss_params: dict) -> bool:
     """Return whether the loss configuration requests Hessian training."""
     loss_type = loss_params.get("type", "ener")
-    return loss_type == "ener" and loss_params.get("start_pref_h", 0.0) > 0.0
+    return loss_type == "ener" and (
+        loss_params.get("start_pref_h", 0.0) != 0.0
+        or loss_params.get("limit_pref_h", 0.0) != 0.0
+    )
+
+
+def _scatter_extended_to_local(
+    value: jnp.ndarray,
+    mapping: jnp.ndarray | None,
+    nloc: int,
+) -> jnp.ndarray:
+    """Scatter an extended-atom value back onto local atoms."""
+    if mapping is None or mapping.shape[0] == nloc:
+        return value[:nloc]
+    return jnp.zeros((nloc, *value.shape[1:]), dtype=value.dtype).at[mapping].add(value)
+
+
+def _call_hessian_local_block(
+    model: BaseModel,
+    extended_coord: jnp.ndarray,
+    extended_atype: jnp.ndarray,
+    nlist: jnp.ndarray,
+    mapping: jnp.ndarray | None,
+    fparam: jnp.ndarray | None,
+    aparam: jnp.ndarray | None,
+    block_index: jnp.ndarray,
+    chunk_size: int,
+) -> jnp.ndarray:
+    """Return local Hessian rows with shape [nf, chunk_size, nloc * 3]."""
+    block_index = jnp.asarray(block_index, dtype=jnp.int32)
+
+    def energy_one(
+        coord_one: jnp.ndarray,
+        atype_one: jnp.ndarray,
+        nlist_one: jnp.ndarray,
+        mapping_one: jnp.ndarray | None,
+        fparam_one: jnp.ndarray | None,
+        aparam_one: jnp.ndarray | None,
+    ) -> jnp.ndarray:
+        output = model.call_common_lower(
+            coord_one[None, ...],
+            atype_one[None, ...],
+            nlist_one[None, ...],
+            mapping=mapping_one[None, ...] if mapping_one is not None else None,
+            fparam=fparam_one[None, ...] if fparam_one is not None else None,
+            aparam=aparam_one[None, ...] if aparam_one is not None else None,
+            do_atomic_virial=False,
+        )
+        return jnp.sum(output["energy_redu"])
+
+    energy_grad_one = jax.grad(energy_one, argnums=0)
+
+    def hessian_block_one(
+        coord_one: jnp.ndarray,
+        atype_one: jnp.ndarray,
+        nlist_one: jnp.ndarray,
+        mapping_one: jnp.ndarray | None,
+        fparam_one: jnp.ndarray | None,
+        aparam_one: jnp.ndarray | None,
+    ) -> jnp.ndarray:
+        nloc = nlist_one.shape[0]
+        local_dim = nloc * 3
+        row_ids = block_index * chunk_size + jnp.arange(
+            chunk_size,
+            dtype=block_index.dtype,
+        )
+        safe_row_ids = jnp.minimum(row_ids, local_dim - 1)
+
+        def local_energy_grad(coord_ext: jnp.ndarray) -> jnp.ndarray:
+            grad_ext = energy_grad_one(
+                coord_ext,
+                atype_one,
+                nlist_one,
+                mapping_one,
+                fparam_one,
+                aparam_one,
+            )
+            return _scatter_extended_to_local(grad_ext, mapping_one, nloc)
+
+        def hessian_row(row_id: jnp.ndarray) -> jnp.ndarray:
+            row_ext = jax.grad(
+                lambda coord_ext: local_energy_grad(coord_ext).reshape(-1)[row_id]
+            )(coord_one)
+            return _scatter_extended_to_local(row_ext, mapping_one, nloc).reshape(-1)
+
+        rows = jax.vmap(hessian_row)(safe_row_ids)
+        return jnp.where(row_ids[:, None] < local_dim, rows, 0.0)
+
+    in_axes = (
+        0,
+        0,
+        0,
+        None if mapping is None else 0,
+        None if fparam is None else 0,
+        None if aparam is None else 0,
+    )
+    return jax.vmap(hessian_block_one, in_axes=in_axes)(
+        extended_coord,
+        extended_atype,
+        nlist,
+        mapping,
+        fparam,
+        aparam,
+    )
+
+
+def _format_energy_loss_outputs(
+    model_dict: dict[str, jnp.ndarray],
+    label_dict: dict[str, jnp.ndarray],
+) -> dict[str, jnp.ndarray]:
+    """Translate lower model outputs to the EnergyLoss key names."""
+    model_dict["atom_energy"] = model_dict["energy"]
+    model_dict["energy"] = model_dict["energy_redu"]
+    force = model_dict["energy_derv_r"].squeeze(-2)
+    if "force" in label_dict and force.shape != label_dict["force"].shape:
+        force = jnp.reshape(force, label_dict["force"].shape)
+    model_dict["force"] = force
+    model_dict["virial"] = model_dict["energy_derv_c_redu"].squeeze(-2)
+    return model_dict
+
+
+def _block_until_ready_tree(tree: Any) -> None:
+    """Synchronize a pytree of JAX arrays."""
+    for value in jax.tree_util.tree_leaves(tree):
+        block_until_ready = getattr(value, "block_until_ready", None)
+        if block_until_ready is not None:
+            block_until_ready()
+
+
+def _disable_hessian_output(model: BaseModel) -> None:
+    """Disable model-level full Hessian output while keeping E/F derivatives."""
+    if hasattr(model, "_enable_hessian"):
+        model._enable_hessian = False
+    if hasattr(model, "hess_fitting_def"):
+        model.hess_fitting_def = None
 
 
 class DPTrainer:
@@ -122,6 +258,15 @@ class DPTrainer:
         self.optimizer_param = dict(jdata.get("optimizer", {}))
         self.opt_type = self.optimizer_param.pop("type", "Adam")
         self.gradient_max_norm = self.training_param.get("gradient_max_norm")
+        self.hessian_train_chunk_size = int(
+            self.training_param.get(
+                "hessian_chunk_size",
+                os.environ.get("DP_JAX_HESSIAN_TRAIN_CHUNK_SIZE", 4),
+            )
+        )
+        self.hessian_sync_blocks = bool(
+            int(os.environ.get("DP_JAX_HESSIAN_SYNC_BLOCKS", "1"))
+        )
         loss_param = jdata.get("loss", {})
         loss_param["starter_learning_rate"] = learning_rate_param["start_lr"]
 
@@ -129,7 +274,8 @@ class DPTrainer:
         if loss_type == "ener":
             self.has_hessian = whether_hessian(loss_param)
             if self.has_hessian:
-                self.model.enable_hessian()
+                if self.hessian_train_chunk_size <= 0:
+                    self.model.enable_hessian()
                 self.model_def_script["hessian_mode"] = True
                 self.loss = EnergyHessianLoss.get_loss(loss_param)
             else:
@@ -249,6 +395,16 @@ class DPTrainer:
         """Run the training loop with optional validation data."""
         self._ensure_training_length(train_data)
         model = self.model
+        if self.has_hessian and self.hessian_train_chunk_size > 0:
+            # The model object may have been constructed with hessian_mode=True
+            # from the normalized input. Clear that runtime flag so the main
+            # forward only builds E/F; Hessian rows are added below by blocks.
+            _disable_hessian_output(model)
+            log.info(
+                "JAX Hessian training uses row/block loss accumulation with "
+                "chunk_size=%d.",
+                self.hessian_train_chunk_size,
+            )
         tx = self._build_optimizer_tx()
         optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
@@ -265,49 +421,8 @@ class DPTrainer:
             ]
             model.atomic_model.compute_or_load_stat(lambda: stat_data_jax)
 
-        def loss_fn(
+        def call_energy_force_loss_model(
             model: BaseModel,
-            lr: float,
-            label_dict: dict[str, jnp.ndarray],
-            extended_coord: jnp.ndarray,
-            extended_atype: jnp.ndarray,
-            nlist: jnp.ndarray,
-            mapping: jnp.ndarray | None,
-            fp: jnp.ndarray | None,
-            ap: jnp.ndarray | None,
-        ) -> jnp.ndarray:
-            model_dict_lower = model.call_common_lower(
-                extended_coord,
-                extended_atype,
-                nlist,
-                mapping,
-                fp,
-                ap,
-            )
-            model_dict = communicate_extended_output(
-                model_dict_lower,
-                model.model_output_def(),
-                mapping,
-                do_atomic_virial=False,
-            )
-            model_dict["atom_energy"] = model_dict["energy"]
-            model_dict["energy"] = model_dict["energy_redu"]
-            model_dict["force"] = model_dict["energy_derv_r"].squeeze(-2)
-            model_dict["virial"] = model_dict["energy_derv_c_redu"].squeeze(-2)
-            if self.has_hessian and model_dict.get("energy_derv_r_derv_r") is not None:
-                model_dict["hessian"] = model_dict["energy_derv_r_derv_r"].squeeze(-3)
-            loss, more_loss = self.loss(
-                learning_rate=lr,
-                natoms=label_dict["type"].shape[1],
-                model_dict=model_dict,
-                label_dict=label_dict,
-            )
-            return loss
-
-        @nnx.jit
-        def loss_fn_more_loss(
-            model: BaseModel,
-            lr: float,
             label_dict: dict[str, jnp.ndarray],
             extended_coord: jnp.ndarray,
             extended_atype: jnp.ndarray,
@@ -330,12 +445,179 @@ class DPTrainer:
                 mapping,
                 do_atomic_virial=False,
             )
-            model_dict["atom_energy"] = model_dict["energy"]
-            model_dict["energy"] = model_dict["energy_redu"]
-            model_dict["force"] = model_dict["energy_derv_r"].squeeze(-2)
-            model_dict["virial"] = model_dict["energy_derv_c_redu"].squeeze(-2)
+            model_dict = _format_energy_loss_outputs(model_dict, label_dict)
             if self.has_hessian and model_dict.get("energy_derv_r_derv_r") is not None:
                 model_dict["hessian"] = model_dict["energy_derv_r_derv_r"].squeeze(-3)
+            return model_dict
+
+        def hessian_coord_mask(
+            label_dict: dict[str, jnp.ndarray],
+            dtype: jnp.dtype,
+        ) -> jnp.ndarray:
+            atom_mask = jnp.asarray(label_dict["type"] >= 0, dtype=dtype)
+            return jnp.repeat(atom_mask, 3, axis=1)
+
+        def hessian_total_count(label_dict: dict[str, jnp.ndarray]) -> jnp.ndarray:
+            coord_mask = hessian_coord_mask(label_dict, label_dict["hessian"].dtype)
+            weight = coord_mask[:, :, None] * coord_mask[:, None, :]
+            return jnp.sum(weight)
+
+        def hessian_nblocks(label_dict: dict[str, jnp.ndarray]) -> int:
+            dim = label_dict["type"].shape[1] * 3
+            chunk_size = min(self.hessian_train_chunk_size, dim)
+            return (dim + chunk_size - 1) // chunk_size
+
+        def hessian_block_sum_count(
+            model: BaseModel,
+            label_dict: dict[str, jnp.ndarray],
+            extended_coord: jnp.ndarray,
+            extended_atype: jnp.ndarray,
+            nlist: jnp.ndarray,
+            mapping: jnp.ndarray | None,
+            fp: jnp.ndarray | None,
+            ap: jnp.ndarray | None,
+            block_index: jnp.ndarray,
+        ) -> tuple[jnp.ndarray, jnp.ndarray]:
+            natoms = label_dict["type"].shape[1]
+            dim = natoms * 3
+            chunk_size = min(self.hessian_train_chunk_size, dim)
+            nblocks = (dim + chunk_size - 1) // chunk_size
+            padded_dim = nblocks * chunk_size
+            hessian_hat = jnp.reshape(
+                label_dict["hessian"],
+                (label_dict["hessian"].shape[0], dim, dim),
+            )
+            pad_rows = padded_dim - dim
+            if pad_rows:
+                hessian_hat = jnp.pad(hessian_hat, ((0, 0), (0, pad_rows), (0, 0)))
+            coord_mask = hessian_coord_mask(label_dict, hessian_hat.dtype)
+            if pad_rows:
+                coord_mask = jnp.pad(coord_mask, ((0, 0), (0, pad_rows)))
+
+            block = _call_hessian_local_block(
+                model,
+                extended_coord,
+                extended_atype,
+                nlist,
+                mapping,
+                fp,
+                ap,
+                block_index,
+                chunk_size,
+            )
+            row_start = block_index * chunk_size
+            slice_zero = jnp.asarray(0, dtype=row_start.dtype)
+            hessian_block_hat = jax.lax.dynamic_slice(
+                hessian_hat,
+                (slice_zero, row_start, slice_zero),
+                (hessian_hat.shape[0], chunk_size, dim),
+            )
+            row_ids = row_start + jnp.arange(chunk_size, dtype=row_start.dtype)
+            row_weight = jnp.asarray(row_ids < dim, dtype=block.dtype)
+            row_coord_mask = jax.lax.dynamic_slice(
+                coord_mask,
+                (slice_zero, row_start),
+                (coord_mask.shape[0], chunk_size),
+            )
+            weight = (
+                row_weight[None, :, None]
+                * row_coord_mask[:, :, None]
+                * coord_mask[:, None, :dim]
+            )
+            values = hessian_block_hat - block
+            if self.loss.loss_func == "mse":
+                values = values * values
+            elif self.loss.loss_func == "mae":
+                values = jnp.abs(values)
+            else:
+                raise NotImplementedError(
+                    f"Loss type {self.loss.loss_func} is not implemented "
+                    "for Hessian loss."
+                )
+            return jnp.sum(values * weight), jnp.sum(jnp.ones_like(values) * weight)
+
+        def hessian_block_loss(
+            model: BaseModel,
+            lr: float,
+            label_dict: dict[str, jnp.ndarray],
+            extended_coord: jnp.ndarray,
+            extended_atype: jnp.ndarray,
+            nlist: jnp.ndarray,
+            mapping: jnp.ndarray | None,
+            fp: jnp.ndarray | None,
+            ap: jnp.ndarray | None,
+            block_index: jnp.ndarray,
+            total_count: jnp.ndarray,
+        ) -> jnp.ndarray:
+            block_sum, _ = hessian_block_sum_count(
+                model,
+                label_dict,
+                extended_coord,
+                extended_atype,
+                nlist,
+                mapping,
+                fp,
+                ap,
+                block_index,
+            )
+            lr_ratio = lr / self.loss.starter_learning_rate
+            pref_h = self.loss.limit_pref_h + (
+                self.loss.start_pref_h - self.loss.limit_pref_h
+            ) * lr_ratio
+            find_hessian = label_dict.get("find_hessian", True)
+            return pref_h * find_hessian * block_sum / jnp.maximum(total_count, 1.0)
+
+        def loss_fn(
+            model: BaseModel,
+            lr: float,
+            label_dict: dict[str, jnp.ndarray],
+            extended_coord: jnp.ndarray,
+            extended_atype: jnp.ndarray,
+            nlist: jnp.ndarray,
+            mapping: jnp.ndarray | None,
+            fp: jnp.ndarray | None,
+            ap: jnp.ndarray | None,
+        ) -> jnp.ndarray:
+            model_dict = call_energy_force_loss_model(
+                model,
+                label_dict,
+                extended_coord,
+                extended_atype,
+                nlist,
+                mapping,
+                fp,
+                ap,
+            )
+            loss, more_loss = self.loss(
+                learning_rate=lr,
+                natoms=label_dict["type"].shape[1],
+                model_dict=model_dict,
+                label_dict=label_dict,
+            )
+            return loss
+
+        @nnx.jit
+        def loss_fn_more_loss(
+            model: BaseModel,
+            lr: float,
+            label_dict: dict[str, jnp.ndarray],
+            extended_coord: jnp.ndarray,
+            extended_atype: jnp.ndarray,
+            nlist: jnp.ndarray,
+            mapping: jnp.ndarray | None,
+            fp: jnp.ndarray | None,
+            ap: jnp.ndarray | None,
+        ) -> dict[str, jnp.ndarray]:
+            model_dict = call_energy_force_loss_model(
+                model,
+                label_dict,
+                extended_coord,
+                extended_atype,
+                nlist,
+                mapping,
+                fp,
+                ap,
+            )
             loss, more_loss = self.loss(
                 learning_rate=lr,
                 natoms=label_dict["type"].shape[1],
@@ -344,7 +626,70 @@ class DPTrainer:
             )
             return more_loss
 
+        ef_grad_fn = nnx.jit(nnx.grad(loss_fn))
+        hessian_block_grad_fn = nnx.jit(nnx.grad(hessian_block_loss))
+        hessian_block_sum_count_fn = nnx.jit(hessian_block_sum_count)
+
         @nnx.jit
+        def apply_grads(
+            model: BaseModel,
+            optimizer: nnx.Optimizer,
+            grads: Any,
+        ) -> None:
+            if Version(flax_version) >= Version("0.11.0"):
+                optimizer.update(model, grads)
+            else:
+                optimizer.update(grads)
+
+        def add_hessian_more_loss(
+            more_loss: dict[str, jnp.ndarray],
+            model: BaseModel,
+            lr: float,
+            label_dict: dict[str, jnp.ndarray],
+            extended_coord: jnp.ndarray,
+            extended_atype: jnp.ndarray,
+            nlist: jnp.ndarray,
+            mapping: jnp.ndarray | None,
+            fp: jnp.ndarray | None,
+            ap: jnp.ndarray | None,
+        ) -> dict[str, jnp.ndarray]:
+            if not (
+                self.has_hessian
+                and self.hessian_train_chunk_size > 0
+                and isinstance(self.loss, EnergyHessianLoss)
+                and "hessian" in label_dict
+            ):
+                return more_loss
+            total_sum = jnp.asarray(0.0, dtype=label_dict["hessian"].dtype)
+            total_count = jnp.asarray(0.0, dtype=label_dict["hessian"].dtype)
+            for block_index in range(hessian_nblocks(label_dict)):
+                block_sum, block_count = hessian_block_sum_count_fn(
+                    model,
+                    label_dict,
+                    extended_coord,
+                    extended_atype,
+                    nlist,
+                    mapping,
+                    fp,
+                    ap,
+                    jnp.asarray(block_index, dtype=jnp.int32),
+                )
+                total_sum = total_sum + block_sum
+                total_count = total_count + block_count
+            hessian_metric = total_sum / jnp.maximum(total_count, 1.0)
+            find_hessian = label_dict.get("find_hessian", True)
+            if self.loss.loss_func == "mse":
+                more_loss["rmse_h"] = self.loss.display_if_exist(
+                    jnp.sqrt(hessian_metric),
+                    find_hessian,
+                )
+            else:
+                more_loss["mae_h"] = self.loss.display_if_exist(
+                    hessian_metric,
+                    find_hessian,
+                )
+            return more_loss
+
         def train_step(
             model: BaseModel,
             optimizer: nnx.Optimizer,
@@ -357,7 +702,7 @@ class DPTrainer:
             fp: jnp.ndarray | None,
             ap: jnp.ndarray | None,
         ) -> None:
-            grads = nnx.grad(loss_fn)(
+            grads = ef_grad_fn(
                 model,
                 lr,
                 label_dict,
@@ -368,10 +713,34 @@ class DPTrainer:
                 fp,
                 ap,
             )
-            if Version(flax_version) >= Version("0.11.0"):
-                optimizer.update(model, grads)
-            else:
-                optimizer.update(grads)
+            if (
+                self.has_hessian
+                and self.hessian_train_chunk_size > 0
+                and "hessian" in label_dict
+            ):
+                total_count = hessian_total_count(label_dict)
+                for block_index in range(hessian_nblocks(label_dict)):
+                    block_grads = hessian_block_grad_fn(
+                        model,
+                        lr,
+                        label_dict,
+                        extended_coord,
+                        extended_atype,
+                        nlist,
+                        mapping,
+                        fp,
+                        ap,
+                        jnp.asarray(block_index, dtype=jnp.int32),
+                        total_count,
+                    )
+                    if self.hessian_sync_blocks:
+                        _block_until_ready_tree(block_grads)
+                    grads = jax.tree.map(
+                        lambda left, right: left + right,
+                        grads,
+                        block_grads,
+                    )
+            apply_grads(model, optimizer, grads)
 
         start_time = time.time()
         disp_path = Path(self.disp_file)
@@ -423,6 +792,18 @@ class DPTrainer:
                         fp,
                         ap,
                     )
+                    more_loss = add_hessian_more_loss(
+                        more_loss,
+                        model,
+                        self.lr.value(step),
+                        jax_data,
+                        extended_coord,
+                        extended_atype,
+                        nlist,
+                        mapping,
+                        fp,
+                        ap,
+                    )
                     if valid_data is not None:
                         valid_more_loss_list = []
                         for _ in range(self.valid_numb_batch):
@@ -444,7 +825,18 @@ class DPTrainer:
                                 )
                             )
                             valid_more_loss_list.append(
-                                loss_fn_more_loss(
+                                add_hessian_more_loss(
+                                    loss_fn_more_loss(
+                                        model,
+                                        self.lr.value(step),
+                                        jax_valid_data,
+                                        extended_coord,
+                                        extended_atype,
+                                        nlist,
+                                        mapping,
+                                        fp,
+                                        ap,
+                                    ),
                                     model,
                                     self.lr.value(step),
                                     jax_valid_data,
