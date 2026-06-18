@@ -22,14 +22,66 @@ from deepmd.utils.version import (
 )
 
 
-def custom_huber_loss(predictions: Array, targets: Array, delta: float = 1.0) -> Array:
+def _masked_mean(xp: Any, values: Array, mask: Array | None = None) -> Array:
+    if mask is None:
+        return xp.mean(values)
+    mask_float = xp.astype(mask, values.dtype)
+    while mask_float.ndim < values.ndim:
+        mask_float = xp.expand_dims(mask_float, axis=-1)
+    weight = xp.ones_like(values) * mask_float
+    return xp.sum(values * mask_float) / xp.sum(weight)
+
+
+def _atom_mask(
+    model_dict: dict[str, Array],
+    label_dict: dict[str, Array],
+) -> Array | None:
+    mask = model_dict.get("mask")
+    if mask is None and "type" in label_dict:
+        mask = label_dict["type"] >= 0
+    return mask
+
+
+def _atom_normalizer(
+    xp: Any,
+    mask: Array | None,
+    natoms: int,
+    dtype: Any,
+) -> Array | float:
+    if mask is None:
+        return 1.0 / natoms
+    mask_float = xp.astype(mask, dtype)
+    real_natoms = xp.sum(mask_float, axis=-1, keepdims=True)
+    return 1.0 / real_natoms
+
+
+def _coord_mask_from_atom_mask(xp: Any, mask: Array | None) -> Array | None:
+    if mask is None:
+        return None
+    mask3 = xp.broadcast_to(mask[..., :, None], (*mask.shape, 3))
+    return xp.reshape(mask3, (*mask.shape[:-1], mask.shape[-1] * 3))
+
+
+def _hessian_mask_from_atom_mask(xp: Any, mask: Array | None) -> Array | None:
+    coord_mask = _coord_mask_from_atom_mask(xp, mask)
+    if coord_mask is None:
+        return None
+    return xp.logical_and(coord_mask[..., :, None], coord_mask[..., None, :])
+
+
+def custom_huber_loss(
+    predictions: Array,
+    targets: Array,
+    delta: float = 1.0,
+    mask: Array | None = None,
+) -> Array:
     xp = array_api_compat.array_namespace(predictions, targets)
     error = targets - predictions
     abs_error = xp.abs(error)
     quadratic_loss = 0.5 * error**2
     linear_loss = delta * (abs_error - 0.5 * delta)
     loss = xp.where(abs_error <= delta, quadratic_loss, linear_loss)
-    return xp.mean(loss)
+    return _masked_mean(xp, loss, mask)
 
 
 class EnergyLoss(Loss):
@@ -228,25 +280,18 @@ class EnergyLoss(Loss):
             atom_ener_coeff = label_dict["atom_ener_coeff"]
             atom_ener_coeff = xp.reshape(atom_ener_coeff, atom_ener.shape)
             energy = xp.sum(atom_ener_coeff * atom_ener, axis=1)
+        atom_mask = _atom_mask(model_dict, label_dict)
         if self.has_f or self.has_pf or self.relative_f or self.has_gf:
-            force_reshape = xp.reshape(force, (-1,))
-            force_hat_reshape = xp.reshape(force_hat, (-1,))
-            diff_f = force_hat_reshape - force_reshape
+            diff_f_full = force_hat - force
         else:
-            diff_f = None
+            diff_f_full = None
 
         if self.relative_f is not None:
-            force_hat_3 = xp.reshape(force_hat, (-1, 3))
-            norm_f = (
-                xp.reshape(xp.linalg.vector_norm(force_hat_3, axis=1), (-1, 1))
-                + self.relative_f
-            )
-            diff_f_3 = xp.reshape(diff_f, (-1, 3))
-            diff_f_3 = diff_f_3 / norm_f
-            diff_f = xp.reshape(diff_f_3, (-1,))
+            norm_f = xp.linalg.vector_norm(force_hat, axis=-1, keepdims=True)
+            diff_f_full = diff_f_full / (norm_f + self.relative_f)
 
-        atom_norm = 1.0 / natoms
-        atom_norm_ener = 1.0 / natoms
+        atom_norm = _atom_normalizer(xp, atom_mask, natoms, energy.dtype)
+        atom_norm_ener = atom_norm
         lr_ratio = learning_rate / self.starter_learning_rate
         pref_e = find_energy * (
             self.limit_pref_e + (self.start_pref_e - self.limit_pref_e) * lr_ratio
@@ -271,10 +316,19 @@ class EnergyLoss(Loss):
         # - norm_exp=1 (intensive_ener_virial=False, legacy): loss uses 1/N scaling, which varies with system size
         norm_exp = 2 if self.intensive_ener_virial else 1
         if self.has_e:
+            diff_e = energy - energy_hat
             if self.loss_func == "mse":
-                l2_ener_loss = xp.mean(xp.square(energy - energy_hat))
+                l2_ener_loss = xp.mean(xp.square(diff_e))
                 if not self.use_huber:
-                    loss += atom_norm_ener**norm_exp * (pref_e * l2_ener_loss)
+                    if norm_exp == 2:
+                        l2_ener_loss_scaled = xp.mean(
+                            xp.square(diff_e * atom_norm_ener)
+                        )
+                    else:
+                        l2_ener_loss_scaled = xp.mean(
+                            xp.square(diff_e) * atom_norm_ener
+                        )
+                    loss += pref_e * l2_ener_loss_scaled
                 else:
                     l_huber_loss = custom_huber_loss(
                         atom_norm_ener * energy,
@@ -283,44 +337,46 @@ class EnergyLoss(Loss):
                     )
                     loss += pref_e * l_huber_loss
                 more_loss["rmse_e"] = self.display_if_exist(
-                    xp.sqrt(l2_ener_loss) * atom_norm_ener, find_energy
+                    xp.sqrt(xp.mean(xp.square(diff_e * atom_norm_ener))), find_energy
                 )
             elif self.loss_func == "mae":
-                l1_ener_loss = xp.mean(xp.abs(energy - energy_hat))
-                loss += atom_norm_ener * (pref_e * l1_ener_loss)
+                l1_ener_loss_scaled = xp.mean(xp.abs(diff_e) * atom_norm_ener)
+                loss += pref_e * l1_ener_loss_scaled
                 more_loss["mae_e"] = self.display_if_exist(
-                    l1_ener_loss * atom_norm_ener, find_energy
+                    l1_ener_loss_scaled, find_energy
                 )
             else:
                 raise NotImplementedError(
                     f"Loss type {self.loss_func} is not implemented for energy loss."
                 )
             if mae:
-                mae_e = xp.mean(xp.abs(energy - energy_hat)) * atom_norm_ener
+                mae_e = xp.mean(xp.abs(diff_e) * atom_norm_ener)
                 more_loss["mae_e"] = self.display_if_exist(mae_e, find_energy)
-                mae_e_all = xp.mean(xp.abs(energy - energy_hat))
+                mae_e_all = xp.mean(xp.abs(diff_e))
                 more_loss["mae_e_all"] = self.display_if_exist(mae_e_all, find_energy)
         if self.has_f:
             if self.loss_func == "mse":
-                l2_force_loss = xp.mean(xp.square(diff_f))
+                l2_force_loss = _masked_mean(xp, xp.square(diff_f_full), atom_mask)
                 if not self.use_huber:
                     loss += pref_f * l2_force_loss
                 else:
                     if not self.f_use_norm:
                         l_huber_loss = custom_huber_loss(
-                            xp.reshape(force, (-1,)),
-                            xp.reshape(force_hat, (-1,)),
+                            force,
+                            force_hat,
                             delta=self._huber_delta_force,
+                            mask=atom_mask,
                         )
                     else:
-                        force_diff_3 = xp.reshape(force_hat - force, (-1, 3))
-                        force_diff_norm = xp.reshape(
-                            xp.linalg.vector_norm(force_diff_3, axis=1), (-1, 1)
+                        force_diff_norm = xp.expand_dims(
+                            xp.linalg.vector_norm(force_hat - force, axis=-1),
+                            axis=-1,
                         )
                         l_huber_loss = custom_huber_loss(
                             force_diff_norm,
                             xp.zeros_like(force_diff_norm),
                             delta=self._huber_delta_force,
+                            mask=atom_mask,
                         )
                     loss += pref_f * l_huber_loss
                 more_loss["rmse_f"] = self.display_if_exist(
@@ -328,10 +384,10 @@ class EnergyLoss(Loss):
                 )
             elif self.loss_func == "mae":
                 if not self.f_use_norm:
-                    l1_force_loss = xp.mean(xp.abs(diff_f))
+                    l1_force_loss = _masked_mean(xp, xp.abs(diff_f_full), atom_mask)
                 else:
-                    force_diff_3 = xp.reshape(force_hat - force, (-1, 3))
-                    l1_force_loss = xp.mean(xp.linalg.vector_norm(force_diff_3, axis=1))
+                    force_diff_norm = xp.linalg.vector_norm(diff_f_full, axis=-1)
+                    l1_force_loss = _masked_mean(xp, force_diff_norm, atom_mask)
                 loss += pref_f * l1_force_loss
                 more_loss["mae_f"] = self.display_if_exist(l1_force_loss, find_force)
             else:
@@ -339,62 +395,64 @@ class EnergyLoss(Loss):
                     f"Loss type {self.loss_func} is not implemented for force loss."
                 )
             if mae:
-                mae_f = xp.mean(xp.abs(diff_f))
+                mae_f = _masked_mean(xp, xp.abs(diff_f_full), atom_mask)
                 more_loss["mae_f"] = self.display_if_exist(mae_f, find_force)
         if self.has_v:
-            virial_reshape = xp.reshape(virial, (-1,))
-            virial_hat_reshape = xp.reshape(virial_hat, (-1,))
+            diff_v = virial_hat - virial
             if self.loss_func == "mse":
-                l2_virial_loss = xp.mean(
-                    xp.square(virial_hat_reshape - virial_reshape),
-                )
+                l2_virial_loss = xp.mean(xp.square(diff_v))
                 if not self.use_huber:
-                    loss += atom_norm**norm_exp * (pref_v * l2_virial_loss)
+                    if norm_exp == 2:
+                        l2_virial_loss_scaled = xp.mean(xp.square(diff_v * atom_norm))
+                    else:
+                        l2_virial_loss_scaled = xp.mean(
+                            xp.square(diff_v) * atom_norm
+                        )
+                    loss += pref_v * l2_virial_loss_scaled
                 else:
                     l_huber_loss = custom_huber_loss(
-                        atom_norm * virial_reshape,
-                        atom_norm * virial_hat_reshape,
+                        atom_norm * virial,
+                        atom_norm * virial_hat,
                         delta=self._huber_delta_virial,
                     )
                     loss += pref_v * l_huber_loss
                 more_loss["rmse_v"] = self.display_if_exist(
-                    xp.sqrt(l2_virial_loss) * atom_norm, find_virial
+                    xp.sqrt(xp.mean(xp.square(diff_v * atom_norm))), find_virial
                 )
             elif self.loss_func == "mae":
-                l1_virial_loss = xp.mean(xp.abs(virial_hat_reshape - virial_reshape))
-                loss += atom_norm * (pref_v * l1_virial_loss)
+                l1_virial_loss = xp.mean(xp.abs(diff_v) * atom_norm)
+                loss += pref_v * l1_virial_loss
                 more_loss["mae_v"] = self.display_if_exist(
-                    l1_virial_loss * atom_norm, find_virial
+                    l1_virial_loss, find_virial
                 )
             else:
                 raise NotImplementedError(
                     f"Loss type {self.loss_func} is not implemented for virial loss."
                 )
             if mae:
-                mae_v = xp.mean(xp.abs(virial_hat_reshape - virial_reshape)) * atom_norm
+                mae_v = xp.mean(xp.abs(diff_v) * atom_norm)
                 more_loss["mae_v"] = self.display_if_exist(mae_v, find_virial)
         if self.has_ae:
-            atom_ener_reshape = xp.reshape(atom_ener, (-1,))
-            atom_ener_hat_reshape = xp.reshape(atom_ener_hat, (-1,))
             if self.loss_func == "mse":
-                l2_atom_ener_loss = xp.mean(
-                    xp.square(atom_ener_hat_reshape - atom_ener_reshape),
+                l2_atom_ener_loss = _masked_mean(
+                    xp, xp.square(atom_ener_hat - atom_ener), atom_mask
                 )
                 if not self.use_huber:
                     loss += pref_ae * l2_atom_ener_loss
                 else:
                     l_huber_loss = custom_huber_loss(
-                        atom_ener_reshape,
-                        atom_ener_hat_reshape,
+                        atom_ener,
+                        atom_ener_hat,
                         delta=self._huber_delta_energy,
+                        mask=atom_mask,
                     )
                     loss += pref_ae * l_huber_loss
                 more_loss["rmse_ae"] = self.display_if_exist(
                     xp.sqrt(l2_atom_ener_loss), find_atom_ener
                 )
             elif self.loss_func == "mae":
-                l1_atom_ener_loss = xp.mean(
-                    xp.abs(atom_ener_hat_reshape - atom_ener_reshape)
+                l1_atom_ener_loss = _masked_mean(
+                    xp, xp.abs(atom_ener_hat - atom_ener), atom_mask
                 )
                 loss += pref_ae * l1_atom_ener_loss
                 more_loss["mae_ae"] = self.display_if_exist(
@@ -405,19 +463,23 @@ class EnergyLoss(Loss):
                     f"Loss type {self.loss_func} is not implemented for atomic energy loss."
                 )
         if self.has_pf:
-            atom_pref_reshape = xp.reshape(atom_pref, (-1,))
+            atom_pref_reshape = xp.reshape(atom_pref, diff_f_full.shape)
 
             if self.loss_func == "mse":
-                l2_pref_force_loss = xp.mean(
-                    xp.multiply(xp.square(diff_f), atom_pref_reshape),
+                l2_pref_force_loss = _masked_mean(
+                    xp,
+                    xp.multiply(xp.square(diff_f_full), atom_pref_reshape),
+                    atom_mask,
                 )
                 loss += pref_pf * l2_pref_force_loss
                 more_loss["rmse_pf"] = self.display_if_exist(
                     xp.sqrt(l2_pref_force_loss), find_atom_pref
                 )
             elif self.loss_func == "mae":
-                l1_pref_force_loss = xp.mean(
-                    xp.multiply(xp.abs(diff_f), atom_pref_reshape)
+                l1_pref_force_loss = _masked_mean(
+                    xp,
+                    xp.multiply(xp.abs(diff_f_full), atom_pref_reshape),
+                    atom_mask,
                 )
                 loss += pref_pf * l1_pref_force_loss
                 more_loss["mae_pf"] = self.display_if_exist(
@@ -617,10 +679,11 @@ class EnergyHessianLoss(EnergyLoss):
         natoms: int,
         model_dict: dict[str, Array],
         label_dict: dict[str, Array],
+        mae: bool = False,
     ) -> dict[str, Array]:
         """Calculate loss from model results and labeled results."""
         loss, more_loss = EnergyLoss.call(
-            self, learning_rate, natoms, model_dict, label_dict
+            self, learning_rate, natoms, model_dict, label_dict, mae=mae
         )
         xp = array_api_compat.array_namespace(model_dict["energy"])
         coef = learning_rate / self.starter_learning_rate
@@ -633,15 +696,20 @@ class EnergyHessianLoss(EnergyLoss):
         ):
             find_hessian = label_dict.get("find_hessian", 0.0)
             pref_h = pref_h * find_hessian
-            diff_h = label_dict["hessian"].reshape(
-                -1,
-            ) - model_dict["energy_derv_r_derv_r"].reshape(
-                -1,
+            pred_hessian = xp.reshape(
+                model_dict["energy_derv_r_derv_r"], label_dict["hessian"].shape
             )
-            l2_hessian_loss = xp.mean(xp.square(diff_h))
+            diff_h = label_dict["hessian"] - pred_hessian
+            hessian_mask = _hessian_mask_from_atom_mask(
+                xp, _atom_mask(model_dict, label_dict)
+            )
+            l2_hessian_loss = _masked_mean(xp, xp.square(diff_h), hessian_mask)
             loss += pref_h * l2_hessian_loss
             rmse_h = xp.sqrt(l2_hessian_loss)
             more_loss["rmse_h"] = self.display_if_exist(rmse_h, find_hessian)
+            if mae:
+                mae_h = _masked_mean(xp, xp.abs(diff_h), hessian_mask)
+                more_loss["mae_h"] = self.display_if_exist(mae_h, find_hessian)
 
         more_loss["rmse"] = xp.sqrt(loss)
         return loss, more_loss

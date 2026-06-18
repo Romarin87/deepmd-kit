@@ -30,6 +30,7 @@ class Tester:
         self,
         model_ckpt: str | torch.nn.Module,
         head: str | None = None,
+        hessian: bool = False,
     ) -> None:
         """Construct a DeePMD tester.
 
@@ -40,7 +41,7 @@ class Tester:
         state_dict = torch.load(model_ckpt, map_location=DEVICE, weights_only=True)
         if "model" in state_dict:
             state_dict = state_dict["model"]
-        model_params = state_dict["_extra_state"]["model_params"]
+        model_params = deepcopy(state_dict["_extra_state"]["model_params"])
         self.multi_task = "model_dict" in model_params
         if self.multi_task:
             assert head is not None, "Head must be specified in multitask mode!"
@@ -49,7 +50,10 @@ class Tester:
                 f"Specified head {head} not found in model {model_ckpt}! "
                 f"Available ones are {list(model_params['model_dict'].keys())}."
             )
-            model_params = model_params["model_dict"][head]
+            global_hessian_mode = model_params.get("hessian_mode", False)
+            model_params = deepcopy(model_params["model_dict"][head])
+            if global_hessian_mode and "hessian_mode" not in model_params:
+                model_params["hessian_mode"] = True
             state_dict_head = {"_extra_state": state_dict["_extra_state"]}
             for item in state_dict:
                 if f"model.{head}." in item:
@@ -58,9 +62,10 @@ class Tester:
                     ] = state_dict[item].clone()
             state_dict = state_dict_head
 
-        model_params.pop(
-            "hessian_mode", None
-        )  # wrapper Hessian to Energy model due to JIT limit
+        if hessian:
+            model_params["hessian_mode"] = True
+        else:
+            model_params.pop("hessian_mode", None)
         self.model_params = deepcopy(model_params)
         self.model = get_model(model_params).to(DEVICE)
         self.modifier = None

@@ -453,8 +453,15 @@ def freeze(
     model: str,
     output: str = "frozen_model.pth",
     head: str | None = None,
+    hessian: bool = False,
 ) -> None:
-    tester = inference.Tester(model, head=head)
+    if hessian:
+        raise RuntimeError(
+            "PyTorch Hessian models are eager-only and cannot be frozen to "
+            "TorchScript .pth. Use the .pt checkpoint directly with "
+            "`hessian_mode=True` in the selected model head."
+        )
+    tester = inference.Tester(model, head=head, hessian=hessian)
     model = tester.model
     model.eval()
     model = torch.jit.script(model)
@@ -645,7 +652,12 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
         else:
             FLAGS.model = FLAGS.checkpoint_folder
         FLAGS.output = str(Path(FLAGS.output).with_suffix(".pth"))
-        freeze(model=FLAGS.model, output=FLAGS.output, head=FLAGS.head)
+        freeze(
+            model=FLAGS.model,
+            output=FLAGS.output,
+            head=FLAGS.head,
+            hessian=FLAGS.hessian,
+        )
     elif FLAGS.command == "change-bias":
         change_bias(
             input_file=FLAGS.INPUT,

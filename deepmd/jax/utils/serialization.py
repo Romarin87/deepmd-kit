@@ -425,6 +425,10 @@ def serialize_from_file(model_file: str) -> dict:
         elif model_def_script.get("hessian_mode", False):
             abstract_model.enable_hessian()
         graphdef, abstract_state = nnx.split(abstract_model)
+        state = _normalize_checkpoint_state_for_model(
+            state,
+            abstract_state.to_pure_dict(),
+        )
         abstract_state.replace_by_pure_dict(state)
         model = nnx.merge(graphdef, abstract_state)
         return {
@@ -443,6 +447,45 @@ def serialize_from_file(model_file: str) -> dict:
         return data
     else:
         raise ValueError("JAX backend only supports converting .jax directory")
+
+
+def _normalize_checkpoint_state_for_model(state: dict, target: dict) -> dict:
+    """Normalize legacy checkpoint state to the current model state tree.
+
+    Older JAX checkpoints may use ``atomic_model.fitting_net`` where current
+    models expose ``atomic_model.fitting``. Some checkpoints also carry
+    auxiliary fitting keys that are no longer present in the active model
+    state. Keep only keys accepted by the target state so checkpoint freeze can
+    restore the matching parameters while leaving newly initialized keys at
+    their model defaults.
+    """
+    _rename_legacy_fitting_net(state)
+    _drop_unknown_state_keys(state, target)
+    return state
+
+
+def _rename_legacy_fitting_net(item: dict) -> None:
+    for value in item.values():
+        if isinstance(value, dict):
+            atomic_model = value.get("atomic_model")
+            if (
+                isinstance(atomic_model, dict)
+                and "fitting_net" in atomic_model
+                and "fitting" not in atomic_model
+            ):
+                atomic_model["fitting"] = atomic_model.pop("fitting_net")
+            _rename_legacy_fitting_net(value)
+
+
+def _drop_unknown_state_keys(item: dict, target: dict) -> None:
+    for key in list(item.keys()):
+        if key not in target:
+            item.pop(key)
+            continue
+        value = item[key]
+        target_value = target[key]
+        if isinstance(value, dict) and isinstance(target_value, dict):
+            _drop_unknown_state_keys(value, target_value)
 
 
 def _get_hessian_chunk_size() -> int:

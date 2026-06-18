@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-import io
-import json
-import logging
 from collections.abc import (
     Callable,
 )
+from copy import (
+    deepcopy,
+)
+import io
+import json
+import logging
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -118,14 +121,15 @@ class DeepEval(DeepEvalBackend):
     ) -> None:
         self.output_def = output_def
         self.model_path = model_file
+        hessian_mode = False
         if str(self.model_path).endswith(".pt"):
             state_dict = torch.load(
                 model_file, map_location=env.DEVICE, weights_only=True
             )
             if "model" in state_dict:
                 state_dict = state_dict["model"]
-            self.input_param = state_dict["_extra_state"]["model_params"]
-            self.model_def_script = self.input_param
+            self.input_param = deepcopy(state_dict["_extra_state"]["model_params"])
+            self.model_def_script = deepcopy(self.input_param)
             self.multi_task = "model_dict" in self.input_param
             if self.multi_task:
                 model_alias_dict, model_branch_dict = get_model_dict(
@@ -158,7 +162,10 @@ class DeepEval(DeepEvalBackend):
                 )
                 head = model_alias_dict[head]
 
-                self.input_param = self.input_param["model_dict"][head]
+                global_hessian_mode = self.input_param.get("hessian_mode", False)
+                self.input_param = deepcopy(self.input_param["model_dict"][head])
+                if global_hessian_mode and "hessian_mode" not in self.input_param:
+                    self.input_param["hessian_mode"] = True
                 state_dict_head = {"_extra_state": state_dict["_extra_state"]}
                 for item in state_dict:
                     if f"model.{head}." in item:
@@ -171,6 +178,7 @@ class DeepEval(DeepEvalBackend):
                 model = torch.jit.script(model)
             self.dp = ModelWrapper(model)
             missing, unexpected = self.dp.load_state_dict(state_dict, strict=False)
+            hessian_mode = self.input_param.get("hessian_mode", False)
             if missing:
                 log.warning(
                     "Checkpoint loaded with missing keys (likely from an older "
@@ -203,6 +211,7 @@ class DeepEval(DeepEvalBackend):
                 self.model_def_script = json.loads(model_def_script)
             else:
                 self.model_def_script = {}
+            hessian_mode = self.model_def_script.get("hessian_mode", False)
         else:
             raise ValueError("Unknown model file format!")
         self.dp.eval()
@@ -222,7 +231,10 @@ class DeepEval(DeepEvalBackend):
         self._has_spin = getattr(self.dp.model["Default"], "has_spin", False)
         if callable(self._has_spin):
             self._has_spin = self._has_spin()
-        self._has_hessian = self.model_def_script.get("hessian_mode", False)
+        self._has_hessian = bool(
+            getattr(self.dp.model["Default"], "_hessian_enabled", False)
+            or hessian_mode
+        )
 
     def get_rcut(self) -> float:
         """Get the cutoff radius of this model."""

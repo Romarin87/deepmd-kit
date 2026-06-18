@@ -26,15 +26,64 @@ from deepmd.utils.version import (
 )
 
 
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    if mask is None:
+        return torch.mean(values)
+    mask_float = mask.to(dtype=values.dtype, device=values.device)
+    while mask_float.dim() < values.dim():
+        mask_float = mask_float.unsqueeze(-1)
+    weight = torch.ones_like(values) * mask_float
+    return torch.sum(values * mask_float) / torch.sum(weight)
+
+
+def _atom_mask(
+    model_pred: dict[str, torch.Tensor],
+    label: dict[str, torch.Tensor],
+) -> torch.Tensor | None:
+    mask = model_pred.get("mask")
+    if mask is None and "type" in label:
+        mask = label["type"] >= 0
+    return mask
+
+
+def _atom_normalizer(
+    mask: torch.Tensor | None,
+    natoms: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if mask is None:
+        return torch.as_tensor(1.0 / natoms, dtype=dtype, device=device)
+    real_natoms = mask.to(dtype=dtype, device=device).sum(dim=-1, keepdim=True)
+    return torch.reciprocal(real_natoms)
+
+
+def _coord_mask_from_atom_mask(mask: torch.Tensor | None) -> torch.Tensor | None:
+    if mask is None:
+        return None
+    mask3 = mask[..., :, None].expand(*mask.shape, 3)
+    return mask3.reshape(*mask.shape[:-1], mask.shape[-1] * 3)
+
+
+def _hessian_mask_from_atom_mask(mask: torch.Tensor | None) -> torch.Tensor | None:
+    coord_mask = _coord_mask_from_atom_mask(mask)
+    if coord_mask is None:
+        return None
+    return coord_mask[..., :, None] & coord_mask[..., None, :]
+
+
 def custom_huber_loss(
-    predictions: torch.Tensor, targets: torch.Tensor, delta: float = 1.0
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    delta: float = 1.0,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     error = targets - predictions
     abs_error = torch.abs(error)
     quadratic_loss = 0.5 * torch.pow(error, 2)
     linear_loss = delta * (abs_error - 0.5 * delta)
     loss = torch.where(abs_error <= delta, quadratic_loss, linear_loss)
-    return torch.mean(loss)
+    return _masked_mean(loss, mask)
 
 
 class EnergyStdLoss(TaskLoss):
@@ -233,7 +282,18 @@ class EnergyStdLoss(TaskLoss):
         more_loss = {}
         # more_loss['log_keys'] = []  # showed when validation on the fly
         # more_loss['test_keys'] = []  # showed when doing dp test
-        atom_norm = 1.0 / natoms
+        atom_mask = _atom_mask(model_pred, label)
+        normalizer_ref = next(
+            value
+            for value in model_pred.values()
+            if torch.is_tensor(value) and value.is_floating_point()
+        )
+        atom_norm = _atom_normalizer(
+            atom_mask,
+            natoms,
+            normalizer_ref.dtype,
+            normalizer_ref.device,
+        )
         # Normalization exponent controls loss scaling with system size:
         # - norm_exp=2 (intensive_ener_virial=True): loss uses 1/N² scaling, making it independent of system size
         # - norm_exp=1 (intensive_ener_virial=False, legacy): loss uses 1/N scaling, which varies with system size
@@ -256,14 +316,23 @@ class EnergyStdLoss(TaskLoss):
                 energy_pred = torch.sum(atom_ener_coeff * atom_ener_pred, dim=1)
             find_energy = label.get("find_energy", 0.0)
             pref_e = pref_e * find_energy
+            diff_e = energy_pred - energy_label
             if self.loss_func == "mse":
-                l2_ener_loss = torch.mean(torch.square(energy_pred - energy_label))
+                l2_ener_loss = torch.mean(torch.square(diff_e))
                 if not self.inference:
                     more_loss["l2_ener_loss"] = self.display_if_exist(
                         l2_ener_loss.detach(), find_energy
                     )
                 if not self.use_huber:
-                    loss += atom_norm**norm_exp * (pref_e * l2_ener_loss)
+                    if norm_exp == 2:
+                        l2_ener_loss_scaled = torch.mean(
+                            torch.square(diff_e * atom_norm)
+                        )
+                    else:
+                        l2_ener_loss_scaled = torch.mean(
+                            torch.square(diff_e) * atom_norm
+                        )
+                    loss += pref_e * l2_ener_loss_scaled
                 else:
                     l_huber_loss = custom_huber_loss(
                         atom_norm * energy_pred,
@@ -271,20 +340,16 @@ class EnergyStdLoss(TaskLoss):
                         delta=self._huber_delta_energy,
                     )
                     loss += pref_e * l_huber_loss
-                rmse_e = l2_ener_loss.sqrt() * atom_norm
+                rmse_e = torch.mean(torch.square(diff_e * atom_norm)).sqrt()
                 more_loss["rmse_e"] = self.display_if_exist(
                     rmse_e.detach(), find_energy
                 )
                 # more_loss['log_keys'].append('rmse_e')
             elif self.loss_func == "mae":
-                l1_ener_loss = F.l1_loss(
-                    energy_pred.reshape(-1),
-                    energy_label.reshape(-1),
-                    reduction="mean",
-                )
-                loss += atom_norm * (pref_e * l1_ener_loss)
+                l1_ener_loss_scaled = torch.mean(torch.abs(diff_e) * atom_norm)
+                loss += pref_e * l1_ener_loss_scaled
                 more_loss["mae_e"] = self.display_if_exist(
-                    l1_ener_loss.detach() * atom_norm,
+                    l1_ener_loss_scaled.detach(),
                     find_energy,
                 )
                 # more_loss['log_keys'].append('rmse_e')
@@ -293,9 +358,9 @@ class EnergyStdLoss(TaskLoss):
                     f"Loss type {self.loss_func} is not implemented for energy loss."
                 )
             if mae:
-                mae_e = torch.mean(torch.abs(energy_pred - energy_label)) * atom_norm
+                mae_e = torch.mean(torch.abs(diff_e) * atom_norm)
                 more_loss["mae_e"] = self.display_if_exist(mae_e.detach(), find_energy)
-                mae_e_all = torch.mean(torch.abs(energy_pred - energy_label))
+                mae_e_all = torch.mean(torch.abs(diff_e))
                 more_loss["mae_e_all"] = self.display_if_exist(
                     mae_e_all.detach(), find_energy
                 )
@@ -309,18 +374,15 @@ class EnergyStdLoss(TaskLoss):
             pref_f = pref_f * find_force
             force_pred = model_pred["force"]
             force_label = label["force"]
-            diff_f = (force_label - force_pred).reshape(-1)
+            diff_f_full = force_label - force_pred
 
             if self.relative_f is not None:
-                force_label_3 = force_label.reshape(-1, 3)
-                norm_f = force_label_3.norm(dim=1, keepdim=True) + self.relative_f
-                diff_f_3 = diff_f.reshape(-1, 3)
-                diff_f_3 = diff_f_3 / norm_f
-                diff_f = diff_f_3.reshape(-1)
+                norm_f = force_label.norm(dim=-1, keepdim=True) + self.relative_f
+                diff_f_full = diff_f_full / norm_f
 
             if self.has_f:
                 if self.loss_func == "mse":
-                    l2_force_loss = torch.mean(torch.square(diff_f))
+                    l2_force_loss = _masked_mean(torch.square(diff_f_full), atom_mask)
                     if not self.inference:
                         more_loss["l2_force_loss"] = self.display_if_exist(
                             l2_force_loss.detach(), find_force
@@ -330,21 +392,23 @@ class EnergyStdLoss(TaskLoss):
                     else:
                         if not self.f_use_norm:
                             l_huber_loss = custom_huber_loss(
-                                force_pred.reshape(-1),
-                                force_label.reshape(-1),
+                                force_pred,
+                                force_label,
                                 delta=self._huber_delta_force,
+                                mask=atom_mask,
                             )
                         else:
                             force_diff_norm = torch.linalg.vector_norm(
-                                (force_label - force_pred).reshape(-1, 3),
+                                force_label - force_pred,
                                 ord=2,
-                                dim=1,
+                                dim=-1,
                                 keepdim=True,
                             )
                             l_huber_loss = custom_huber_loss(
                                 force_diff_norm,
                                 torch.zeros_like(force_diff_norm),
                                 delta=self._huber_delta_force,
+                                mask=atom_mask,
                             )
                         loss += pref_f * l_huber_loss
                     rmse_f = l2_force_loss.sqrt()
@@ -354,17 +418,18 @@ class EnergyStdLoss(TaskLoss):
                 elif self.loss_func == "mae":
                     if not self.f_use_norm:
                         l1_force_loss = F.l1_loss(
-                            force_label.reshape(-1),
-                            force_pred.reshape(-1),
-                            reduction="mean",
+                            force_label,
+                            force_pred,
+                            reduction="none",
                         )
+                        l1_force_loss = _masked_mean(l1_force_loss, atom_mask)
                     else:
                         l1_force_loss = torch.linalg.vector_norm(
-                            (force_label - force_pred).reshape(-1, 3),
+                            diff_f_full,
                             ord=2,
-                            dim=1,
-                            keepdim=True,
-                        ).mean()
+                            dim=-1,
+                        )
+                        l1_force_loss = _masked_mean(l1_force_loss, atom_mask)
                     more_loss["mae_f"] = self.display_if_exist(
                         l1_force_loss.detach(), find_force
                     )
@@ -374,7 +439,7 @@ class EnergyStdLoss(TaskLoss):
                         f"Loss type {self.loss_func} is not implemented for force loss."
                     )
                 if mae:
-                    mae_f = torch.mean(torch.abs(diff_f))
+                    mae_f = _masked_mean(torch.abs(diff_f_full), atom_mask)
                     more_loss["mae_f"] = self.display_if_exist(
                         mae_f.detach(), find_force
                     )
@@ -383,12 +448,13 @@ class EnergyStdLoss(TaskLoss):
                 atom_pref = label["atom_pref"]
                 find_atom_pref = label.get("find_atom_pref", 0.0)
                 pref_pf = pref_pf * find_atom_pref
-                atom_pref_reshape = atom_pref.reshape(-1)
+                atom_pref_reshape = atom_pref.reshape(diff_f_full.shape)
 
                 if self.loss_func == "mse":
-                    l2_pref_force_loss = (
-                        torch.square(diff_f) * atom_pref_reshape
-                    ).mean()
+                    l2_pref_force_loss = _masked_mean(
+                        torch.square(diff_f_full) * atom_pref_reshape,
+                        atom_mask,
+                    )
                     if not self.inference:
                         more_loss["l2_pref_force_loss"] = self.display_if_exist(
                             l2_pref_force_loss.detach(), find_atom_pref
@@ -399,7 +465,10 @@ class EnergyStdLoss(TaskLoss):
                         rmse_pf.detach(), find_atom_pref
                     )
                 elif self.loss_func == "mae":
-                    l1_pref_force_loss = (torch.abs(diff_f) * atom_pref_reshape).mean()
+                    l1_pref_force_loss = _masked_mean(
+                        torch.abs(diff_f_full) * atom_pref_reshape,
+                        atom_mask,
+                    )
                     loss += (pref_pf * l1_pref_force_loss).to(GLOBAL_PT_FLOAT_PRECISION)
                     more_loss["mae_pf"] = self.display_if_exist(
                         l1_pref_force_loss.detach(), find_atom_pref
@@ -445,27 +514,31 @@ class EnergyStdLoss(TaskLoss):
                         l2_virial_loss.detach(), find_virial
                     )
                 if not self.use_huber:
-                    loss += atom_norm**norm_exp * (pref_v * l2_virial_loss)
+                    if norm_exp == 2:
+                        l2_virial_loss_scaled = torch.mean(
+                            torch.square(diff_v * atom_norm)
+                        )
+                    else:
+                        l2_virial_loss_scaled = torch.mean(
+                            torch.square(diff_v) * atom_norm
+                        )
+                    loss += pref_v * l2_virial_loss_scaled
                 else:
                     l_huber_loss = custom_huber_loss(
-                        atom_norm * model_pred["virial"].reshape(-1),
-                        atom_norm * label["virial"].reshape(-1),
+                        atom_norm * model_pred["virial"].reshape(-1, 9),
+                        atom_norm * label["virial"],
                         delta=self._huber_delta_virial,
                     )
                     loss += pref_v * l_huber_loss
-                rmse_v = l2_virial_loss.sqrt() * atom_norm
+                rmse_v = torch.mean(torch.square(diff_v * atom_norm)).sqrt()
                 more_loss["rmse_v"] = self.display_if_exist(
                     rmse_v.detach(), find_virial
                 )
             elif self.loss_func == "mae":
-                l1_virial_loss = F.l1_loss(
-                    label["virial"].reshape(-1),
-                    model_pred["virial"].reshape(-1),
-                    reduction="mean",
-                )
-                loss += atom_norm * (pref_v * l1_virial_loss)
+                l1_virial_loss = torch.mean(torch.abs(diff_v) * atom_norm)
+                loss += pref_v * l1_virial_loss
                 more_loss["mae_v"] = self.display_if_exist(
-                    l1_virial_loss.detach() * atom_norm,
+                    l1_virial_loss.detach(),
                     find_virial,
                 )
             else:
@@ -473,7 +546,7 @@ class EnergyStdLoss(TaskLoss):
                     f"Loss type {self.loss_func} is not implemented for virial loss."
                 )
             if mae:
-                mae_v = torch.mean(torch.abs(diff_v)) * atom_norm
+                mae_v = torch.mean(torch.abs(diff_v) * atom_norm)
                 more_loss["mae_v"] = self.display_if_exist(mae_v.detach(), find_virial)
 
         if self.has_ae and "atom_energy" in model_pred and "atom_ener" in label:
@@ -481,13 +554,11 @@ class EnergyStdLoss(TaskLoss):
             atom_ener_label = label["atom_ener"]
             find_atom_ener = label.get("find_atom_ener", 0.0)
             pref_ae = pref_ae * find_atom_ener
-            atom_ener_reshape = atom_ener.reshape(-1)
-            atom_ener_label_reshape = atom_ener_label.reshape(-1)
 
             if self.loss_func == "mse":
-                l2_atom_ener_loss = torch.square(
-                    atom_ener_label_reshape - atom_ener_reshape
-                ).mean()
+                l2_atom_ener_loss = _masked_mean(
+                    torch.square(atom_ener_label - atom_ener), atom_mask
+                )
                 if not self.inference:
                     more_loss["l2_atom_ener_loss"] = self.display_if_exist(
                         l2_atom_ener_loss.detach(), find_atom_ener
@@ -496,9 +567,10 @@ class EnergyStdLoss(TaskLoss):
                     loss += (pref_ae * l2_atom_ener_loss).to(GLOBAL_PT_FLOAT_PRECISION)
                 else:
                     l_huber_loss = custom_huber_loss(
-                        atom_ener_reshape,
-                        atom_ener_label_reshape,
+                        atom_ener,
+                        atom_ener_label,
                         delta=self._huber_delta_energy,
+                        mask=atom_mask,
                     )
                     loss += pref_ae * l_huber_loss
                 rmse_ae = l2_atom_ener_loss.sqrt()
@@ -506,10 +578,8 @@ class EnergyStdLoss(TaskLoss):
                     rmse_ae.detach(), find_atom_ener
                 )
             elif self.loss_func == "mae":
-                l1_atom_ener_loss = F.l1_loss(
-                    atom_ener_reshape,
-                    atom_ener_label_reshape,
-                    reduction="mean",
+                l1_atom_ener_loss = _masked_mean(
+                    torch.abs(atom_ener_label - atom_ener), atom_mask
                 )
                 loss += (pref_ae * l1_atom_ener_loss).to(GLOBAL_PT_FLOAT_PRECISION)
                 more_loss["mae_ae"] = self.display_if_exist(
@@ -702,12 +772,10 @@ class EnergyHessianStdLoss(EnergyStdLoss):
         if self.has_h and "hessian" in model_pred and "hessian" in label:
             find_hessian = label.get("find_hessian", 0.0)
             pref_h = pref_h * find_hessian
-            diff_h = label["hessian"].reshape(
-                -1,
-            ) - model_pred["hessian"].reshape(
-                -1,
-            )
-            l2_hessian_loss = torch.mean(torch.square(diff_h))
+            pred_hessian = model_pred["hessian"].reshape(label["hessian"].shape)
+            diff_h = label["hessian"] - pred_hessian
+            hessian_mask = _hessian_mask_from_atom_mask(_atom_mask(model_pred, label))
+            l2_hessian_loss = _masked_mean(torch.square(diff_h), hessian_mask)
             if not self.inference:
                 more_loss["l2_hessian_loss"] = self.display_if_exist(
                     l2_hessian_loss.detach(), find_hessian
@@ -716,7 +784,7 @@ class EnergyHessianStdLoss(EnergyStdLoss):
             rmse_h = l2_hessian_loss.sqrt()
             more_loss["rmse_h"] = self.display_if_exist(rmse_h.detach(), find_hessian)
             if mae:
-                mae_h = torch.mean(torch.abs(diff_h))
+                mae_h = _masked_mean(torch.abs(diff_h), hessian_mask)
                 more_loss["mae_h"] = self.display_if_exist(mae_h.detach(), find_hessian)
 
         if not self.inference:
