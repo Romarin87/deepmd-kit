@@ -11,6 +11,9 @@ from deepmd.dpmodel.array_api import (
 from deepmd.dpmodel.loss.loss import (
     Loss,
 )
+from deepmd.dpmodel.utils.safe_gradient import (
+    safe_for_vector_norm,
+)
 from deepmd.utils.data import (
     DataRequirementItem,
 )
@@ -30,6 +33,36 @@ def custom_huber_loss(predictions: Array, targets: Array, delta: float = 1.0) ->
     linear_loss = delta * (abs_error - 0.5 * delta)
     loss = xp.where(abs_error <= delta, quadratic_loss, linear_loss)
     return xp.mean(loss)
+
+
+def _masked_mean(values: Array, mask: Array | None) -> Array:
+    """Mean over real atoms when an atom mask is available."""
+    xp = array_api_compat.array_namespace(values)
+    if mask is None:
+        return xp.mean(values)
+    weight = xp.astype(mask, values.dtype)
+    while len(weight.shape) < len(values.shape):
+        weight = weight[..., None]
+    weight = xp.ones_like(values) * weight
+    denom = xp.sum(weight)
+    denom = xp.where(denom > 0, denom, xp.asarray(1.0, dtype=values.dtype))
+    return xp.sum(values * weight) / denom
+
+
+def _get_atom_mask(
+    model_dict: dict[str, Array],
+    label_dict: dict[str, Array],
+    natoms: int,
+    ref: Array,
+) -> Array | None:
+    """Return a float atom mask with shape [nframes, natoms]."""
+    xp = array_api_compat.array_namespace(ref)
+    mask = model_dict.get("mask")
+    if mask is None and "type" in label_dict:
+        mask = label_dict["type"] >= 0
+    if mask is None:
+        return None
+    return xp.astype(xp.reshape(mask, (ref.shape[0], natoms)), ref.dtype)
 
 
 class EnergyLoss(Loss):
@@ -222,6 +255,7 @@ class EnergyLoss(Loss):
             atom_ener_hat,
             atom_pref,
         )
+        atom_mask = _get_atom_mask(model_dict, label_dict, natoms, energy)
 
         if self.enable_atom_ener_coeff:
             # when ener_coeff (\nu) is defined, the energy is defined as
@@ -239,8 +273,10 @@ class EnergyLoss(Loss):
             force_reshape = xp.reshape(force, (-1,))
             force_hat_reshape = xp.reshape(force_hat, (-1,))
             diff_f = force_hat_reshape - force_reshape
+            diff_f_atom = xp.reshape(diff_f, (energy.shape[0], natoms, 3))
         else:
             diff_f = None
+            diff_f_atom = None
 
         if self.relative_f is not None:
             force_hat_3 = xp.reshape(force_hat, (-1, 3))
@@ -309,36 +345,46 @@ class EnergyLoss(Loss):
                 more_loss["mae_e_all"] = self.display_if_exist(mae_e_all, find_energy)
         if self.has_f:
             if self.loss_func == "mse":
-                l2_force_loss = xp.mean(xp.square(diff_f))
+                l2_force_loss = _masked_mean(xp.square(diff_f_atom), atom_mask)
                 if not self.use_huber:
                     loss += pref_f * l2_force_loss
                 else:
                     if not self.f_use_norm:
-                        l_huber_loss = custom_huber_loss(
-                            xp.reshape(force, (-1,)),
-                            xp.reshape(force_hat, (-1,)),
-                            delta=self._huber_delta_force,
+                        diff_for_huber = xp.abs(diff_f_atom)
+                        quadratic_loss = 0.5 * diff_for_huber**2
+                        linear_loss = self._huber_delta_force * (
+                            diff_for_huber - 0.5 * self._huber_delta_force
                         )
+                        huber_values = xp.where(
+                            diff_for_huber <= self._huber_delta_force,
+                            quadratic_loss,
+                            linear_loss,
+                        )
+                        l_huber_loss = _masked_mean(huber_values, atom_mask)
                     else:
-                        force_diff_3 = xp.reshape(diff_f, (-1, 3))
-                        force_diff_norm = xp.reshape(
-                            xp.linalg.vector_norm(force_diff_3, axis=1), (-1, 1)
+                        force_diff_norm = safe_for_vector_norm(diff_f_atom, axis=-1)
+                        abs_error = xp.abs(force_diff_norm)
+                        quadratic_loss = 0.5 * force_diff_norm**2
+                        linear_loss = self._huber_delta_force * (
+                            abs_error - 0.5 * self._huber_delta_force
                         )
-                        l_huber_loss = custom_huber_loss(
-                            force_diff_norm,
-                            xp.zeros_like(force_diff_norm),
-                            delta=self._huber_delta_force,
+                        huber_values = xp.where(
+                            abs_error <= self._huber_delta_force,
+                            quadratic_loss,
+                            linear_loss,
                         )
+                        l_huber_loss = _masked_mean(huber_values, atom_mask)
                     loss += pref_f * l_huber_loss
                 more_loss["rmse_f"] = self.display_if_exist(
                     xp.sqrt(l2_force_loss), find_force
                 )
             elif self.loss_func == "mae":
                 if not self.f_use_norm:
-                    l1_force_loss = xp.mean(xp.abs(diff_f))
+                    l1_force_loss = _masked_mean(xp.abs(diff_f_atom), atom_mask)
                 else:
-                    force_diff_3 = xp.reshape(diff_f, (-1, 3))
-                    l1_force_loss = xp.mean(xp.linalg.vector_norm(force_diff_3, axis=1))
+                    l1_force_loss = _masked_mean(
+                        safe_for_vector_norm(diff_f_atom, axis=-1), atom_mask
+                    )
                 loss += pref_f * l1_force_loss
                 more_loss["mae_f"] = self.display_if_exist(l1_force_loss, find_force)
             else:
@@ -346,7 +392,7 @@ class EnergyLoss(Loss):
                     f"Loss type {self.loss_func} is not implemented for force loss."
                 )
             if mae:
-                mae_f = xp.mean(xp.abs(diff_f))
+                mae_f = _masked_mean(xp.abs(diff_f_atom), atom_mask)
                 more_loss["mae_f"] = self.display_if_exist(mae_f, find_force)
         if self.has_v:
             virial_reshape = xp.reshape(virial, (-1,))

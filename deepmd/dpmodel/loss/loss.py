@@ -3,6 +3,7 @@ from abc import (
     ABC,
     abstractmethod,
 )
+import numbers
 
 import array_api_compat
 
@@ -63,6 +64,10 @@ class Loss(NativeOP, ABC, make_plugin_registry("loss")):
         """
         xp = array_api_compat.array_namespace(loss)
         dev = array_api_compat.device(loss)
+        if isinstance(find_property, (bool, numbers.Number)):
+            if bool(find_property):
+                return loss
+            return xp.asarray(xp.nan, device=dev)
         return xp.where(
             xp.asarray(find_property, dtype=xp.bool, device=dev),
             loss,
