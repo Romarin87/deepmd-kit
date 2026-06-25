@@ -91,7 +91,7 @@ from deepmd.utils.finetune import (
     FinetuneRuleItem,
 )
 from deepmd.utils.model_stat import (
-    collect_batches,
+    make_stat_input,
 )
 
 log = logging.getLogger(__name__)
@@ -223,29 +223,11 @@ def _set_jax_mesh(mesh: Mesh) -> None:
     _ACTIVE_JAX_MESH_CONTEXT.append(mesh)
 
 
-def _merge_batches_for_bias(batch_list: list[np.ndarray], key: str) -> np.ndarray | float:
-    arrays = [np.asarray(item) for item in batch_list]
-    if key.startswith("find_"):
-        return float(np.max(arrays))
-    if key in {"natoms", "natoms_vec"}:
-        return np.stack(arrays, axis=0)
-    if arrays and arrays[0].ndim == 0:
-        return np.asarray(arrays)
-    return np.concatenate(arrays, axis=0)
-
-
 def _pack_data_for_bias_adjust(
     train_data: DeepmdDataSystem,
     nbatches: int,
 ) -> list[dict[str, np.ndarray | None]]:
-    all_stat = collect_batches(train_data, nbatches, merge_sys=False)
-    all_stat["atype"] = all_stat.pop("type")
-    if "natoms_vec" in all_stat:
-        all_stat["natoms"] = all_stat["natoms_vec"]
-    sampled = [
-        {kk: _merge_batches_for_bias(vv[ii], kk) for kk, vv in all_stat.items()}
-        for ii in range(train_data.get_nsystems())
-    ]
+    sampled = make_stat_input(train_data, nbatches)
     for ii, single_data in enumerate(sampled):
         for key, value in list(single_data.items()):
             single_data[key] = to_numpy_array(value)

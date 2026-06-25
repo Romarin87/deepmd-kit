@@ -249,6 +249,84 @@ _COMMON_CHECK_KEYS = [
 ]
 
 
+class TestMakeStatInputMixedBatch(unittest.TestCase):
+    """Mixed batch-size statistics should still sample each system separately."""
+
+    class _FakeSystem:
+        def __init__(self, natoms: int, atype: list[int]) -> None:
+            self.natoms = natoms
+            self.atype = np.asarray(atype, dtype=np.int64)
+            self.calls = 0
+
+        def get_batch(self, batch_size: int) -> dict:
+            self.calls += 1
+            coord = np.full(
+                (batch_size, self.natoms * 3),
+                float(self.natoms),
+                dtype=np.float64,
+            )
+            force = np.full_like(coord, -float(self.natoms))
+            return {
+                "type": np.tile(self.atype.reshape(1, -1), (batch_size, 1)),
+                "coord": coord,
+                "energy": np.full((batch_size, 1), float(self.natoms)),
+                "force": force,
+                "find_energy": np.float32(1.0),
+                "find_force": np.float32(1.0),
+            }
+
+    class _FakeMixedData:
+        mixed_systems = True
+
+        def __init__(self) -> None:
+            self.data_systems = [
+                TestMakeStatInputMixedBatch._FakeSystem(4, [0, 1, 1, 1]),
+                TestMakeStatInputMixedBatch._FakeSystem(7, [0, 0, 1, 1, 1, 1, 1]),
+            ]
+            self.batch_size = np.asarray([2, 2], dtype=np.int64)
+            self.natoms_vec = [
+                np.asarray([4, 4, 1, 3], dtype=np.int32),
+                np.asarray([7, 7, 2, 5], dtype=np.int32),
+            ]
+            self.default_mesh = [
+                np.zeros(6, dtype=np.int32),
+                np.zeros(6, dtype=np.int32),
+            ]
+            self.fallback_get_batch_calls = 0
+
+        def get_nsystems(self) -> int:
+            return len(self.data_systems)
+
+        def get_batch(self, sys_idx=None) -> dict:
+            self.fallback_get_batch_calls += 1
+            raise AssertionError("mixed-system stat collection must not use get_batch")
+
+    def test_mixed_batch_size_keeps_per_system_shapes(self) -> None:
+        from deepmd.utils.model_stat import (
+            make_stat_input,
+        )
+
+        data = self._FakeMixedData()
+        sampled = make_stat_input(data, nbatches=2)
+
+        self.assertEqual(data.fallback_get_batch_calls, 0)
+        self.assertEqual([sys.calls for sys in data.data_systems], [2, 2])
+        self.assertEqual(len(sampled), 2)
+
+        self.assertEqual(sampled[0]["coord"].shape, (4, 12))
+        self.assertEqual(sampled[1]["coord"].shape, (4, 21))
+        self.assertEqual(sampled[0]["force"].shape, (4, 12))
+        self.assertEqual(sampled[1]["force"].shape, (4, 21))
+        self.assertEqual(sampled[0]["atype"].shape, (4, 4))
+        self.assertEqual(sampled[1]["atype"].shape, (4, 7))
+        self.assertEqual(sampled[0]["natoms"].shape, (4, 4))
+        self.assertEqual(sampled[1]["natoms"].shape, (4, 4))
+        self.assertNotIn("real_natoms_vec", sampled[0])
+        self.assertNotIn("real_natoms_vec", sampled[1])
+        self.assertFalse(np.any(sampled[0]["atype"] < 0))
+        self.assertFalse(np.any(sampled[1]["atype"] < 0))
+
+
 @unittest.skipUnless(INSTALLED_PT, "PyTorch backend not installed")
 class TestMakeStatInputNormal(unittest.TestCase):
     """Test with normal (non-mixed-type) water data, multiple systems."""
