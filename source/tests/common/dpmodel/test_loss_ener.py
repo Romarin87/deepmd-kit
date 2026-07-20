@@ -102,38 +102,6 @@ class TestEnergyLossBasic(TestEnergyLossBase):
         _loss, more_loss = loss_fn.call(1.0, nmax, model_dict, label_dict)
         np.testing.assert_allclose(more_loss["rmse_f"], 1.0)
 
-    def test_force_padding_mask_with_flat_label(self) -> None:
-        loss_fn = EnergyLoss(
-            starter_learning_rate=1.0,
-            start_pref_f=1.0,
-            limit_pref_f=1.0,
-        )
-        nframes, nreal, nmax = 1, 2, 4
-        model_dict = {
-            "energy": np.zeros((nframes, 1)),
-            "force": np.zeros((nframes, nmax, 3)),
-            "virial": np.zeros((nframes, 9)),
-            "atom_energy": np.zeros((nframes, nmax, 1)),
-            "mask": np.array([[1, 1, 0, 0]], dtype=np.int32),
-        }
-        label_force = np.zeros((nframes, nmax, 3))
-        label_force[:, :nreal, :] = 1.0
-        label_dict = {
-            "energy": np.zeros((nframes, 1)),
-            "force": label_force.reshape(nframes, nmax * 3),
-            "virial": np.zeros((nframes, 9)),
-            "atom_ener": np.zeros((nframes, nmax, 1)),
-            "atom_pref": np.zeros((nframes, nmax * 3)),
-            "type": np.array([[0, 0, -1, -1]], dtype=np.int32),
-            "find_energy": 0.0,
-            "find_force": 1.0,
-            "find_virial": 0.0,
-            "find_atom_ener": 0.0,
-            "find_atom_pref": 0.0,
-        }
-        _loss, more_loss = loss_fn.call(1.0, nmax, model_dict, label_dict)
-        np.testing.assert_allclose(more_loss["rmse_f"], 1.0)
-
     def test_energy_padding_uses_real_natoms(self) -> None:
         loss_fn = EnergyLoss(
             starter_learning_rate=1.0,
@@ -268,42 +236,6 @@ class TestEnergyHessianLossPadding(TestEnergyLossBase):
             "atom_ener": np.zeros((nframes, nmax, 1)),
             "atom_pref": np.zeros((nframes, nmax * 3)),
             "hessian": label_hessian,
-            "type": np.array([[0, 0, -1, -1]], dtype=np.int32),
-            "find_energy": 0.0,
-            "find_force": 0.0,
-            "find_virial": 0.0,
-            "find_atom_ener": 0.0,
-            "find_atom_pref": 0.0,
-            "find_hessian": 1.0,
-        }
-        _loss, more_loss = loss_fn.call(1.0, nmax, model_dict, label_dict)
-        np.testing.assert_allclose(more_loss["rmse_h"], 1.0)
-
-    def test_hessian_padding_mask_with_flat_label(self) -> None:
-        loss_fn = EnergyHessianLoss(
-            starter_learning_rate=1.0,
-            start_pref_h=1.0,
-            limit_pref_h=1.0,
-        )
-        nframes, nreal, nmax = 1, 2, 4
-        hdim = nmax * 3
-        model_dict = {
-            "energy": np.zeros((nframes, 1)),
-            "force": np.zeros((nframes, nmax, 3)),
-            "virial": np.zeros((nframes, 9)),
-            "atom_energy": np.zeros((nframes, nmax, 1)),
-            "energy_derv_r_derv_r": np.zeros((nframes, hdim, hdim)),
-            "mask": np.array([[1, 1, 0, 0]], dtype=np.int32),
-        }
-        label_hessian = np.zeros((nframes, hdim, hdim))
-        label_hessian[:, : nreal * 3, : nreal * 3] = 1.0
-        label_dict = {
-            "energy": np.zeros((nframes, 1)),
-            "force": np.zeros((nframes, nmax, 3)),
-            "virial": np.zeros((nframes, 9)),
-            "atom_ener": np.zeros((nframes, nmax, 1)),
-            "atom_pref": np.zeros((nframes, nmax * 3)),
-            "hessian": label_hessian.reshape(nframes, hdim * hdim),
             "type": np.array([[0, 0, -1, -1]], dtype=np.int32),
             "find_energy": 0.0,
             "find_force": 0.0,

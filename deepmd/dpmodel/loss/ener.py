@@ -69,23 +69,6 @@ def _hessian_mask_from_atom_mask(xp: Any, mask: Array | None) -> Array | None:
     return xp.logical_and(coord_mask[..., :, None], coord_mask[..., None, :])
 
 
-def _reshape_force_like_atoms(xp: Any, value: Array, mask: Array | None) -> Array:
-    if value.ndim >= 3 and value.shape[-1] == 3:
-        return value
-    if mask is not None:
-        return xp.reshape(value, (*mask.shape, 3))
-    return xp.reshape(value, (*value.shape[:-1], value.shape[-1] // 3, 3))
-
-
-def _reshape_hessian_like_atoms(xp: Any, value: Array, mask: Array | None) -> Array:
-    if value.ndim >= 3:
-        return value
-    if mask is None:
-        return value
-    ncoord = mask.shape[-1] * 3
-    return xp.reshape(value, (*mask.shape[:-1], ncoord, ncoord))
-
-
 def custom_huber_loss(
     predictions: Array,
     targets: Array,
@@ -298,9 +281,12 @@ class EnergyLoss(Loss):
             atom_ener_coeff = xp.reshape(atom_ener_coeff, atom_ener.shape)
             energy = xp.sum(atom_ener_coeff * atom_ener, axis=1)
         atom_mask = _atom_mask(model_dict, label_dict)
+        if getattr(force, "shape", None) != getattr(force_hat, "shape", None):
+            if len(force.shape) >= len(force_hat.shape):
+                force_hat = xp.reshape(force_hat, force.shape)
+            else:
+                force = xp.reshape(force, force_hat.shape)
         if self.has_f or self.has_pf or self.relative_f or self.has_gf:
-            force = _reshape_force_like_atoms(xp, force, atom_mask)
-            force_hat = _reshape_force_like_atoms(xp, force_hat, atom_mask)
             diff_f_full = force_hat - force
         else:
             diff_f_full = None
@@ -715,15 +701,15 @@ class EnergyHessianLoss(EnergyLoss):
         ):
             find_hessian = label_dict.get("find_hessian", 0.0)
             pref_h = pref_h * find_hessian
-            atom_mask = _atom_mask(model_dict, label_dict)
-            hessian_mask = _hessian_mask_from_atom_mask(xp, atom_mask)
-            pred_hessian = _reshape_hessian_like_atoms(
-                xp, model_dict["energy_derv_r_derv_r"], atom_mask
+            hessian_mask = _hessian_mask_from_atom_mask(
+                xp, _atom_mask(model_dict, label_dict)
             )
-            label_hessian = _reshape_hessian_like_atoms(
-                xp, label_dict["hessian"], atom_mask
-            )
-            if hessian_mask is None:
+            label_hessian = label_dict["hessian"]
+            pred_hessian = model_dict["energy_derv_r_derv_r"]
+            if hessian_mask is not None:
+                label_hessian = xp.reshape(label_hessian, hessian_mask.shape)
+                pred_hessian = xp.reshape(pred_hessian, hessian_mask.shape)
+            else:
                 pred_hessian = xp.reshape(pred_hessian, label_hessian.shape)
             diff_h = label_hessian - pred_hessian
             l2_hessian_loss = _masked_mean(xp, xp.square(diff_h), hessian_mask)

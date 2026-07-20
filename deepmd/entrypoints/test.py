@@ -57,8 +57,8 @@ from deepmd.utils.eval_metrics import (
     DP_TEST_SPIN_WEIGHTED_METRIC_KEYS,
     DP_TEST_WEIGHTED_FORCE_METRIC_KEYS,
     DP_TEST_WEIGHTED_METRIC_KEYS,
-    compute_energy_type_metrics,
-    compute_error_stat,
+    EnergyTypeEvalMetrics,
+    ErrorStat,
     compute_spin_force_metrics,
     compute_weighted_error_stat,
     mae,
@@ -326,6 +326,152 @@ def _concat_force_rows(
     return np.concatenate(force_blocks, axis=0)
 
 
+def _error_stat_from_diff(diff: np.ndarray) -> ErrorStat:
+    """Compute one MAE/RMSE pair from an already-filtered difference array."""
+    diff = np.asarray(diff)
+    if diff.size == 0:
+        return ErrorStat(mae=0.0, rmse=0.0, weight=0.0)
+    return ErrorStat(
+        mae=mae(diff),
+        rmse=rmse(diff),
+        weight=float(diff.size),
+    )
+
+
+def _get_real_atom_mask(
+    atom_type: np.ndarray,
+    *,
+    numb_test: int,
+    natoms: int,
+) -> np.ndarray:
+    """Return `[nframes, natoms]` mask for non-padding atoms."""
+    atom_type = np.asarray(atom_type).reshape([-1, natoms])
+    if atom_type.shape[0] == 1 and numb_test != 1:
+        atom_type = np.broadcast_to(atom_type, (numb_test, natoms))
+    else:
+        atom_type = atom_type[:numb_test]
+    if atom_type.shape != (numb_test, natoms):
+        raise ValueError(
+            "Atom type array does not match the requested number of test frames."
+        )
+    atom_mask = atom_type >= 0
+    if np.any(np.sum(atom_mask, axis=1) <= 0):
+        raise ValueError("Each test frame must contain at least one real atom.")
+    return atom_mask
+
+
+def _real_natoms(atom_mask: np.ndarray) -> np.ndarray:
+    """Return the number of real atoms in each frame as a column vector."""
+    return np.sum(atom_mask, axis=1, dtype=np.float64).reshape([-1, 1])
+
+
+def _force_component_mask(atom_mask: np.ndarray) -> np.ndarray:
+    """Expand an atom mask to flattened force components."""
+    return np.repeat(atom_mask, 3, axis=1)
+
+
+def _compute_masked_error_stat(
+    prediction: np.ndarray,
+    reference: np.ndarray,
+    mask: np.ndarray,
+) -> ErrorStat:
+    """Compute MAE/RMSE after dropping masked-out entries."""
+    diff = np.asarray(prediction) - np.asarray(reference)
+    if mask.shape != diff.shape:
+        mask = np.broadcast_to(mask, diff.shape)
+    return _error_stat_from_diff(diff[mask])
+
+
+def _compute_energy_type_metrics_with_atom_mask(
+    prediction: dict[str, np.ndarray],
+    test_data: dict[str, np.ndarray],
+    *,
+    natoms: int,
+    has_pbc: bool,
+    atom_mask: np.ndarray,
+) -> EnergyTypeEvalMetrics:
+    """Compute energy-type metrics using real atoms for atomic normalization."""
+    energy = None
+    energy_per_atom = None
+    force = None
+    virial = None
+    virial_per_atom = None
+    nframes = atom_mask.shape[0]
+    real_natoms = _real_natoms(atom_mask)
+
+    if bool(test_data.get("find_energy", 0.0)):
+        energy_diff = (
+            prediction["energy"].reshape([nframes, 1])
+            - test_data["energy"].reshape([nframes, 1])
+        )
+        energy = _error_stat_from_diff(energy_diff)
+        energy_per_atom = _error_stat_from_diff(energy_diff / real_natoms)
+
+    if bool(test_data.get("find_force", 0.0)):
+        force = _compute_masked_error_stat(
+            prediction["force"].reshape([nframes, natoms * 3]),
+            test_data["force"].reshape([nframes, natoms * 3]),
+            _force_component_mask(atom_mask),
+        )
+
+    if has_pbc and bool(test_data.get("find_virial", 0.0)):
+        virial_diff = (
+            prediction["virial"].reshape([nframes, 9])
+            - test_data["virial"].reshape([nframes, 9])
+        )
+        virial = _error_stat_from_diff(virial_diff)
+        virial_per_atom = _error_stat_from_diff(virial_diff / real_natoms)
+
+    return EnergyTypeEvalMetrics(
+        energy=energy,
+        energy_per_atom=energy_per_atom,
+        force=force,
+        virial=virial,
+        virial_per_atom=virial_per_atom,
+    )
+
+
+def _compute_weighted_force_error_stat_with_atom_mask(
+    prediction: np.ndarray,
+    reference: np.ndarray,
+    weight: np.ndarray,
+    *,
+    natoms: int,
+    atom_mask: np.ndarray,
+) -> ErrorStat:
+    """Compute weighted force metrics while dropping padding atoms."""
+    nframes = atom_mask.shape[0]
+    weight = np.asarray(weight).reshape([nframes, -1])
+    if weight.shape[1] == natoms:
+        weight = np.repeat(weight, 3, axis=1)
+    elif weight.shape[1] != natoms * 3:
+        raise ValueError(
+            "Atom preference weights must be per atom or force component."
+        )
+    return compute_weighted_error_stat(
+        np.asarray(prediction).reshape([nframes, natoms * 3]),
+        np.asarray(reference).reshape([nframes, natoms * 3]),
+        weight * _force_component_mask(atom_mask),
+    )
+
+
+def _compute_hessian_error_stat_with_atom_mask(
+    prediction: np.ndarray,
+    reference: np.ndarray,
+    *,
+    natoms: int,
+    atom_mask: np.ndarray,
+) -> ErrorStat:
+    """Compute Hessian metrics on blocks where both coordinates are real atoms."""
+    nframes = atom_mask.shape[0]
+    ncoords = natoms * 3
+    prediction = np.asarray(prediction).reshape([nframes, ncoords, ncoords])
+    reference = np.asarray(reference).reshape([nframes, ncoords, ncoords])
+    coord_mask = _force_component_mask(atom_mask)
+    hessian_mask = coord_mask[:, :, None] & coord_mask[:, None, :]
+    return _error_stat_from_diff((prediction - reference)[hessian_mask])
+
+
 def _align_spin_force_arrays(
     *,
     dp: "DeepPot",
@@ -336,10 +482,13 @@ def _align_spin_force_arrays(
     prediction_force_mag: np.ndarray | None,
     reference_force_mag: np.ndarray | None,
     mask_mag: np.ndarray | None,
+    atom_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Align spin force arrays into real-atom and magnetic subsets."""
     prediction_force_by_atom = _reshape_force_by_atom(prediction_force, natoms)
     reference_force_by_atom = _reshape_force_by_atom(reference_force, natoms)
+    if atom_mask is None:
+        atom_mask = np.ones(prediction_force_by_atom.shape[:2], dtype=bool)
     if dp.get_ntypes_spin() != 0:  # old tf support for spin
         ntypes_real = dp.get_ntypes() - dp.get_ntypes_spin()
         atype_by_frame = np.reshape(atype, [-1, natoms])
@@ -356,14 +505,15 @@ def _align_spin_force_arrays(
         force_real_reference_chunks = []
         force_magnetic_prediction_chunks = []
         force_magnetic_reference_chunks = []
-        for frame_atype, frame_prediction, frame_reference in zip(
+        for frame_atype, frame_prediction, frame_reference, frame_atom_mask in zip(
             atype_by_frame,
             prediction_force_by_atom,
             reference_force_by_atom,
+            atom_mask,
             strict=False,
         ):
-            real_mask = frame_atype < ntypes_real
-            magnetic_mask = ~real_mask
+            real_mask = frame_atom_mask & (frame_atype < ntypes_real)
+            magnetic_mask = frame_atom_mask & (frame_atype >= ntypes_real)
             force_real_prediction_chunks.append(frame_prediction[real_mask])
             force_real_reference_chunks.append(frame_reference[real_mask])
             force_magnetic_prediction_chunks.append(frame_prediction[magnetic_mask])
@@ -387,11 +537,14 @@ def _align_spin_force_arrays(
             ),
         )
 
-    force_real_prediction = prediction_force_by_atom.reshape(-1, 3)
-    force_real_reference = reference_force_by_atom.reshape(-1, 3)
+    force_real_prediction = prediction_force_by_atom[atom_mask]
+    force_real_reference = reference_force_by_atom[atom_mask]
     if prediction_force_mag is None or reference_force_mag is None or mask_mag is None:
         return force_real_prediction, force_real_reference, None, None
-    magnetic_mask = mask_mag.reshape(-1).astype(bool)
+    magnetic_mask = mask_mag.reshape([atom_mask.shape[0], -1]).astype(bool)
+    if magnetic_mask.shape == atom_mask.shape:
+        magnetic_mask = magnetic_mask & atom_mask
+    magnetic_mask = magnetic_mask.reshape(-1)
     return (
         force_real_prediction,
         force_real_reference,
@@ -405,6 +558,7 @@ def _write_energy_test_details(
     detail_path: Path,
     system: str,
     natoms: int,
+    atom_mask: np.ndarray,
     append_detail: bool,
     reference_energy: np.ndarray,
     prediction_energy: np.ndarray,
@@ -421,6 +575,8 @@ def _write_energy_test_details(
     prediction_hessian: np.ndarray | None = None,
 ) -> None:
     """Write energy-type detail outputs after arrays have been aligned."""
+    nframes = atom_mask.shape[0]
+    real_natoms = _real_natoms(atom_mask)
     pe = np.concatenate(
         (
             np.reshape(reference_energy, [-1, 1]),
@@ -434,7 +590,7 @@ def _write_energy_test_details(
         header=f"{system}: data_e pred_e",
         append=append_detail,
     )
-    pe_atom = pe / natoms
+    pe_atom = pe / real_natoms
     save_txt_file(
         detail_path.with_suffix(".e_peratom.out"),
         pe_atom,
@@ -442,10 +598,12 @@ def _write_energy_test_details(
         append=append_detail,
     )
     if not out_put_spin:
+        reference_force = np.asarray(reference_force).reshape([nframes, natoms, 3])
+        prediction_force = np.asarray(prediction_force).reshape([nframes, natoms, 3])
         pf = np.concatenate(
             (
-                np.reshape(reference_force, [-1, 3]),
-                np.reshape(prediction_force, [-1, 3]),
+                reference_force[atom_mask].reshape([-1, 3]),
+                prediction_force[atom_mask].reshape([-1, 3]),
             ),
             axis=1,
         )
@@ -512,7 +670,7 @@ def _write_energy_test_details(
             "pred_vyy pred_vyz pred_vzx pred_vzy pred_vzz",
             append=append_detail,
         )
-        pv_atom = pv / natoms
+        pv_atom = pv / real_natoms
         save_txt_file(
             detail_path.with_suffix(".v_peratom.out"),
             pv_atom,
@@ -522,17 +680,25 @@ def _write_energy_test_details(
             append=append_detail,
         )
     if reference_hessian is not None and prediction_hessian is not None:
+        coord_mask = _force_component_mask(atom_mask)
+        hessian_mask = coord_mask[:, :, None] & coord_mask[:, None, :]
+        reference_hessian = np.asarray(reference_hessian).reshape(
+            [nframes, natoms * 3, natoms * 3]
+        )
+        prediction_hessian = np.asarray(prediction_hessian).reshape(
+            [nframes, natoms * 3, natoms * 3]
+        )
         hessian_detail = np.concatenate(
             (
-                reference_hessian.reshape(-1, 1),
-                prediction_hessian.reshape(-1, 1),
+                reference_hessian[hessian_mask].reshape(-1, 1),
+                prediction_hessian[hessian_mask].reshape(-1, 1),
             ),
             axis=1,
         )
         save_txt_file(
             detail_path.with_suffix(".h.out"),
             hessian_detail,
-            header=f"{system}: data_h pred_h (3Na*3Na matrix in row-major order)",
+            header=f"{system}: data_h pred_h (real-atom Hessian blocks only)",
             append=append_detail,
         )
 
@@ -606,6 +772,11 @@ def test_ener(
     natoms = len(test_data["type"][0])
     nframes = test_data["box"].shape[0]
     numb_test = min(nframes, numb_test)
+    atom_mask = _get_real_atom_mask(
+        test_data["type"],
+        numb_test=numb_test,
+        natoms=natoms,
+    )
 
     coord = test_data["coord"][:numb_test].reshape([numb_test, -1])
     box = test_data["box"][:numb_test]
@@ -688,6 +859,7 @@ def test_ener(
                 test_data["force_mag"][:numb_test] if "force_mag" in test_data else None
             ),
             mask_mag=mask_mag,
+            atom_mask=atom_mask,
         )
         if find_force_mag == 1 and (force_m is None or test_force_m is None):
             raise RuntimeError(
@@ -714,11 +886,12 @@ def test_ener(
     if find_virial == 1 and data.pbc and not out_put_spin:
         energy_metric_input["virial"] = test_data["virial"][:numb_test]
         energy_metric_prediction["virial"] = virial
-    shared_metrics = compute_energy_type_metrics(
+    shared_metrics = _compute_energy_type_metrics_with_atom_mask(
         prediction=energy_metric_prediction,
         test_data=energy_metric_input,
         natoms=natoms,
         has_pbc=data.pbc,
+        atom_mask=atom_mask,
     )
     dict_to_return.update(
         shared_metrics.as_weighted_average_errors(DP_TEST_WEIGHTED_METRIC_KEYS)
@@ -739,10 +912,12 @@ def test_ener(
         mae_f = shared_metrics.force.mae
         rmse_f = shared_metrics.force.rmse
         if find_atom_pref == 1:
-            weighted_force_metrics = compute_weighted_error_stat(
+            weighted_force_metrics = _compute_weighted_force_error_stat_with_atom_mask(
                 force,
                 test_data["force"][:numb_test],
                 test_data["atom_pref"][:numb_test],
+                natoms=natoms,
+                atom_mask=atom_mask,
             )
             mae_fw = weighted_force_metrics.mae
             rmse_fw = weighted_force_metrics.rmse
@@ -757,16 +932,19 @@ def test_ener(
 
     hessian_metrics = None
     if dp.has_hessian:
-        hessian_metrics = compute_error_stat(
+        hessian_metrics = _compute_hessian_error_stat_with_atom_mask(
             hessian,
             test_data["hessian"][:numb_test],
+            natoms=natoms,
+            atom_mask=atom_mask,
         )
         mae_h = hessian_metrics.mae
         rmse_h = hessian_metrics.rmse
     if has_atom_ener:
-        atomic_energy_metrics = compute_error_stat(
-            ae.reshape([-1]),
-            test_data["atom_ener"][:numb_test].reshape([-1]),
+        atomic_energy_metrics = _compute_masked_error_stat(
+            ae.reshape([numb_test, natoms]),
+            test_data["atom_ener"][:numb_test].reshape([numb_test, natoms]),
+            atom_mask,
         )
         mae_ae = atomic_energy_metrics.mae
         rmse_ae = atomic_energy_metrics.rmse
@@ -836,6 +1014,7 @@ def test_ener(
             detail_path=Path(detail_file),
             system=system,
             natoms=natoms,
+            atom_mask=atom_mask,
             append_detail=append_detail,
             reference_energy=test_data["energy"][:numb_test],
             prediction_energy=energy,

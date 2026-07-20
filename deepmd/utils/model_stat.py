@@ -16,25 +16,11 @@ from deepmd.dpmodel.utils.batch import (
 log = logging.getLogger(__name__)
 
 
-def _get_batch_by_system(data: Any, sys_idx: int) -> dict[str, Any]:
-    """Get a statistics batch from one concrete underlying system."""
-    if not getattr(data, "mixed_systems", False):
-        return data.get_batch(sys_idx=sys_idx)
-
-    # DeepmdDataSystem.get_batch(sys_idx=...) explicitly ignores sys_idx for
-    # mixed systems and returns a padded mixed batch. Statistics, however,
-    # should keep one dict per system, matching the PyTorch stat path.
-    stat_data = data.data_systems[sys_idx].get_batch(int(data.batch_size[sys_idx]))
-    stat_data["natoms_vec"] = data.natoms_vec[sys_idx]
-    stat_data["default_mesh"] = data.default_mesh[sys_idx]
-    return stat_data
-
-
 def _make_all_stat_ref(data: Any, nbatches: int) -> dict[str, list[Any]]:
     all_stat = defaultdict(list)
     for ii in range(data.get_nsystems()):
         for jj in range(nbatches):
-            stat_data = _get_batch_by_system(data, ii)
+            stat_data = data.get_batch(sys_idx=ii)
             for dd in stat_data:
                 if dd == "natoms_vec":
                     stat_data[dd] = stat_data[dd].astype(np.int32)
@@ -72,7 +58,7 @@ def collect_batches(
     for ii in range(data.get_nsystems()):
         sys_stat = defaultdict(list)
         for jj in range(nbatches):
-            stat_data = _get_batch_by_system(data, ii)
+            stat_data = data.get_batch(sys_idx=ii)
             for dd in stat_data:
                 if dd == "natoms_vec":
                     stat_data[dd] = stat_data[dd].astype(np.int32)
