@@ -4608,7 +4608,7 @@ opt_args_plugin = ArgsPlugin()
 
 
 @opt_args_plugin.register(
-    "Adam", doc=supported_backends("tf", "pt", "pd", "pt_expt", "tf2")
+    "Adam", doc=supported_backends("tf", "pt", "pd", "pt_expt", "tf2", "jax")
 )
 def optimizer_adam() -> list[Argument]:
     doc_adam_beta1 = "Adam beta1 coefficient for first moment decay."
@@ -4626,33 +4626,35 @@ def optimizer_adam() -> list[Argument]:
             float,
             optional=True,
             default=0.9,
-            doc=supported_backends("tf", "pt", "pd", "tf2") + doc_adam_beta1,
+            doc=supported_backends("tf", "pt", "pd", "tf2", "jax") + doc_adam_beta1,
         ),
         Argument(
             "adam_beta2",
             float,
             optional=True,
             default=0.999,
-            doc=supported_backends("tf", "pt", "pd", "tf2") + doc_adam_beta2,
+            doc=supported_backends("tf", "pt", "pd", "tf2", "jax") + doc_adam_beta2,
         ),
         Argument(
             "adam_eps",
             float,
             optional=True,
             default=1e-8,
-            doc=supported_backends("pt_expt") + doc_adam_eps,
+            doc=supported_backends("pt_expt", "jax") + doc_adam_eps,
         ),
         Argument(
             "weight_decay",
             float,
             optional=True,
             default=0.0,
-            doc=supported_backends("pt", "pd") + doc_weight_decay,
+            doc=supported_backends("pt", "pd", "jax") + doc_weight_decay,
         ),
     ]
 
 
-@opt_args_plugin.register("AdamW", doc=supported_backends("pt", "pd", "pt_expt", "tf2"))
+@opt_args_plugin.register(
+    "AdamW", doc=supported_backends("pt", "pd", "pt_expt", "tf2", "jax")
+)
 def optimizer_adamw() -> list[Argument]:
     doc_adam_beta1 = "AdamW beta1 coefficient for first moment decay."
     doc_adam_beta2 = "AdamW beta2 coefficient for second moment decay."
@@ -4667,28 +4669,29 @@ def optimizer_adamw() -> list[Argument]:
             float,
             optional=True,
             default=0.9,
-            doc=supported_backends("pt", "pd", "tf2") + doc_adam_beta1,
+            doc=supported_backends("pt", "pd", "tf2", "jax") + doc_adam_beta1,
         ),
         Argument(
             "adam_beta2",
             float,
             optional=True,
             default=0.999,
-            doc=supported_backends("pt", "pd", "tf2") + doc_adam_beta2,
+            doc=supported_backends("pt", "pd", "tf2", "jax") + doc_adam_beta2,
         ),
         Argument(
             "adam_eps",
             float,
             optional=True,
             default=1e-8,
-            doc=supported_backends("pt_expt") + doc_adam_eps,
+            doc=supported_backends("pt_expt", "jax") + doc_adam_eps,
         ),
         Argument(
             "weight_decay",
             float,
             optional=True,
             default=0.001,
-            doc=supported_backends("pt", "pd", "pt_expt", "tf2") + doc_weight_decay,
+            doc=supported_backends("pt", "pd", "pt_expt", "tf2", "jax")
+            + doc_weight_decay,
         ),
     ]
 
@@ -6338,7 +6341,7 @@ def training_args(
             "gradient_max_norm",
             float,
             optional=True,
-            doc=supported_backends("pt", "pd", "pt_expt", "tf2")
+            doc=supported_backends("pt", "pd", "pt_expt", "tf2", "jax")
             + doc_gradient_max_norm,
         ),
         Argument(

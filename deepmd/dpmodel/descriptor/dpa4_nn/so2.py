@@ -394,8 +394,11 @@ class SO2Linear(NativeOP):
         # factories invoke ``_build_so2_weight()`` with no args, so fall back to
         # the stored weight for the namespace/device (numpy or torch buffer).
         if xp is None or device is None:
-            xp = array_api_compat.array_namespace(self.weight_m0)
-            device = array_api_compat.device(self.weight_m0)
+            # Unwrap backend parameter containers before querying placement.
+            # JAX tracers have no concrete device during differentiation.
+            weight_array = self.weight_m0[...]
+            xp = array_api_compat.array_namespace(weight_array)
+            device = array_api_compat.device(weight_array)
         in_total = self.reduced_dim * self.in_channels
         out_total = self.reduced_dim * self.out_channels
         num_in_m0 = (self.lmax + 1) * self.in_channels

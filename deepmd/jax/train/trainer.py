@@ -89,6 +89,7 @@ from deepmd.jax.utils.multi_task import (
 )
 from deepmd.jax.utils.serialization import (
     _checkpoint_state,
+    _restore_empty_state_arrays,
     serialize_from_file,
 )
 from deepmd.utils.argcheck import (
@@ -118,7 +119,7 @@ log = logging.getLogger(__name__)
 
 
 class DPTrainer(AbstractTrainer):
-    """Train JAX DeePMD models on local devices."""
+    """Train JAX DeePMD models on a frame/atom device mesh."""
 
     def __init__(
         self,
@@ -142,6 +143,8 @@ class DPTrainer(AbstractTrainer):
         self.finetune_links = finetune_links
         self.shared_links = shared_links
         self.restart_training = restart is not None
+        self.optimizer_params = deepcopy(jdata.get("optimizer", {}))
+        self.mesh = None
         self.training_param = jdata["training"]
         self.validating_param = jdata.get("validating", {}) or {}
         self.num_steps = self.training_param["numb_steps"]
@@ -569,10 +572,14 @@ class DPTrainer(AbstractTrainer):
             merge_shared_statistics=merge_shared_statistics,
         )
 
+        from deepmd.jax.utils.parallel import make_training_mesh, replicate_model
+
+        self.mesh = make_training_mesh()
         for model_key in self.model_keys:
-            tx = optax.chain(
-                optax.scale_by_adam(),
-                _scale_by_global_learning_rate(),
+            replicate_model(self.models[model_key], self.mesh)
+            tx = make_optimizer(
+                self.optimizer_params,
+                gradient_max_norm=self.training_param.get("gradient_max_norm", 0.0),
             )
             self.optimizers[model_key] = nnx.Optimizer(
                 self.models[model_key], tx, wrt=nnx.Param
@@ -581,6 +588,8 @@ class DPTrainer(AbstractTrainer):
                 self._train_step_impls[model_key],
                 self._loss_fn_more_loss[model_key],
             ) = self._make_step_functions(self.losses[model_key])
+        if self.restart is not None and (Path(self.restart) / "optimizer").is_dir():
+            self._restore_optimizer_checkpoint(Path(self.restart))
         self.optimizer = (
             self.optimizers[DEFAULT_TASK_KEY] if not self.multi_task else None
         )
@@ -898,6 +907,12 @@ class DPTrainer(AbstractTrainer):
             np.arange(len(tasks), dtype=np.int_),
             p=tasks.probabilities,
         )
+        if self.rank_context.world_size > 1:
+            from jax.experimental import multihost_utils
+
+            model_index = multihost_utils.broadcast_one_to_all(
+                np.asarray(model_index), is_source=self.rank_context.is_chief
+            )
         return tasks[tasks.keys[int(model_index)]]
 
     def train_step(self, task: TrainingTask, step: int) -> TrainStepResult:
@@ -959,6 +974,10 @@ class DPTrainer(AbstractTrainer):
         """Persist a JAX checkpoint for a one-based step."""
         self._save_checkpoint(step)
 
+    @property
+    def display_is_collective(self) -> bool:
+        return self.rank_context.world_size > 1
+
     def run(self, tasks: TrainingTaskCollection) -> None:
         """Run JAX training through the backend-independent trainer loop."""
         log.info("Start to train %d steps.", self.num_steps)
@@ -971,7 +990,11 @@ class DPTrainer(AbstractTrainer):
         log.info("Training finished. Total wall time: %.2fs", time.time() - wall_start)
 
     def _change_bias_after_training(self) -> None:
+        from deepmd.jax.utils.parallel import localize_model, replicate_model
+
         if self.rank_context.is_chief:
+            if getattr(self, "mesh", None) is not None and self.mesh.size > 1:
+                localize_model(self.models)
             change_model_out_bias_by_task(
                 self.models,
                 self._sample_funcs,
@@ -979,6 +1002,8 @@ class DPTrainer(AbstractTrainer):
                 bias_adjust_mode="change-by-statistic",
             )
         self._broadcast_model_states()
+        if getattr(self, "mesh", None) is not None:
+            replicate_model(self.models, self.mesh)
 
     def run_full_validation(
         self,
@@ -1024,7 +1049,12 @@ class DPTrainer(AbstractTrainer):
             aparam=jax_data.get("aparam", None),
             pair_excl=model.atomic_model.pair_excl,
         )
-        return jax_data, extended_coord, extended_atype, nlist, mapping, fp, ap
+        from deepmd.jax.utils.parallel import shard_prepared_batch
+
+        return shard_prepared_batch(
+            (jax_data, extended_coord, extended_atype, nlist, mapping, fp, ap),
+            self.mesh,
+        )
 
     def _evaluate_prepared_batch(
         self,
@@ -1087,20 +1117,73 @@ class DPTrainer(AbstractTrainer):
         else:
             _, single_state = nnx.split(self.models[DEFAULT_TASK_KEY])
             state = single_state.to_pure_dict()
+        # Parameters are replicated; materialize the chief's local copy so
+        # Orbax does not require peer ranks to participate in a chief-only save.
+        state = jax.tree.map(np.asarray, state)
         if ckpt_path.is_dir():
             shutil.rmtree(ckpt_path)
         model_def_script_cpy = deepcopy(self.model_def_script)
         model_def_script_cpy["current_step"] = step
+        items = {
+            "state": ocp.args.StandardSave(_checkpoint_state(state)),
+            "model_def_script": ocp.args.JsonSave(model_def_script_cpy),
+        }
+        if getattr(self, "optimizers", None):
+            items["optimizer"] = ocp.args.StandardSave(
+                _checkpoint_state(self._optimizer_checkpoint_state())
+            )
+            items["optimizer_config"] = ocp.args.JsonSave(
+                self._optimizer_checkpoint_config()
+            )
+        process_options = ocp.options.MultiprocessingOptions(active_processes={0})
         with ocp.Checkpointer(
-            ocp.CompositeCheckpointHandler("state", "model_def_script")
+            ocp.CompositeCheckpointHandler(
+                *items,
+                composite_options=ocp.CompositeOptions(
+                    multiprocessing_options=process_options
+                ),
+            ),
+            multiprocessing_options=process_options,
         ) as checkpointer:
-            checkpointer.save(
-                ckpt_path.absolute(),
-                ocp.args.Composite(
-                    state=ocp.args.StandardSave(_checkpoint_state(state)),
-                    model_def_script=ocp.args.JsonSave(model_def_script_cpy),
+            checkpointer.save(ckpt_path.absolute(), ocp.args.Composite(**items))
+
+    def _optimizer_checkpoint_state(self) -> dict:
+        return {
+            key: jax.tree.map(np.asarray, nnx.state(optimizer).to_pure_dict())
+            for key, optimizer in self.optimizers.items()
+        }
+
+    def _optimizer_checkpoint_config(self) -> dict:
+        return {
+            "optimizer": self.optimizer_params,
+            "gradient_max_norm": self.training_param.get("gradient_max_norm", 0.0),
+        }
+
+    def _restore_optimizer_checkpoint(self, path: Path) -> None:
+        """Restore moments/step for new checkpoints; older checkpoints stay readable."""
+        target = self._optimizer_checkpoint_state()
+        with ocp.Checkpointer(
+            ocp.CompositeCheckpointHandler("optimizer", "optimizer_config")
+        ) as checkpointer:
+            restored = checkpointer.restore(
+                path.absolute(),
+                args=ocp.args.Composite(
+                    optimizer=ocp.args.StandardRestore(_checkpoint_state(target)),
+                    optimizer_config=ocp.args.JsonRestore(),
                 ),
             )
+        if restored.optimizer_config != self._optimizer_checkpoint_config():
+            raise ValueError(
+                "Restart optimizer configuration differs from the checkpoint; use init_model to reset optimizer state."
+            )
+        state = _restore_empty_state_arrays(restored.optimizer, target)
+        for key, optimizer in self.optimizers.items():
+            variables = nnx.state(optimizer)
+            variables.replace_by_pure_dict(state[key])
+            nnx.update(optimizer, variables)
+            from deepmd.jax.utils.parallel import replicate_model
+
+            replicate_model(optimizer, self.mesh)
 
     def _cleanup_old_checkpoints(self) -> None:
         """Remove old checkpoint directories beyond the retention limit."""
@@ -1411,6 +1494,33 @@ def _scale_by_global_learning_rate() -> optax.GradientTransformationExtraArgs:
         return updates, state
 
     return optax.GradientTransformationExtraArgs(_init_empty_state, update_fn)
+
+
+def make_optimizer(
+    config: dict[str, Any], *, gradient_max_norm: float = 0.0
+) -> optax.GradientTransformationExtraArgs:
+    """Build Adam/AdamW with the learning rate supplied by the global step."""
+    kind = config.get("type", "Adam")
+    if kind not in {"Adam", "AdamW"}:
+        raise ValueError(f"JAX optimizer {kind!r} is unsupported; use Adam or AdamW.")
+    b1 = config.get("adam_beta1", 0.9)
+    b2 = config.get("adam_beta2", 0.999)
+    eps = config.get("adam_eps", 1e-8)
+    decay = config.get("weight_decay", 0.001 if kind == "AdamW" else 0.0)
+    if not (0 <= b1 < 1 and 0 <= b2 < 1 and eps > 0 and decay >= 0):
+        raise ValueError("Invalid Adam coefficients, epsilon, or weight decay.")
+    if gradient_max_norm < 0:
+        raise ValueError("gradient_max_norm must be nonnegative.")
+    transforms = []
+    if gradient_max_norm > 0:
+        transforms.append(optax.clip_by_global_norm(gradient_max_norm))
+    if kind == "Adam" and decay:
+        transforms.append(optax.add_decayed_weights(decay))
+    transforms.append(optax.scale_by_adam(b1=b1, b2=b2, eps=eps))
+    if kind == "AdamW" and decay:
+        transforms.append(optax.add_decayed_weights(decay))
+    transforms.append(_scale_by_global_learning_rate())
+    return optax.chain(*transforms)
 
 
 def _legacy_optimizer_update(optimizer: Any, grads: Any, lr: float) -> None:

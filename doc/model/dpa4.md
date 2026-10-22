@@ -43,7 +43,8 @@ To include Hessian supervision, set positive `loss.start_pref_h` and
 `(3 * natoms, 3 * natoms)` matrix per frame. These are second derivatives
 of energy, equivalently minus the coordinate derivative of force.
 The trainer enables Hessian output for the supervised model and differentiates
-the loss through it. The current path materializes the full Hessian.
+the loss through it. Training materializes the full Hessian; inference can
+export and evaluate exact Hessian row blocks as described below.
 
 ```bash
 dp --jax train input_jax.json --skip-neighbor-stat
@@ -56,6 +57,64 @@ training configuration. `.jax` stores model state for restoration and
 lossless conversion; see the [JAX backend notes](../backend.md#jax) for
 inference formats. Charge/multiplicity conditioning uses the dedicated
 `charge_spin.npy` field of shape `(nframes, 2)` or `default_chg_spin`.
+
+
+JAX training uses a two-axis device mesh: `data` spans processes and `natoms`
+spans the devices visible to each process. A single process automatically uses
+all visible devices. Atom dimensions that are not divisible by the local device
+count retain frame-only placement. Neighbor lists are built locally before
+placement. Across processes, batches must have matching shapes, ghost counts,
+and label availability; an inconsistent batch raises an error before model
+collectives. Multi-task branch selection is synchronized across processes.
+
+For a multi-process launcher, set these variables separately for each process
+before invoking the same training command:
+
+```bash
+export DP_JAX_MULTI_NPROC=2
+export DP_JAX_MULTI_IPROC=0  # use 1 on the second process
+export DP_JAX_MULTI_HOST=coordinator-host:12345
+```
+
+Each process must see its assigned devices and the same shared checkpoint
+location. The global frame batch is the sum of the local frame batches.
+All processes participate in training and display-metric evaluation; the chief
+writes learning curves and checkpoints.
+
+The `optimizer` section supports `Adam` and `AdamW`, including `adam_beta1`,
+`adam_beta2`, `adam_eps`, and `weight_decay`. Adam applies coupled L2 decay;
+AdamW applies decoupled decay. `training.gradient_max_norm` clips the global
+parameter-gradient norm before the optimizer transform. For example:
+
+```json
+"optimizer": {
+  "type": "AdamW",
+  "adam_beta1": 0.9,
+  "adam_beta2": 0.999,
+  "adam_eps": 1e-8,
+  "weight_decay": 0.001
+}
+```
+
+New training checkpoints preserve optimizer moments and step counts.
+`--restart` restores them and checks optimizer configuration compatibility.
+Older checkpoints remain loadable and initialize fresh optimizer state;
+`--init-model` intentionally initializes a new optimizer.
+
+To export Hessian blocks, choose a positive number of coordinate rows per block:
+
+```bash
+DP_JAX_HESSIAN_CHUNK_SIZE=32 dp --jax freeze \
+  -c model.ckpt-1000.jax -o frozen.hlo --hessian
+```
+
+`DeepPot("frozen.hlo").eval(...)` evaluates the blocks sequentially and assembles
+the full `(nframes, 3 * natoms, 3 * natoms)` Hessian on the CPU. Ghost contributions
+are accumulated on both Hessian axes, and the final partial block is trimmed.
+Device intermediates scale with the selected row count; the returned CPU matrix
+still requires quadratic storage. Omitting the environment variable preserves
+full-Hessian export. Both routes support dedicated charge/spin inputs, default
+conditioning values, and model-level pair exclusions.
 
 The JAX model deserializer also accepts portable PyTorch DPA4 energy records
 with deterministic rotations and an ordinary GLU head. Keep the original
@@ -1045,8 +1104,9 @@ closed over the one-hop neighbor shell.
 
 ## Limitations
 
-- DPA4/SeZM is implemented for the PyTorch backend only.
-- Export uses `.pt2` (AOTInductor); the TorchScript freeze path is not used.
+- PyTorch supports the full DPA4/SeZM feature set. JAX supports the energy
+  implementation described in [JAX energy and Hessian training](#jax-energy-and-hessian-training).
+- PyTorch export uses `.pt2` (AOTInductor); the TorchScript freeze path is not used.
 - Model compression is not supported.
 - Multi-rank (multi-GPU/MPI) LAMMPS inference works on both export routes:
   the PT `edge_vec` archive and the pt_expt NeighborGraph archive each embed

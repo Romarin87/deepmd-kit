@@ -66,16 +66,28 @@ class JAXFullValidator(FullValidatorBase):
 
     def evaluate_all_systems(self) -> dict[str, float]:
         """Evaluate every validation system and aggregate metrics."""
-        system_metrics = [
-            self._evaluate_system(data_system)
-            for data_system in self._iter_validation_data_systems()
-        ]
-        aggregated = weighted_average([metric for metric in system_metrics if metric])
-        return {
-            metric_key: float(aggregated[metric_key])
-            for metric_key, _, _ in self.table_column_specs
-            if metric_key in aggregated
-        }
+        from deepmd.jax.env import nnx
+        from deepmd.jax.utils.parallel import localize_model
+
+        training_model = self.model
+        if jax.device_count() > 1:
+            self.model = nnx.clone(training_model)
+            localize_model(self.model)
+        try:
+            system_metrics = [
+                self._evaluate_system(data_system)
+                for data_system in self._iter_validation_data_systems()
+            ]
+            aggregated = weighted_average(
+                [metric for metric in system_metrics if metric]
+            )
+            return {
+                metric_key: float(aggregated[metric_key])
+                for metric_key, _, _ in self.table_column_specs
+                if metric_key in aggregated
+            }
+        finally:
+            self.model = training_model
 
     def propagate_error(self, error_message: str | None) -> str | None:
         """Broadcast rank-0 full-validation failures to all JAX processes."""

@@ -7,6 +7,9 @@ from typing import (
 from deepmd.dpmodel.model.make_model import (
     model_call_from_call_lower,
 )
+from deepmd.dpmodel.utils.nlist import build_neighbor_list, extend_coord_with_ghosts
+from deepmd.dpmodel.utils.region import normalize_coord
+
 from deepmd.dpmodel.output_def import (
     FittingOutputDef,
     ModelOutputDef,
@@ -82,6 +85,10 @@ class HLO(BaseModel):
         var_name: str | None = None,
         task_dim: int | None = None,
         intensive: bool = False,
+        stablehlo_hessian_block: bytes | None = None,
+        hessian_chunk_size: int = 0,
+        dim_chg_spin: int = 0,
+        default_chg_spin: list[float] | None = None,
     ) -> None:
         self._call_lower = jax_export.deserialize(stablehlo).call
         self._call_lower_atomic_virial = jax_export.deserialize(
@@ -91,6 +98,14 @@ class HLO(BaseModel):
         self._call_lower_atomic_virial_no_ghost = jax_export.deserialize(
             stablehlo_atomic_virial_no_ghost
         ).call
+        self.hessian_chunk_size = hessian_chunk_size
+        self.dim_chg_spin = dim_chg_spin
+        self.default_chg_spin = default_chg_spin
+        self._call_hessian_block = (
+            jax_export.deserialize(stablehlo_hessian_block).call
+            if stablehlo_hessian_block is not None
+            else None
+        )
         self.stablehlo = stablehlo
         self.type_map = type_map
         self.rcut = rcut
@@ -137,6 +152,7 @@ class HLO(BaseModel):
         fparam: jnp.ndarray | None = None,
         aparam: jnp.ndarray | None = None,
         do_atomic_virial: bool = False,
+        charge_spin: jnp.ndarray | None = None,
     ) -> Any:
         """Return model prediction.
 
@@ -163,7 +179,9 @@ class HLO(BaseModel):
             The keys are defined by the `ModelOutputDef`.
 
         """
-        return self.call(coord, atype, box, fparam, aparam, do_atomic_virial)
+        return self.call(
+            coord, atype, box, fparam, aparam, do_atomic_virial, charge_spin
+        )
 
     def call(
         self,
@@ -173,6 +191,7 @@ class HLO(BaseModel):
         fparam: jnp.ndarray | None = None,
         aparam: jnp.ndarray | None = None,
         do_atomic_virial: bool = False,
+        charge_spin: jnp.ndarray | None = None,
     ) -> dict[str, jnp.ndarray]:
         """Return model prediction.
 
@@ -211,6 +230,7 @@ class HLO(BaseModel):
             fparam=fparam,
             aparam=aparam,
             do_atomic_virial=do_atomic_virial,
+            charge_spin=charge_spin,
             # exclusion is a nlist-BUILD transform (decision #18/A4); the
             # serialized StableHLO lower consumes a pre-excluded nlist.
             pair_excl=self._pair_excl,
@@ -224,8 +244,10 @@ class HLO(BaseModel):
         )
 
     def _output_var_def(self, name: str) -> OutputVariableDef:
-        if name == "energy" and json.loads(self.model_def_script).get(
-            "hessian_mode", False
+        if (
+            name == "energy"
+            and not getattr(self, "hessian_chunk_size", 0)
+            and json.loads(self.model_def_script).get("hessian_mode", False)
         ):
             return OUTPUT_DEFS["energy_hessian"]
         if name in OUTPUT_DEFS:
@@ -271,7 +293,84 @@ class HLO(BaseModel):
             mapping,
             fparam,
             aparam,
+            *self._charge_spin_args(charge_spin, extended_coord.shape[0]),
         )
+
+    def call_hessian_block(
+        self,
+        coord: jnp.ndarray,
+        atype: jnp.ndarray,
+        box: jnp.ndarray | None = None,
+        fparam: jnp.ndarray | None = None,
+        aparam: jnp.ndarray | None = None,
+        block_index: jnp.ndarray | int = 0,
+        charge_spin: jnp.ndarray | None = None,
+    ) -> dict[str, jnp.ndarray]:
+        if self.hessian_chunk_size <= 0:
+            raise RuntimeError("This HLO model does not contain Hessian block output.")
+        if self._call_hessian_block is None:
+            raise RuntimeError("This HLO model does not contain Hessian block output.")
+        nframes, nloc = atype.shape[:2]
+        atype = jnp.asarray(atype, dtype=jnp.int32)
+        coord = jnp.asarray(coord, dtype=jnp.float64).reshape(nframes, nloc, 3)
+        if box is not None:
+            coord = normalize_coord(coord, box)
+        extended_coord, extended_atype, mapping = extend_coord_with_ghosts(
+            coord,
+            atype,
+            box,
+            self.get_rcut(),
+        )
+        nlist = build_neighbor_list(
+            extended_coord,
+            extended_atype,
+            nloc,
+            self.get_rcut(),
+            self.get_sel(),
+            distinguish_types=False,
+            pair_excl=self._pair_excl,
+        )
+        extended_coord = extended_coord.reshape(nframes, -1, 3)
+        if extended_coord.shape[1] == nloc:
+            dummy_coord = jnp.zeros((nframes, 1, 3), dtype=extended_coord.dtype)
+            dummy_atype = -jnp.ones((nframes, 1), dtype=extended_atype.dtype)
+            dummy_mapping = jnp.zeros((nframes, 1), dtype=mapping.dtype)
+            extended_coord = jnp.concatenate([extended_coord, dummy_coord], axis=1)
+            extended_atype = jnp.concatenate([extended_atype, dummy_atype], axis=1)
+            mapping = jnp.concatenate([mapping, dummy_mapping], axis=1)
+        return self._call_hessian_block(
+            extended_coord,
+            extended_atype,
+            nlist,
+            mapping,
+            fparam,
+            aparam,
+            jnp.asarray(block_index, dtype=jnp.int32),
+            *self._charge_spin_args(charge_spin, nframes),
+        )
+
+    def has_chg_spin_ebd(self) -> bool:
+        return getattr(self, "dim_chg_spin", 0) > 0
+
+    def get_dim_chg_spin(self) -> int:
+        return getattr(self, "dim_chg_spin", 0)
+
+    def get_default_chg_spin(self) -> list[float] | None:
+        return getattr(self, "default_chg_spin", None)
+
+    def _charge_spin_args(self, value: jnp.ndarray | None, nframes: int) -> list:
+        if not self.has_chg_spin_ebd():
+            return []
+        if value is None:
+            if self.default_chg_spin is None:
+                raise ValueError("This HLO model requires charge_spin input.")
+            value = jnp.tile(jnp.asarray(self.default_chg_spin), (nframes, 1))
+        return [
+            jnp.asarray(value, dtype=jnp.float64).reshape(nframes, self.dim_chg_spin)
+        ]
+
+    def get_hessian_chunk_size(self) -> int:
+        return getattr(self, "hessian_chunk_size", 0)
 
     def get_type_map(self) -> list[str]:
         """Get the type map."""

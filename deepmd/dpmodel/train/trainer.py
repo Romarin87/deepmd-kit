@@ -572,13 +572,14 @@ class AbstractTrainer(ABC):
                 display_step = step + 1
 
                 if self._should_display(display_step):
-                    if self.rank_context.is_chief:
+                    if self.rank_context.is_chief or self.display_is_collective:
                         train_results, valid_results = self.collect_display_results(
                             tasks,
                             active_task=task,
                             step=step,
                             step_result=step_result,
                         )
+                    if self.rank_context.is_chief:
                         current_lr = self.learning_rate(step)
                         self.lcurve_writer.log_results(
                             step=display_step,
@@ -672,6 +673,11 @@ class AbstractTrainer(ABC):
     def on_train_end(self, tasks: TrainingTaskCollection) -> None:
         """Hook called after training resources have been closed."""
         return None
+
+    @property
+    def display_is_collective(self) -> bool:
+        """Whether every rank must evaluate display metrics before chief logging."""
+        return False
 
     @property
     def checkpoint_is_collective(self) -> bool:

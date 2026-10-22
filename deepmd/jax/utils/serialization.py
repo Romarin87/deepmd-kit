@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import os
+
 from pathlib import (
     Path,
 )
@@ -284,7 +286,13 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
             data["model_def_script"],
             hessian,
         )
-        if hessian:
+        chunk_size = _get_hessian_chunk_size() if hessian else 0
+        if chunk_size:
+            # A checkpoint may already carry hessian_mode=True. Disable the
+            # monolithic graph before exporting E/F and individual Hessian rows.
+            model._enable_hessian = False
+            model.hess_fitting_def = None
+        elif hessian:
             model.enable_hessian()
         call_lower = model.call_common_lower
 
@@ -300,6 +308,7 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
                 mapping: jnp.ndarray,
                 fparam: jnp.ndarray,
                 aparam: jnp.ndarray,
+                charge_spin: jnp.ndarray | None = None,
             ) -> dict[str, jnp.ndarray]:
                 return call_lower(
                     coord,
@@ -309,6 +318,7 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
                     fparam,
                     aparam,
                     do_atomic_virial=do_atomic_virial,
+                    charge_spin=charge_spin,
                 )
 
             if has_ghost_atoms:
@@ -329,6 +339,11 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
                 jax.ShapeDtypeStruct((nf, nloc, model.get_dim_aparam()), jnp.float64)
                 if model.get_dim_aparam()
                 else None,  # aparam
+                *(
+                    [jax.ShapeDtypeStruct((nf, model.get_dim_chg_spin()), jnp.float64)]
+                    if model.has_chg_spin_ebd()
+                    else []
+                ),
             )
 
         exported = exported_whether_do_atomic_virial(
@@ -360,8 +375,15 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
         data["@variables"]["stablehlo_atomic_virial_no_ghost"] = np.void(
             serialized_atomic_virial_no_ghost
         )
+        if chunk_size:
+            data["@variables"]["stablehlo_hessian_block"] = np.void(
+                _export_hessian_block(model, chunk_size).serialize()
+            )
         is_property_model = model.get_var_name() is not None
         data["constants"] = {
+            "hessian_chunk_size": chunk_size,
+            "dim_chg_spin": model.get_dim_chg_spin() if model.has_chg_spin_ebd() else 0,
+            "default_chg_spin": model.get_default_chg_spin(),
             "type_map": model.get_type_map(),
             "rcut": model.get_rcut(),
             "numb_dos": model.get_numb_dos(),
@@ -477,3 +499,148 @@ def serialize_from_file(model_file: str) -> dict:
             "JAX backend only supports lossless file serialization for .jax "
             "directory and .hlo."
         )
+
+
+def _get_hessian_chunk_size() -> int:
+    raw_value = os.environ.get("DP_JAX_HESSIAN_CHUNK_SIZE")
+    if raw_value is None or raw_value == "":
+        return 0
+    try:
+        chunk_size = int(raw_value)
+    except ValueError as err:
+        raise ValueError(
+            "DP_JAX_HESSIAN_CHUNK_SIZE must be a positive integer"
+        ) from err
+    if chunk_size <= 0:
+        raise ValueError("DP_JAX_HESSIAN_CHUNK_SIZE must be a positive integer")
+    return chunk_size
+
+
+def _export_hessian_block(
+    model: BaseModel,
+    chunk_size: int,
+) -> "jax_export.Exported":
+    nf, nloc, nghost = jax_export.symbolic_shape(
+        "nf, nloc, nghost",
+        constraints=("nghost >= 0",),
+    )
+    nall = nloc + nghost
+
+    def call_hessian_block(
+        extended_coord: jnp.ndarray,
+        extended_atype: jnp.ndarray,
+        nlist: jnp.ndarray,
+        mapping: jnp.ndarray,
+        fparam: jnp.ndarray | None,
+        aparam: jnp.ndarray | None,
+        block_index: jnp.ndarray,
+        charge_spin: jnp.ndarray | None = None,
+    ) -> dict[str, jnp.ndarray]:
+        block_index = jnp.asarray(block_index, dtype=jnp.int32)
+
+        def energy_one(
+            extended_coord_one: jnp.ndarray,
+            extended_atype_one: jnp.ndarray,
+            nlist_one: jnp.ndarray,
+            mapping_one: jnp.ndarray,
+            fparam_one: jnp.ndarray | None,
+            aparam_one: jnp.ndarray | None,
+            charge_spin_one: jnp.ndarray | None,
+        ) -> jnp.ndarray:
+            output = model.call_common_lower(
+                extended_coord_one[None, ...],
+                extended_atype_one[None, ...],
+                nlist_one[None, ...],
+                mapping=mapping_one[None, ...],
+                fparam=None if fparam_one is None else fparam_one[None, ...],
+                aparam=None if aparam_one is None else aparam_one[None, ...],
+                do_atomic_virial=False,
+                charge_spin=None
+                if charge_spin_one is None
+                else charge_spin_one[None, ...],
+            )
+            return jnp.sum(output["energy_redu"])
+
+        grad_one = jax.grad(energy_one, argnums=0)
+
+        def hessian_block_one(
+            extended_coord_one: jnp.ndarray,
+            extended_atype_one: jnp.ndarray,
+            nlist_one: jnp.ndarray,
+            mapping_one: jnp.ndarray,
+            fparam_one: jnp.ndarray | None,
+            aparam_one: jnp.ndarray | None,
+            charge_spin_one: jnp.ndarray | None,
+        ) -> jnp.ndarray:
+            local_natoms = nlist_one.shape[0]
+            local_dim = local_natoms * 3
+            row_ids = block_index * chunk_size + jnp.arange(chunk_size)
+            safe_row_ids = jnp.minimum(row_ids, local_dim - 1)
+
+            def local_grad(coord_ext: jnp.ndarray) -> jnp.ndarray:
+                grad_ext = grad_one(
+                    coord_ext,
+                    extended_atype_one,
+                    nlist_one,
+                    mapping_one,
+                    fparam_one,
+                    aparam_one,
+                    charge_spin_one,
+                )
+                return (
+                    jnp.zeros(
+                        (local_natoms, 3),
+                        dtype=grad_ext.dtype,
+                    )
+                    .at[mapping_one]
+                    .add(grad_ext)
+                )
+
+            def hessian_row(row_id: jnp.ndarray) -> jnp.ndarray:
+                row_ext = jax.grad(
+                    lambda coord_ext: local_grad(coord_ext).reshape(-1)[row_id]
+                )(extended_coord_one)
+                return (
+                    jnp.zeros(
+                        (local_natoms, 3),
+                        dtype=row_ext.dtype,
+                    )
+                    .at[mapping_one]
+                    .add(row_ext)
+                    .reshape(-1)
+                )
+
+            rows = jax.vmap(hessian_row)(safe_row_ids)
+            return jnp.where(row_ids[:, None] < local_dim, rows, 0.0)
+
+        return {
+            "energy_derv_r_derv_r_block": jax.vmap(hessian_block_one)(
+                extended_coord,
+                extended_atype,
+                nlist,
+                mapping,
+                fparam,
+                aparam,
+                charge_spin,
+            )
+        }
+
+    exported = jax_export.export(jax.jit(call_hessian_block))(
+        jax.ShapeDtypeStruct((nf, nall, 3), jnp.float64),
+        jax.ShapeDtypeStruct((nf, nall), jnp.int32),
+        jax.ShapeDtypeStruct((nf, nloc, model.get_nnei()), jnp.int64),
+        jax.ShapeDtypeStruct((nf, nall), jnp.int64),
+        jax.ShapeDtypeStruct((nf, model.get_dim_fparam()), jnp.float64)
+        if model.get_dim_fparam()
+        else None,
+        jax.ShapeDtypeStruct((nf, nloc, model.get_dim_aparam()), jnp.float64)
+        if model.get_dim_aparam()
+        else None,
+        jax.ShapeDtypeStruct((), jnp.int32),
+        *(
+            [jax.ShapeDtypeStruct((nf, model.get_dim_chg_spin()), jnp.float64)]
+            if model.has_chg_spin_ebd()
+            else []
+        ),
+    )
+    return exported

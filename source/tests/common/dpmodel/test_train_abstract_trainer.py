@@ -414,3 +414,21 @@ def test_multitask_training_uses_single_task_as_collection_item(
     lcurve_text = lcurve.read_text()
     assert "rmse_val_task_a" in lcurve_text
     assert "rmse_trn_task_b" in lcurve_text
+
+
+def test_collective_display_reaches_peer_without_writing(tmp_path: Path) -> None:
+    class CollectiveTrainer(DummyTrainer):
+        @property
+        def display_is_collective(self) -> bool:
+            return True
+
+    validation = DummyData([2.0])
+    output = tmp_path / "peer.out"
+    trainer = CollectiveTrainer(
+        TrainerConfig(num_steps=2, disp_freq=1, disp_file=str(output)),
+        rank_context=RankContext(rank=1, world_size=2),
+    )
+    trainer.run(TrainingTaskCollection.single(DummyData([1.0]), validation))
+    assert validation.index == 2
+    assert not output.exists()
+    assert trainer.checkpoints == []

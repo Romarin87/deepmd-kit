@@ -108,6 +108,11 @@ class DeepEval(DeepEvalBackend):
                 stablehlo_atomic_virial_no_ghost=model_data["@variables"][
                     "stablehlo_atomic_virial_no_ghost"
                 ].tobytes(),
+                stablehlo_hessian_block=(
+                    model_data["@variables"]["stablehlo_hessian_block"].tobytes()
+                    if "stablehlo_hessian_block" in model_data["@variables"]
+                    else None
+                ),
                 model_def_script=json.dumps(model_data["model_def_script"]),
                 **model_data["constants"],
             )
@@ -457,6 +462,19 @@ class DeepEval(DeepEvalBackend):
         for kk, vv in batch_output.items():
             batch_output[kk] = to_numpy_array(vv)
 
+        if self._has_hessian_block() and any(
+            x.category == OutputVariableCategory.DERV_R_DERV_R for x in request_defs
+        ):
+            batch_output["energy_derv_r_derv_r"] = self._eval_hessian_block_model(
+                model,
+                coord_input,
+                type_input,
+                box_input,
+                fparam_input,
+                aparam_input,
+                charge_spin_input,
+            )
+
         results = []
         for odef in request_defs:
             # HLO and TFModelWrapper return raw internal keys (not translated),
@@ -507,6 +525,46 @@ class DeepEval(DeepEvalBackend):
     def get_has_hessian(self) -> bool:
         """Check if the model has Hessian output."""
         return self.get_model_def_script().get("hessian_mode", False)
+
+    def _has_hessian_block(self) -> bool:
+        return (
+            isinstance(self.dp, HLO)
+            and hasattr(self.dp, "get_hessian_chunk_size")
+            and self.dp.get_hessian_chunk_size() > 0
+        )
+
+    def _eval_hessian_block_model(
+        self,
+        model: HLO,
+        coord_input: np.ndarray,
+        type_input: np.ndarray,
+        box_input: np.ndarray | None,
+        fparam_input: np.ndarray | None,
+        aparam_input: np.ndarray | None,
+        charge_spin_input: np.ndarray | None = None,
+    ) -> np.ndarray:
+        nframes, natoms = coord_input.shape[:2]
+        dim = natoms * 3
+        chunk_size = model.get_hessian_chunk_size()
+        hessian = np.zeros(
+            (nframes, dim, dim),
+            dtype=GLOBAL_NP_FLOAT_PRECISION,
+        )
+        for start in range(0, dim, chunk_size):
+            block_index = start // chunk_size
+            block = model.call_hessian_block(
+                to_jax_array(coord_input),
+                to_jax_array(type_input),
+                box=to_jax_array(box_input),
+                fparam=to_jax_array(fparam_input),
+                aparam=to_jax_array(aparam_input),
+                block_index=block_index,
+                charge_spin=to_jax_array(charge_spin_input),
+            )["energy_derv_r_derv_r_block"]
+            block_np = to_numpy_array(block)
+            row_count = min(chunk_size, dim - start)
+            hessian[:, start : start + row_count, :] = block_np[:, :row_count, :]
+        return hessian
 
     def get_model(self) -> Any:
         """Get the JAX model as BaseModel.

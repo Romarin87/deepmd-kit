@@ -32,8 +32,8 @@ def model_config():
     }
 
 
-def make_model():
-    model = get_model(model_config())
+def make_model(config=None):
+    model = get_model(model_config() if config is None else config)
     # Residual output projections start at zero. Move off that initialization
     # so nonzero forces/Hessians exercise every geometry-dependent branch.
     state = nnx.state(model, nnx.Param)
@@ -181,9 +181,26 @@ def test_training_checkpoint_restart(tmp_path, monkeypatch):
     assert (tmp_path / "model-1.jax").is_dir()
     restored = DPTrainer(config, restart=str(tmp_path / "model-1.jax"))
     assert restored.start_step == 1
-    evaluate = nnx.jit(lambda m: m(COORD, ATYPE, charge_spin=jnp.array([[0.0, 1.0]])))
-    expected = evaluate(trainer.model)
-    actual = evaluate(restored.model)
+    from deepmd.dpmodel.train import DEFAULT_TASK_KEY
+
+    resumed_data = get_data(data_config, 3.0, ["H", "O"], None)
+    restored._setup_training({DEFAULT_TASK_KEY: resumed_data}, {DEFAULT_TASK_KEY: None})
+    for original, resumed in zip(
+        jax.tree.leaves(nnx.state(trainer.optimizer)),
+        jax.tree.leaves(nnx.state(restored.optimizer)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(original, resumed)
+    batch = restored._prepare_batch(resumed_data.get_batch(), DEFAULT_TASK_KEY)
+    for current in (trainer, restored):
+        current._train_step_impls[DEFAULT_TASK_KEY](
+            current.model, current.optimizer, current.lr.value(1), *batch
+        )
+    from deepmd.jax.train.trainer import _evaluate_model_dict
+
+    evaluate = nnx.jit(_evaluate_model_dict)
+    expected = evaluate(trainer.model, *batch[1:], charge_spin=batch[0]["charge_spin"])
+    actual = evaluate(restored.model, *batch[1:], charge_spin=batch[0]["charge_spin"])
     for key in ("energy", "force", "hessian"):
         assert np.isfinite(actual[key]).all()
         np.testing.assert_allclose(actual[key], expected[key], atol=1e-12)
@@ -286,3 +303,39 @@ def test_padded_atom_hessian():
     )
     np.testing.assert_allclose(actual["hessian"][:, 9:, :], 0, atol=1e-12)
     np.testing.assert_allclose(actual["hessian"][:, :, 9:], 0, atol=1e-12)
+
+
+def test_cloned_interaction_block_parameter_gradient():
+    model = make_model()
+    cloned = nnx.clone(model)
+    block = cloned.atomic_model.descriptor.blocks[0]
+    assert block._forward_impl.__self__ is block
+
+    def energy(m):
+        return m(COORD, ATYPE)["energy"].sum()
+
+    derivative = nnx.jit(nnx.grad(energy))(cloned)
+    path = (
+        "atomic_model",
+        "descriptor",
+        "blocks",
+        0,
+        "so2_conv",
+        "pre_focus_mix",
+        "weight",
+    )
+    grad = dict(nnx.to_flat_state(derivative))[path].value
+    index = np.unravel_index(np.argmax(np.abs(grad)), grad.shape)
+    assert abs(float(grad[index])) > 1e-8
+    evaluate = nnx.jit(energy)
+    values = []
+    delta = 1e-4
+    for sign in (1, -1):
+        shifted = nnx.clone(model)
+        weight = shifted.atomic_model.descriptor.blocks[0].so2_conv.pre_focus_mix.weight
+        weight.value = weight.value.at[index].add(sign * delta)
+        values.append(float(evaluate(shifted)))
+    np.testing.assert_allclose(
+        (values[0] - values[1]) / (2 * delta), grad[index], atol=1e-9, rtol=1e-4
+    )
+    np.testing.assert_allclose(evaluate(model), evaluate(cloned), atol=1e-12)

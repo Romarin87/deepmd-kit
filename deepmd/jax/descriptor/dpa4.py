@@ -14,6 +14,9 @@ from deepmd.dpmodel.common import (
 )
 from deepmd.dpmodel.descriptor.dpa4 import DescrptDPA4 as DescrptDPA4DP
 from deepmd.dpmodel.descriptor.dpa4_nn.activation import SwiGLU as SwiGLUDP
+from deepmd.dpmodel.descriptor.dpa4_nn.block import (
+    SeZMInteractionBlock as SeZMInteractionBlockDP,
+)
 from deepmd.dpmodel.descriptor.dpa4_nn.grid_net import GridProduct as GridProductDP
 from deepmd.dpmodel.descriptor.dpa4_nn.radial import (
     C3CutoffEnvelope as C3CutoffEnvelopeDP,
@@ -39,6 +42,29 @@ from deepmd.jax.env import (
 )
 from deepmd.jax.utils.network import (
     ArrayAPIParam,
+)
+
+
+@flax_module
+class SeZMInteractionBlock(SeZMInteractionBlockDP):
+    """Resolve the selected forward method on the current NNX graph instance.
+
+    A stored bound method is static to NNX and otherwise keeps referring to
+    the original block after clone/split/merge and JIT graph reconstruction.
+    """
+
+    @property
+    def _forward_impl(self) -> Any:
+        return getattr(self, self._jax_forward_impl_name)
+
+    @_forward_impl.setter
+    def _forward_impl(self, implementation: Any) -> None:
+        self._jax_forward_impl_name = implementation.__name__
+
+
+register_dpmodel_mapping(
+    SeZMInteractionBlockDP,
+    lambda value: SeZMInteractionBlock.deserialize(value.serialize()),
 )
 
 

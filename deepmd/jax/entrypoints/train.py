@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """DeePMD training entrypoint script.
 
-Can handle local training.
+Can handle local and distributed training.
 """
 
 import logging
@@ -259,6 +259,9 @@ def train(
     RuntimeError
         if the training command fails.
     """
+    from deepmd.jax.utils.parallel import initialize_distributed
+
+    initialize_distributed()
     JAXTrainEntrypoint().run(
         TrainEntrypointOptions(
             input_file=INPUT,
