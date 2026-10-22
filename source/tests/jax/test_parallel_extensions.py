@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Optimizer numerics and explicit multi-device placement regressions."""
 
+import json
+
 import numpy as np
 import optax
 import pytest
@@ -47,6 +49,35 @@ def test_optimizer_matches_reference(kind, clip):
 def test_unsupported_optimizer():
     with pytest.raises(ValueError, match="unsupported"):
         make_optimizer({"type": "LKF"})
+
+
+def test_checkpoint_restores_with_unavailable_saved_device(tmp_path):
+    from .test_dpa4_energy_hessian import make_model, model_config, COORD, ATYPE
+    from deepmd.jax.model.base_model import BaseModel
+    from deepmd.jax.utils.serialization import deserialize_to_file, serialize_from_file
+
+    model = make_model()
+    checkpoint = tmp_path / "model.jax"
+    deserialize_to_file(
+        str(checkpoint),
+        {"model": model.serialize(), "model_def_script": model_config()},
+    )
+    # Reproduce a checkpoint written on another distributed rank/device.
+    sharding_file = checkpoint / "state" / "_sharding"
+    shardings = json.loads(sharding_file.read_text())
+    assert shardings
+    for key in shardings:
+        shardings[key] = json.dumps(
+            {"sharding_type": "SingleDeviceSharding", "device_str": "cuda:99999"}
+        )
+    sharding_file.write_text(json.dumps(shardings))
+    restored = BaseModel.deserialize(serialize_from_file(str(checkpoint))["model"])
+    model.enable_hessian()
+    restored.enable_hessian()
+    evaluate = nnx.jit(lambda m: m(COORD, ATYPE))
+    expected, actual = evaluate(model), evaluate(restored)
+    for key in ("energy", "force", "hessian"):
+        np.testing.assert_allclose(actual[key], expected[key], atol=1e-12)
 
 
 @pytest.mark.skipif(

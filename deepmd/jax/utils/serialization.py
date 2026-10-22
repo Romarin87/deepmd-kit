@@ -433,13 +433,29 @@ def serialize_from_file(model_file: str) -> dict:
         The serialized model data.
     """
     if model_file.endswith(".jax"):
+        # A checkpoint may have been written on devices unavailable to this
+        # process (for example cuda:0 on another distributed rank). Restore
+        # arrays to host memory instead of reusing the saved device topology.
+        handler = ocp.StandardCheckpointHandler()
+        try:
+            metadata = handler.metadata(Path(model_file).absolute() / "state")
+        finally:
+            handler.close()
+        restore_args = jax.tree.map(
+            lambda value: (
+                ocp.RestoreArgs(restore_type=np.ndarray)
+                if isinstance(value, ocp.metadata.value.ArrayMetadata)
+                else ocp.RestoreArgs()
+            ),
+            metadata.tree,
+        )
         with ocp.Checkpointer(
             ocp.CompositeCheckpointHandler("state", "model_def_script")
         ) as checkpointer:
             data = checkpointer.restore(
                 Path(model_file).absolute(),
                 ocp.args.Composite(
-                    state=ocp.args.StandardRestore(),
+                    state=ocp.args.PyTreeRestore(restore_args=restore_args),
                     model_def_script=ocp.args.JsonRestore(),
                 ),
             )
