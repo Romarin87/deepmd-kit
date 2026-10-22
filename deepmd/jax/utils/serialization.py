@@ -25,6 +25,31 @@ from deepmd.jax.model.model import (
 )
 
 
+def _checkpoint_state(state: Any) -> Any:
+    """Represent empty arrays as None for Orbax versions that reject them.
+
+    Their shape and dtype are reconstructed from the model definition on load.
+    DPA4 has empty compatibility statistics and empty angular basis tables.
+    """
+    return jax.tree.map(
+        lambda value: None if getattr(value, "size", None) == 0 else value, state
+    )
+
+
+def _restore_empty_state_arrays(state: Any, template: Any) -> Any:
+    """Restore only empty array placeholders, preserving ordinary None values."""
+    return jax.tree.map(
+        lambda value, expected: (
+            expected
+            if value is None and getattr(expected, "size", None) == 0
+            else value
+        ),
+        state,
+        template,
+        is_leaf=lambda value: value is None,
+    )
+
+
 def _convert_str_to_int_key(item: dict) -> None:
     """Convert Orbax-restored numeric index keys from strings back to ints."""
     for key, value in item.copy().items():
@@ -247,7 +272,7 @@ def deserialize_to_file(model_file: str, data: dict, hessian: bool = False) -> N
             checkpointer.save(
                 Path(model_file).absolute(),
                 ocp.args.Composite(
-                    state=ocp.args.StandardSave(state),
+                    state=ocp.args.StandardSave(_checkpoint_state(state)),
                     model_def_script=ocp.args.JsonSave(model_def_script),
                 ),
             )
@@ -405,6 +430,9 @@ def serialize_from_file(model_file: str) -> dict:
             abstract_model = get_model(model_params)
             _restore_compression_slots_from_state(abstract_model, model_state)
             graphdef, abstract_state = nnx.split(abstract_model)
+            model_state = _restore_empty_state_arrays(
+                model_state, abstract_state.to_pure_dict()
+            )
             abstract_state.replace_by_pure_dict(model_state)
             return nnx.merge(graphdef, abstract_state)
 

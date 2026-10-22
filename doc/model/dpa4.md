@@ -1,7 +1,7 @@
-# Descriptor DPA4 {{ pytorch_icon }}
+# Descriptor DPA4 {{ pytorch_icon }} {{ jax_icon }}
 
 > [!NOTE]
-> **Supported backends**: PyTorch {{ pytorch_icon }}
+> **Supported backends**: PyTorch {{ pytorch_icon }}; JAX {{ jax_icon }} for the energy path described below.
 
 DPA4 is the DeePMD-kit implementation of the SeZM (Smooth Equivariant
 Zone-bridging Model) architecture: an SO(3)-equivariant message-passing model
@@ -17,7 +17,7 @@ Reference: {ref}`DPA4 paper <cite-dpa4>` in the canonical citation guide.
 
 ## Quick start
 
-DPA4 is a PyTorch-only model. Train it with the standard `dp --pt` workflow:
+Train the PyTorch implementation with the standard `dp --pt` workflow:
 
 ```bash
 cd examples/water/dpa4
@@ -27,6 +27,41 @@ dp --pt train input.json
 `examples/water/dpa4/input.json` is a complete, compact training input you can
 copy and adapt. See [training energy models](train-energy.md) for the general
 training workflow shared by all energy models.
+
+### JAX energy and Hessian training
+
+The JAX backend supports the DPA4 descriptor with its native GLU energy
+fitting network, conservative forces, and coordinate Hessians. Set
+`model.type` to `dpa4` (or `DPA4`, `sezm`, `SeZM`). The fitting type defaults
+to `dpa4_ener`; `sezm_ener` is an equivalent alias. Set
+`descriptor.random_gamma: false` and `descriptor.use_amp: false` explicitly
+in training inputs. Use `precision: "float64"` in both the descriptor and
+fitting network when checking higher derivatives.
+
+To include Hessian supervision, set positive `loss.start_pref_h` and
+`loss.limit_pref_h` and provide `set.*/hessian.npy` with one
+`(3 * natoms, 3 * natoms)` matrix per frame. These are second derivatives
+of energy, equivalently minus the coordinate derivative of force.
+The trainer enables Hessian output for the supervised model and differentiates
+the loss through it. The current path materializes the full Hessian.
+
+```bash
+dp --jax train input_jax.json --skip-neighbor-stat
+dp --jax train input_jax.json --restart model.ckpt-1000.jax --skip-neighbor-stat
+dp --jax freeze -c model.ckpt-1000.jax -o frozen.jax --hessian
+```
+
+The checkpoint prefix and saved step in these commands must match the
+training configuration. `.jax` stores model state for restoration and
+lossless conversion; see the [JAX backend notes](../backend.md#jax) for
+inference formats. Charge/multiplicity conditioning uses the dedicated
+`charge_spin.npy` field of shape `(nframes, 2)` or `default_chg_spin`.
+
+The JAX model deserializer also accepts portable PyTorch DPA4 energy records
+with deterministic rotations and an ordinary GLU head. Keep the original
+type map when importing weights. Analytical bridging, native/deepspin spin
+models, DeNS, LoRA, and case-conditioned fitting heads are outside this JAX
+energy implementation.
 
 ## Overview
 

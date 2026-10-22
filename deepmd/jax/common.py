@@ -215,7 +215,7 @@ def dpmodel_setattr(obj: nnx.Module, name: str, value: Any) -> tuple[bool, Any]:
     if isinstance(current, nnx.Variable) and isinstance(value, (np.ndarray, jax.Array)):
         if isinstance(value, np.ndarray):
             value = to_jax_array(value)
-        if Version(flax_version) >= _FLAX_0_12:
+        if hasattr(type(current), "set_value"):
             current.set_value(value)
         else:
             current.value = value

@@ -9,6 +9,7 @@ from .dipole_model import (
 from .dos_model import (
     DOSModel,
 )
+from .dpa4_model import DPA4EnergyModel
 from .ener_model import (
     EnergyModel,
 )
@@ -21,6 +22,7 @@ from .property_model import (
 
 __all__ = [
     "DOSModel",
+    "DPA4EnergyModel",
     "DPZBLLinearEnergyAtomicModel",
     "DipoleModel",
     "EnergyModel",

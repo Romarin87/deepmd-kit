@@ -88,6 +88,7 @@ from deepmd.jax.utils.multi_task import (
     preprocess_shared_params,
 )
 from deepmd.jax.utils.serialization import (
+    _checkpoint_state,
     serialize_from_file,
 )
 from deepmd.utils.argcheck import (
@@ -223,6 +224,40 @@ class DPTrainer(AbstractTrainer):
             for model_key in self.model_keys
         }
         for model_key, requirements in self.data_requirements_by_task.items():
+            task_model = self.models[model_key]
+            if task_model.get_dim_fparam() > 0:
+                has_default = task_model.has_default_fparam()
+                requirements.append(
+                    DataRequirementItem(
+                        "fparam",
+                        task_model.get_dim_fparam(),
+                        must=not has_default,
+                        default=task_model.get_default_fparam() if has_default else 0.0,
+                        source_policy="default" if has_default else "tracked",
+                    )
+                )
+            if task_model.get_dim_aparam() > 0:
+                requirements.append(
+                    DataRequirementItem(
+                        "aparam",
+                        task_model.get_dim_aparam(),
+                        atomic=True,
+                        must=True,
+                    )
+                )
+            if task_model.has_chg_spin_ebd():
+                has_default = task_model.get_default_chg_spin() is not None
+                requirements.append(
+                    DataRequirementItem(
+                        "charge_spin",
+                        2,
+                        must=not has_default,
+                        default=task_model.get_default_chg_spin()
+                        if has_default
+                        else 0.0,
+                        source_policy="default" if has_default else "tracked",
+                    )
+                )
             # Hessians are expensive and are only exposed by models whose task
             # loss requests the corresponding label. Enable each multi-task
             # branch independently so unrelated branches keep normal outputs.
@@ -775,7 +810,14 @@ class DPTrainer(AbstractTrainer):
             ap: jnp.ndarray | None,
         ) -> jnp.ndarray:
             model_dict = _evaluate_model_dict(
-                model, extended_coord, extended_atype, nlist, mapping, fp, ap
+                model,
+                extended_coord,
+                extended_atype,
+                nlist,
+                mapping,
+                fp,
+                ap,
+                charge_spin=label_dict.get("charge_spin"),
             )
             loss, _ = loss_obj(
                 learning_rate=lr,
@@ -798,7 +840,14 @@ class DPTrainer(AbstractTrainer):
             ap: jnp.ndarray | None,
         ) -> dict[str, jnp.ndarray]:
             model_dict = _evaluate_model_dict(
-                model, extended_coord, extended_atype, nlist, mapping, fp, ap
+                model,
+                extended_coord,
+                extended_atype,
+                nlist,
+                mapping,
+                fp,
+                ap,
+                charge_spin=label_dict.get("charge_spin"),
             )
             _, more_loss = loss_obj(
                 learning_rate=lr,
@@ -1048,7 +1097,7 @@ class DPTrainer(AbstractTrainer):
             checkpointer.save(
                 ckpt_path.absolute(),
                 ocp.args.Composite(
-                    state=ocp.args.StandardSave(state),
+                    state=ocp.args.StandardSave(_checkpoint_state(state)),
                     model_def_script=ocp.args.JsonSave(model_def_script_cpy),
                 ),
             )
@@ -1078,6 +1127,7 @@ def _evaluate_model_dict(
     mapping: jnp.ndarray | None,
     fp: jnp.ndarray | None,
     ap: jnp.ndarray | None,
+    charge_spin: jnp.ndarray | None = None,
 ) -> dict[str, jnp.ndarray]:
     model_dict_lower = model.call_common_lower(
         extended_coord,
@@ -1086,6 +1136,7 @@ def _evaluate_model_dict(
         mapping,
         fp,
         ap,
+        charge_spin=charge_spin,
     )
     model_dict = communicate_extended_output(
         model_dict_lower,

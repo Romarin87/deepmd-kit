@@ -220,6 +220,12 @@ class _RequirementModel:
     def get_dim_fparam(self) -> int:
         return 0
 
+    def get_dim_aparam(self) -> int:
+        return 0
+
+    def has_chg_spin_ebd(self) -> bool:
+        return False
+
 
 @patch("deepmd.jax.train.trainer.DPTrainer._build_losses")
 @patch("deepmd.jax.train.trainer.get_model")
@@ -321,9 +327,7 @@ def test_jax_init_model_preserves_input_model_script(
         "model": {},
         "model_def_script": checkpoint_model,
     }
-    deserialize_models.return_value = {
-        "Default": SimpleNamespace(get_dim_fparam=lambda: 0)
-    }
+    deserialize_models.return_value = {"Default": _RequirementModel()}
     build_losses.return_value = {"Default": SimpleNamespace(label_requirement=[])}
 
     trainer = DPTrainer(_minimal_jax_config(input_model), init_model="model-1.jax")
@@ -351,9 +355,7 @@ def test_jax_restart_uses_checkpoint_model_script(
         "model": {},
         "model_def_script": checkpoint_model,
     }
-    deserialize_models.return_value = {
-        "Default": SimpleNamespace(get_dim_fparam=lambda: 0)
-    }
+    deserialize_models.return_value = {"Default": _RequirementModel()}
     build_losses.return_value = {"Default": SimpleNamespace(label_requirement=[])}
 
     trainer = DPTrainer(_minimal_jax_config(input_model), restart="model-7.jax")
