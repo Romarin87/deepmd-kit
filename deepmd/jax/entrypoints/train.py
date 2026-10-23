@@ -6,6 +6,7 @@ Can handle local and distributed training.
 
 import logging
 import time
+from copy import deepcopy
 from typing import (
     Any,
 )
@@ -133,6 +134,37 @@ class JAXTrainEntrypoint(AbstractTrainEntrypoint):
             if "RANDOM" in config["model"]["model_dict"]:
                 raise ValueError("Model name can not be 'RANDOM' in multi-task mode!")
         return config
+
+    def normalize_config(
+        self,
+        config: dict[str, Any],
+        *,
+        multi_task: bool,
+    ) -> dict[str, Any]:
+        """Apply JAX DPA4 defaults before the shared argument defaults."""
+        config = deepcopy(config)
+
+        def prepare_descriptor(descriptor: dict, model_type: str = "standard") -> None:
+            descriptor_type = str(descriptor.get("type", model_type)).lower()
+            if descriptor_type in ("dpa4", "sezm"):
+                for option in ("random_gamma", "use_amp"):
+                    if descriptor.get(option) is True:
+                        raise NotImplementedError(
+                            f"DPA4 {option}=True is not supported in the JAX backend."
+                        )
+                    descriptor.setdefault(option, False)
+            elif descriptor_type == "hybrid":
+                for child in descriptor["list"]:
+                    prepare_descriptor(child)
+
+        models = (
+            config["model"]["model_dict"].values() if multi_task else [config["model"]]
+        )
+        for model in models:
+            prepare_descriptor(
+                model.setdefault("descriptor", {}), model.get("type", "standard")
+            )
+        return super().normalize_config(config, multi_task=multi_task)
 
     def update_neighbor_stat(
         self,

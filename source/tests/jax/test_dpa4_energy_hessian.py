@@ -133,7 +133,42 @@ def test_model_aliases(alias):
     assert get_model(config).atomic_model.fitting_net.serialize()["type"] == "sezm_ener"
 
 
+@pytest.mark.parametrize("option", ["random_gamma", "use_amp"])
+def test_cli_rejects_explicit_unsupported_dpa4_options(option):
+    from deepmd.jax.entrypoints.train import JAXTrainEntrypoint
+
+    config = {"model": model_config()}
+    config["model"]["descriptor"][option] = True
+    with pytest.raises(NotImplementedError, match=f"{option}=True"):
+        JAXTrainEntrypoint().normalize_config(config, multi_task=False)
+
+
+def test_multitask_cli_dpa4_defaults():
+    from deepmd.jax.entrypoints.train import JAXTrainEntrypoint
+
+    models = {alias: {**model_config(), "type": alias} for alias in ("dpa4", "sezm")}
+    config = {
+        "model": {"model_dict": models},
+        "learning_rate": {"type": "exp", "start_lr": 0.001, "decay_steps": 10},
+        "loss_dict": {key: {"type": "ener"} for key in models},
+        "training": {
+            "numb_steps": 1,
+            "data_dict": {
+                key: {"training_data": {"systems": ["data"], "batch_size": 1}}
+                for key in models
+            },
+        },
+    }
+    normalized = JAXTrainEntrypoint().normalize_config(config, multi_task=True)
+    for model in normalized["model"]["model_dict"].values():
+        assert model["descriptor"]["random_gamma"] is False
+        assert model["descriptor"]["use_amp"] is False
+        get_model(model)
+    assert "random_gamma" not in models["dpa4"]["descriptor"]
+
+
 def test_training_checkpoint_restart(tmp_path, monkeypatch):
+    from deepmd.jax.entrypoints.train import JAXTrainEntrypoint
     from deepmd.jax.train.trainer import DPTrainer
     from deepmd.utils.data_system import get_data
 
@@ -176,6 +211,10 @@ def test_training_checkpoint_restart(tmp_path, monkeypatch):
     config["model"]["data_stat_nbatch"] = 1
     config["model"]["descriptor"]["add_chg_spin_ebd"] = True
     data_config = {"systems": [str(system)], "batch_size": 1}
+    config["training"]["training_data"] = data_config
+    config = JAXTrainEntrypoint().normalize_config(config, multi_task=False)
+    assert config["model"]["descriptor"]["random_gamma"] is False
+    assert config["model"]["descriptor"]["use_amp"] is False
     trainer = DPTrainer(config)
     trainer.train(get_data(data_config, 3.0, ["H", "O"], None))
     assert (tmp_path / "model-1.jax").is_dir()
